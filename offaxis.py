@@ -2,6 +2,10 @@ import cv2
 import numpy as np
 import math
 
+# Fixed window size - defined early so mouse_callback can use it
+WINDOW_WIDTH = 800
+WINDOW_HEIGHT = 600
+
 def update_perspective(img, camera_x, camera_y, camera_z, yaw, pitch):
     h, w = img.shape[:2]
     
@@ -47,8 +51,9 @@ def update_perspective(img, camera_x, camera_y, camera_z, yaw, pitch):
     points_2d = np.zeros((4, 2), dtype=np.float32)
     for i in range(4):
         z = points_translated[i, 2]
-        if z <= 0:  # Point is behind camera
-            return img
+        # Allow points behind camera - OpenCV will handle clipping
+        if z <= 0:
+            z = 0.1  # Use a small positive value to avoid division by zero
         points_2d[i, 0] = points_translated[i, 0] * f / z + w/2
         points_2d[i, 1] = points_translated[i, 1] * f / z + h/2
     
@@ -60,32 +65,37 @@ def update_perspective(img, camera_x, camera_y, camera_z, yaw, pitch):
         # Get and apply the perspective transform
         M = cv2.getPerspectiveTransform(pts1, pts2)
         result = cv2.warpPerspective(img, M, (w, h))
-        print("Transform applied successfully")  # Debug print
         return result
-    except cv2.error as e:
-        print(f"Transform failed: {e}")
-        return img
+    except cv2.error:
+        # If transform fails, return a black image instead of the original
+        return np.zeros_like(img)
 
 def mouse_callback(event, x, y, flags, param):
     global yaw, pitch
     if event == cv2.EVENT_MOUSEMOVE:
-        h, w = param['img'].shape[:2]
+        # Use fixed window dimensions for mouse calculations
+        h, w = WINDOW_HEIGHT, WINDOW_WIDTH
         # Convert mouse position to rotation angles
         yaw = (x - w/2) / (w/2) * math.pi / 3    # +/- 60 degrees rotation
         pitch = (y - h/2) / (h/2) * math.pi / 4   # +/- 45 degrees tilt
         print(f"Mouse: x={x}, y={y}, yaw={yaw:.2f}, pitch={pitch:.2f}")
 
 # Load image
-img = cv2.imread("image.jpg")  # Replace with your image path
+img = cv2.imread("image.png")  # Replace with your image path
 if img is None:
-    print("Error: Could not load image.jpg")
+    print("Error: Could not load image.png")
     # Create a test image if no image is found
-    img = np.zeros((480, 640, 3), dtype=np.uint8)
-    cv2.putText(img, "Test Image", (200, 240), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2)
-    cv2.rectangle(img, (100, 100), (540, 380), (0, 255, 0), 2)
+    img = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    cv2.putText(img, "Test Image", (800, 540), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2)
+    cv2.rectangle(img, (100, 100), (1820, 980), (0, 255, 0), 2)
     # Add diagonal lines to help visualize perspective
-    cv2.line(img, (100, 100), (540, 380), (0, 0, 255), 2)
-    cv2.line(img, (100, 380), (540, 100), (0, 0, 255), 2)
+    cv2.line(img, (100, 100), (1820, 980), (0, 0, 255), 2)
+    cv2.line(img, (100, 980), (1820, 100), (0, 0, 255), 2)
+    # Add grid to make panning more visible
+    for i in range(0, 1920, 200):
+        cv2.line(img, (i, 0), (i, 1080), (128, 128, 128), 1)
+    for i in range(0, 1080, 200):
+        cv2.line(img, (0, i), (1920, i), (128, 128, 128), 1)
 
 # Initialize camera parameters
 camera_x = 0      # Left/Right position
@@ -107,14 +117,27 @@ while True:
     # Always update every frame
     warped = update_perspective(img, camera_x, camera_y, camera_z, yaw, pitch)
     
-    # Draw some debug info on the image
-    debug_img = warped.copy()
-    cv2.putText(debug_img, f"Yaw: {yaw:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    cv2.putText(debug_img, f"Pitch: {pitch:.2f}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-    cv2.putText(debug_img, f"Pos: ({camera_x:.0f}, {camera_y:.0f}, {camera_z:.0f})", (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    # Crop the center of the warped image to the fixed window size
+    h, w = warped.shape[:2]
+    start_y = max(0, (h - WINDOW_HEIGHT) // 2)
+    start_x = max(0, (w - WINDOW_WIDTH) // 2)
+    end_y = start_y + WINDOW_HEIGHT
+    end_x = start_x + WINDOW_WIDTH
+    
+    # Handle case where image might be smaller than window
+    if h >= WINDOW_HEIGHT and w >= WINDOW_WIDTH:
+        display_img = warped[start_y:end_y, start_x:end_x].copy()
+    else:
+        # Image too small, just use the whole thing
+        display_img = cv2.resize(warped, (WINDOW_WIDTH, WINDOW_HEIGHT))
+    
+    # Draw debug info ONLY on display image
+    cv2.putText(display_img, f"Yaw: {yaw:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(display_img, f"Pitch: {pitch:.2f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(display_img, f"Pos: ({camera_x:.0f}, {camera_y:.0f})", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
     
     # Show the image
-    cv2.imshow("Off-Axis Projection", debug_img)
+    cv2.imshow("Off-Axis Projection", display_img)
     
     # Handle keyboard input
     key = cv2.waitKey(1) & 0xFF
