@@ -45,7 +45,7 @@ class CalibrationData:
 class StarfieldRenderer:
     """Handle OpenGL rendering of starfield with off-axis projection"""
     
-    def __init__(self, image_path="image.png"):
+    def __init__(self, image_path="starfield.jpg"):
         self.image_path = image_path
         self.texture_id = None
         self.image_width = 0
