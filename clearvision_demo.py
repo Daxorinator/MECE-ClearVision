@@ -11,6 +11,7 @@ import pygame
 from pygame.locals import *
 from OpenGL.GL import *
 from OpenGL.GLU import *
+from PIL import Image
 import os
 import time
 import threading
@@ -45,36 +46,59 @@ class CalibrationData:
 class StarfieldRenderer:
     """Handle OpenGL rendering of starfield with off-axis projection"""
     
-    def __init__(self, image_path="starfield.jpg"):
+    def __init__(self, image_path="image.png"):
         self.image_path = image_path
         self.texture_id = None
         self.image_width = 0
         self.image_height = 0
         
     def load_texture(self):
-        """Load starfield image as OpenGL texture"""
-        # Try to load the starfield image
-        image = None
-        if os.path.exists(self.image_path):
-            image = cv2.imread(self.image_path)
-            if image is None:
-                raise FileNotFoundError(f"Starfield image not found. Please provide '{self.image_path}'")
-            else:
-                print(f"Loaded starfield image: {self.image_path}")
-            
-        # Convert BGR to RGB
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        self.image_height, self.image_width = image.shape[:2]
+        """Load starfield image as OpenGL texture using Pygame"""
+        # Load image using PIL
+        if not os.path.exists(self.image_path):
+            raise FileNotFoundError(f"Starfield image not found. Please provide '{self.image_path}'")
+        
+        print(f"Loading starfield image: {self.image_path}")
+        
+        # Load image using pygame
+        texture_surface = pygame.image.load(self.image_path)
+        
+        # Resize to smaller dimensions if too large (helps with memory issues)
+        orig_width = texture_surface.get_width()
+        orig_height = texture_surface.get_height()
+        
+        # Limit to max 2048x2048 for compatibility
+        max_size = 2048
+        if orig_width > max_size or orig_height > max_size:
+            scale = min(max_size / orig_width, max_size / orig_height)
+            new_width = int(orig_width * scale)
+            new_height = int(orig_height * scale)
+            print(f"Resizing from {orig_width}x{orig_height} to {new_width}x{new_height}")
+            texture_surface = pygame.transform.smoothscale(texture_surface, (new_width, new_height))
+        
+        self.image_width = texture_surface.get_width()
+        self.image_height = texture_surface.get_height()
+        print(f"Image size: {self.image_width}x{self.image_height}")
+        
+        # Convert to string data for OpenGL
+        texture_data = pygame.image.tostring(texture_surface, "RGB", 1)
         
         # Create OpenGL texture
         self.texture_id = glGenTextures(1)
+        print(f"Generated texture ID: {self.texture_id}")
+        
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.image_width, self.image_height, 
-                     0, GL_RGB, GL_UNSIGNED_BYTE, image)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT)
         
-        print(f"Texture loaded: {self.image_width}x{self.image_height}")
+        print(f"Uploading texture data...")
+        # Use gluBuild2DMipmaps which is more robust
+        gluBuild2DMipmaps(GL_TEXTURE_2D, GL_RGB, self.image_width, self.image_height,
+                          GL_RGB, GL_UNSIGNED_BYTE, texture_data)
+        
+        print(f"✓ Texture loaded successfully: {self.image_width}x{self.image_height}")
     
     def setup_asymmetric_frustum(self, head_x_mm, head_y_mm, head_z_mm):
         """
@@ -86,19 +110,16 @@ class StarfieldRenderer:
             head_z_mm: Head distance from screen in mm (+ is away from screen)
         """
         # Near and far clipping planes
-        near = 1.0  # mm - very close to screen plane
-        far = 10000.0  # mm - far clipping plane
+        # Near plane should be at the screen distance for proper perspective
+        near = head_z_mm * 0.95  # Slightly in front of viewer
+        far = head_z_mm + 2000.0  # Far clipping plane
         
         # Screen dimensions in mm (half widths for calculations)
         screen_half_w = SCREEN_WIDTH_MM / 2.0
         screen_half_h = SCREEN_HEIGHT_MM / 2.0
         
-        # Calculate frustum bounds based on head position
-        # The screen plane is at z=0, viewer is at z=head_z_mm
-        # We need to calculate the view frustum from the viewer's perspective
-        
-        # Left/Right/Bottom/Top are defined at the near plane
-        # Scale factors based on viewing distance
+        # Calculate frustum bounds at the near plane
+        # Scale screen dimensions to near plane distance
         scale = near / head_z_mm if head_z_mm > 0 else 0.01
         
         # Calculate frustum edges accounting for head offset
@@ -122,31 +143,99 @@ class StarfieldRenderer:
                   0.0, 1.0, 0.0)                       # Up vector
     
     def render_starfield_quad(self):
-        """Render the starfield as a textured quad at the screen plane"""
+        """Render the starfield as a textured quad behind the screen plane"""
         if self.texture_id is None:
             return
         
         glEnable(GL_TEXTURE_2D)
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
         
-        # Draw a large quad at z=0 (screen plane)
-        quad_size = max(SCREEN_WIDTH_MM, SCREEN_HEIGHT_MM) * 2
+        # Make quad MUCH larger than screen and place it behind the screen plane
+        # This way edges will move in/out of view as head moves
+        scale = 3.0  # Make it 3x larger than screen
+        half_w = (SCREEN_WIDTH_MM / 2.0) * scale
+        half_h = (SCREEN_HEIGHT_MM / 2.0) * scale
+        depth = -300.0  # Place it 300mm behind the screen plane
         
         glBegin(GL_QUADS)
         glTexCoord2f(0, 0)
-        glVertex3f(-quad_size, -quad_size, 0)
+        glVertex3f(-half_w, -half_h, depth)
         
         glTexCoord2f(1, 0)
-        glVertex3f(quad_size, -quad_size, 0)
+        glVertex3f(half_w, -half_h, depth)
         
         glTexCoord2f(1, 1)
-        glVertex3f(quad_size, quad_size, 0)
+        glVertex3f(half_w, half_h, depth)
         
         glTexCoord2f(0, 1)
-        glVertex3f(-quad_size, quad_size, 0)
+        glVertex3f(-half_w, half_h, depth)
         glEnd()
         
         glDisable(GL_TEXTURE_2D)
+    
+    def render_depth_cues(self):
+        """Render 3D reference objects to make the parallax effect visible"""
+        glDisable(GL_TEXTURE_2D)
+        
+        # Draw some colored cubes at different depths
+        cube_positions = [
+            (0, 0, -100, (1.0, 0.0, 0.0)),      # Red cube close to screen
+            (150, 100, -200, (0.0, 1.0, 0.0)),  # Green cube
+            (-150, -80, -250, (0.0, 0.0, 1.0)), # Blue cube
+            (100, -120, -150, (1.0, 1.0, 0.0)), # Yellow cube
+            (-120, 90, -180, (1.0, 0.0, 1.0)),  # Magenta cube
+        ]
+        
+        for x, y, z, color in cube_positions:
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            self.draw_cube(30, color)
+            glPopMatrix()
+    
+    def draw_cube(self, size, color):
+        """Draw a simple colored cube"""
+        s = size / 2.0
+        glColor3f(*color)
+        
+        glBegin(GL_QUADS)
+        # Front face
+        glVertex3f(-s, -s, s)
+        glVertex3f(s, -s, s)
+        glVertex3f(s, s, s)
+        glVertex3f(-s, s, s)
+        
+        # Back face
+        glVertex3f(-s, -s, -s)
+        glVertex3f(-s, s, -s)
+        glVertex3f(s, s, -s)
+        glVertex3f(s, -s, -s)
+        
+        # Top face
+        glVertex3f(-s, s, -s)
+        glVertex3f(-s, s, s)
+        glVertex3f(s, s, s)
+        glVertex3f(s, s, -s)
+        
+        # Bottom face
+        glVertex3f(-s, -s, -s)
+        glVertex3f(s, -s, -s)
+        glVertex3f(s, -s, s)
+        glVertex3f(-s, -s, s)
+        
+        # Right face
+        glVertex3f(s, -s, -s)
+        glVertex3f(s, s, -s)
+        glVertex3f(s, s, s)
+        glVertex3f(s, -s, s)
+        
+        # Left face
+        glVertex3f(-s, -s, -s)
+        glVertex3f(-s, -s, s)
+        glVertex3f(-s, s, s)
+        glVertex3f(-s, s, -s)
+        glEnd()
+        
+        glColor3f(1.0, 1.0, 1.0)
 
 
 def face_landmarker_callback(result, output_image: mp.Image, timestamp_ms: int):
@@ -312,14 +401,18 @@ def main():
         # Initialize Pygame and OpenGL
         pygame.init()
         display = (SCREEN_WIDTH_PX, SCREEN_HEIGHT_PX)
-        pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
+        screen = pygame.display.set_mode(display, DOUBLEBUF | OPENGL)
         pygame.display.set_caption("ClearVision Off-Axis Projection Demo")
         
         # Initialize OpenGL settings
         glEnable(GL_DEPTH_TEST)
         glClearColor(0.0, 0.0, 0.0, 1.0)
         
-        # Create starfield renderer
+        # Clear the screen once to ensure context is ready
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        pygame.display.flip()
+        
+        # Create starfield renderer and load texture AFTER OpenGL context is ready
         renderer = StarfieldRenderer()
         renderer.load_texture()
         
@@ -373,14 +466,17 @@ def main():
                 nose_x, nose_y = get_nose_position(face_landmarks, cam_w, cam_h)
                 
                 # Calculate offset from calibration reference
-                # Map normalized coordinates to screen mm coordinates
                 delta_x = nose_x - calibration.reference_nose_x
                 delta_y = nose_y - calibration.reference_nose_y
                 
-                # Convert to mm (mapping camera FOV to screen size)
-                # Assuming camera FOV maps roughly to screen size at viewing distance
-                head_x_mm = delta_x * SCREEN_WIDTH_MM * 2.0  # Amplify for better effect
-                head_y_mm = -delta_y * SCREEN_HEIGHT_MM * 2.0  # Negative because screen Y is inverted
+                # Convert to mm - use moderate amplification
+                head_x_mm = delta_x * SCREEN_WIDTH_MM * 3.0
+                head_y_mm = -delta_y * SCREEN_HEIGHT_MM * 3.0
+                
+                # Debug output every 30 frames
+                if frame_count % 30 == 0:
+                    print(f"Head: ({head_x_mm:.1f}, {head_y_mm:.1f}, {head_z_mm:.1f}) mm | "
+                          f"Delta: ({delta_x:.3f}, {delta_y:.3f})")
             
             # Render OpenGL scene
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
