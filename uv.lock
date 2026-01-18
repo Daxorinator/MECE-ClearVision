@@ -447,6 +447,7 @@ dependencies = [
     { name = "mediapipe" },
     { name = "numpy" },
     { name = "opencv-python" },
+    { name = "pillow" },
     { name = "pygame" },
     { name = "pyopengl" },
 ]
@@ -456,6 +457,7 @@ requires-dist = [
     { name = "mediapipe", specifier = ">=0.10.21" },
     { name = "numpy", specifier = ">=1.26.4" },
     { name = "opencv-python", specifier = ">=4.11.0.86" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "pygame", specifier = ">=2.5.0" },
     { name = "pyopengl", specifier = ">=3.1.0" },
 ]
