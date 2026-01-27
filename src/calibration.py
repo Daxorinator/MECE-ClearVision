@@ -39,7 +39,7 @@ CAMERA_HEIGHT = 1080
 MIN_CALIBRATION_IMAGES = 15
 
 # Output directory for calibration data
-OUTPUT_DIR = Path("calibration_output")
+OUTPUT_DIR = Path("calibration")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # ============================================================================
@@ -117,7 +117,7 @@ def init_pi_cameras(left_cam_id, right_cam_id, width, height):
     # Initialize left camera
     picam_left = Picamera2(camera_num=left_cam_id)
     config_left = picam_left.create_preview_configuration(
-        main={"size": (width, height), "format": "RGB888"}
+        main={"size": (width, height), "format": "RGB888"} # This is wrong, I think YUV420 or BGR888 is needed, check "The Picamera2 Library"
     )
     picam_left.configure(config_left)
     picam_left.start()
@@ -125,9 +125,11 @@ def init_pi_cameras(left_cam_id, right_cam_id, width, height):
     # Initialize right camera
     picam_right = Picamera2(camera_num=right_cam_id)
     config_right = picam_right.create_preview_configuration(
-        main={"size": (width, height), "format": "RGB888"}
+        main={"size": (width, height), "format": "RGB888"} # In fact, this whole line might be wrong - I think it should be create_video_configuration with a lower res
     )
+    
     picam_right.configure(config_right)
+    # Start preview with Preview.QTGL here and configure width and height explicitly
     picam_right.start()
     
     # Let cameras warm up
@@ -140,13 +142,13 @@ def init_pi_cameras(left_cam_id, right_cam_id, width, height):
     return picam_left, picam_right
 
 
-def capture_calibration_images(left_cam_id, right_cam_id, checkerboard_size):
+def capture_calibration_images(picam_left, picam_right, checkerboard_size):
     """
     Capture synchronized image pairs from both Pi Cameras for calibration
     
     Args:
-        left_cam_id: Camera ID for left camera
-        right_cam_id: Camera ID for right camera
+        picam_left: Initialized left Picamera2 instance
+        picam_right: Initialized right Picamera2 instance
         checkerboard_size: (width, height) of internal corners
         
     Returns:
@@ -155,11 +157,6 @@ def capture_calibration_images(left_cam_id, right_cam_id, checkerboard_size):
         imgpoints_right: List of 2D image points from right camera
         image_size: (width, height) of images
     """
-    # Initialize Pi Cameras
-    picam_left, picam_right = init_pi_cameras(
-        left_cam_id, right_cam_id, CAMERA_WIDTH, CAMERA_HEIGHT
-    )
-    
     # Storage for calibration data
     objpoints = []  # 3D points in real world
     imgpoints_left = []  # 2D points in left camera
@@ -232,8 +229,6 @@ def capture_calibration_images(left_cam_id, right_cam_id, checkerboard_size):
             
             if key == 27:  # ESC
                 print("\nCalibration cancelled")
-                picam_left.stop()
-                picam_right.stop()
                 cv2.destroyAllWindows()
                 return None, None, None, None
             
@@ -260,8 +255,6 @@ def capture_calibration_images(left_cam_id, right_cam_id, checkerboard_size):
                     print(f"\n✗ Need at least {MIN_CALIBRATION_IMAGES} pairs. Currently have {captured_count}")
     
     finally:
-        picam_left.stop()
-        picam_right.stop()
         cv2.destroyAllWindows()
     
     return objpoints, imgpoints_left, imgpoints_right, image_size
@@ -384,14 +377,14 @@ def save_calibration(calibration_data, filename):
     print(f"\n✓ Calibration data saved to: {filename}")
 
 
-def test_rectification(calibration_data, left_cam_id, right_cam_id):
+def test_rectification(calibration_data, picam_left, picam_right):
     """
     Test rectification by displaying rectified images with epipolar lines
     
     Args:
         calibration_data: Dictionary of calibration parameters
-        left_cam_id: Left camera ID
-        right_cam_id: Right camera ID
+        picam_left: Initialized left Picamera2 instance
+        picam_right: Initialized right Picamera2 instance
     """
     print("\n" + "="*60)
     print("TESTING RECTIFICATION")
@@ -400,11 +393,6 @@ def test_rectification(calibration_data, left_cam_id, right_cam_id):
     print("Corresponding points should lie on the same horizontal line")
     print("Press any key to exit")
     print("="*60 + "\n")
-    
-    # Initialize Pi Cameras
-    picam_left, picam_right = init_pi_cameras(
-        left_cam_id, right_cam_id, CAMERA_WIDTH, CAMERA_HEIGHT
-    )
     
     # Extract calibration parameters
     K_left = np.array(calibration_data['K_left'])
@@ -455,8 +443,6 @@ def test_rectification(calibration_data, left_cam_id, right_cam_id):
                 break
     
     finally:
-        picam_left.stop()
-        picam_right.stop()
         cv2.destroyAllWindows()
 
 # ============================================================================
@@ -473,33 +459,42 @@ def main():
     print(f"Right camera: {RIGHT_CAMERA_ID}")
     print("="*60)
     
-    # Step 1: Capture calibration images
-    objpoints, imgpoints_left, imgpoints_right, image_size = capture_calibration_images(
-        LEFT_CAMERA_ID, RIGHT_CAMERA_ID, CHECKERBOARD_SIZE
+    # Initialize cameras once and reuse for rectification
+    picam_left, picam_right = init_pi_cameras(
+        LEFT_CAMERA_ID, RIGHT_CAMERA_ID, CAMERA_WIDTH, CAMERA_HEIGHT
     )
     
-    if objpoints is None:
-        return
-    
-    # Step 2: Run calibration
-    calibration_data = calibrate_stereo(
-        objpoints, imgpoints_left, imgpoints_right, image_size
-    )
-    
-    # Step 3: Save calibration
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = OUTPUT_DIR / f"stereo_calibration_{timestamp}.json"
-    save_calibration(calibration_data, output_file)
-    
-    # Step 4: Test rectification
-    print("\nWould you like to test the rectification? (y/n): ", end='')
-    response = input().strip().lower()
-    
-    if response == 'y':
-        test_rectification(calibration_data, LEFT_CAMERA_ID, RIGHT_CAMERA_ID)
-    
-    print("\n✓ Calibration complete!")
-    print(f"Load calibration data with: json.load(open('{output_file}'))")
+    try:
+        # Step 1: Capture calibration images
+        objpoints, imgpoints_left, imgpoints_right, image_size = capture_calibration_images(
+            picam_left, picam_right, CHECKERBOARD_SIZE
+        )
+        
+        if objpoints is None:
+            return
+        
+        # Step 2: Run calibration
+        calibration_data = calibrate_stereo(
+            objpoints, imgpoints_left, imgpoints_right, image_size
+        )
+        
+        # Step 3: Save calibration
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = OUTPUT_DIR / f"stereo_calibration_{timestamp}.json"
+        save_calibration(calibration_data, output_file)
+        
+        # Step 4: Test rectification
+        print("\nWould you like to test the rectification? (y/n): ", end='')
+        response = input().strip().lower()
+        
+        if response == 'y':
+            test_rectification(calibration_data, picam_left, picam_right)
+        
+        print("\n✓ Calibration complete!")
+    finally:
+        picam_left.stop()
+        picam_right.stop()
+        cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':
