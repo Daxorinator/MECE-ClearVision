@@ -17,7 +17,7 @@ import numpy as np
 import json
 from pathlib import Path
 from datetime import datetime
-from picamera2 import Picamera2
+from picamera2 import Picamera2, Preview
 
 # ============================================================================
 # CONFIGURATION
@@ -116,20 +116,21 @@ def init_pi_cameras(left_cam_id, right_cam_id, width, height):
     """
     # Initialize left camera
     picam_left = Picamera2(camera_num=left_cam_id)
-    config_left = picam_left.create_preview_configuration(
-        main={"size": (width, height), "format": "RGB888"} # This is wrong, I think YUV420 or BGR888 is needed, check "The Picamera2 Library"
+    config_left = picam_left.create_video_configuration(
+        main={"size": (width, height), "format": "BGR888"}
     )
     picam_left.configure(config_left)
+    picam_left.start_preview(Preview.QTGL, x=0, y=0, width=800, height=600)
     picam_left.start()
     
     # Initialize right camera
     picam_right = Picamera2(camera_num=right_cam_id)
-    config_right = picam_right.create_preview_configuration(
-        main={"size": (width, height), "format": "RGB888"} # In fact, this whole line might be wrong - I think it should be create_video_configuration with a lower res
+    config_right = picam_right.create_video_configuration(
+        main={"size": (width, height), "format": "BGR888"} # In fact, this whole line might be wrong - I think it should be create_video_configuration with a lower res
     )
     
     picam_right.configure(config_right)
-    # Start preview with Preview.QTGL here and configure width and height explicitly
+    picam_right.start_preview(Preview.QTGL, x=800, y=0, width=800, height=600)
     picam_right.start()
     
     # Let cameras warm up
