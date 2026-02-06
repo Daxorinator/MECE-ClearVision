@@ -57,6 +57,7 @@
 #define CAMERA_HEIGHT       1080
 #define MIN_CALIB_IMAGES    15
 #define DISPLAY_SCALE       0.5
+#define DETECT_EVERY_N      4
 #define TIMER_INTERVAL_MS   33
 
 static const cv::Size BOARD_SIZE(CHECKERBOARD_W, CHECKERBOARD_H);
@@ -431,9 +432,13 @@ private:
 
     cv::Mat map_lx, map_ly, map_rx, map_ry;
 
-    /* Latest corner-detection results (updated each frame) */
+    /* Corner detection (runs every Nth frame on downscaled images) */
+    int frame_count;
     bool corners_found_l, corners_found_r;
     std::vector<cv::Point2f> corners_l, corners_r;
+
+    /* Latest full-res frames (kept for sub-pixel refinement on capture) */
+    cv::Mat last_frame_l, last_frame_r;
 
     void shutdownCameras();
 };
@@ -444,7 +449,7 @@ CalibrationWindow::CalibrationWindow(
     std::shared_ptr<libcamera::CameraManager> cm_in, QWidget *parent)
     : QWidget(parent), cm(cm_in), cameras_ok(false),
       state(ST_CAPTURE), capture_count(0), calibrated(false),
-      corners_found_l(false), corners_found_r(false)
+      frame_count(0), corners_found_l(false), corners_found_r(false)
 {
     setWindowTitle("Stereo Calibration");
 
@@ -535,10 +540,31 @@ void CalibrationWindow::keyPressEvent(QKeyEvent *e)
 
     if (state == ST_CAPTURE) {
         if (e->key() == Qt::Key_C) {
-            if (corners_found_l && corners_found_r) {
+            if (corners_found_l && corners_found_r
+                && !last_frame_l.empty() && !last_frame_r.empty()) {
+                /* Scale corners from display coords to full-res and
+                   refine to sub-pixel accuracy on the full-res image */
+                float inv = 1.0f / (float)DISPLAY_SCALE;
+                std::vector<cv::Point2f> full_l(corners_l.size());
+                std::vector<cv::Point2f> full_r(corners_r.size());
+                for (size_t i = 0; i < corners_l.size(); i++) {
+                    full_l[i] = corners_l[i] * inv;
+                    full_r[i] = corners_r[i] * inv;
+                }
+                cv::Mat gray_l, gray_r;
+                cv::cvtColor(last_frame_l, gray_l, cv::COLOR_BGR2GRAY);
+                cv::cvtColor(last_frame_r, gray_r, cv::COLOR_BGR2GRAY);
+                cv::TermCriteria crit(
+                    cv::TermCriteria::EPS | cv::TermCriteria::MAX_ITER,
+                    30, 0.001);
+                cv::cornerSubPix(gray_l, full_l,
+                                 cv::Size(11, 11), cv::Size(-1, -1), crit);
+                cv::cornerSubPix(gray_r, full_r,
+                                 cv::Size(11, 11), cv::Size(-1, -1), crit);
+
                 obj_points.push_back(objp);
-                img_pts_l.push_back(corners_l);
-                img_pts_r.push_back(corners_r);
+                img_pts_l.push_back(full_l);
+                img_pts_r.push_back(full_r);
                 capture_count++;
                 printf("Captured pair %d/%d\n",
                        capture_count, MIN_CALIB_IMAGES);
@@ -633,20 +659,30 @@ void CalibrationWindow::onTimer()
         return;
 
     if (state == ST_CAPTURE) {
-        /* Detect checkerboard corners */
-        cv::Mat gray_l, gray_r;
-        cv::cvtColor(frame_l, gray_l, cv::COLOR_BGR2GRAY);
-        cv::cvtColor(frame_r, gray_r, cv::COLOR_BGR2GRAY);
+        /* Keep full-res frames for sub-pixel refinement on capture */
+        last_frame_l = frame_l;
+        last_frame_r = frame_r;
 
-        corners_found_l = find_corners(gray_l, corners_l);
-        corners_found_r = find_corners(gray_r, corners_r);
+        /* Downscale first — detection and display both use the small image */
+        cv::Mat small_l, small_r;
+        cv::resize(frame_l, small_l, cv::Size(), DISPLAY_SCALE, DISPLAY_SCALE);
+        cv::resize(frame_r, small_r, cv::Size(), DISPLAY_SCALE, DISPLAY_SCALE);
 
-        /* Draw corners */
-        cv::Mat disp_l = frame_l.clone();
-        cv::Mat disp_r = frame_r.clone();
-        cv::drawChessboardCorners(disp_l, BOARD_SIZE,
+        /* Run corner detection every Nth frame on the small images */
+        if (++frame_count >= DETECT_EVERY_N) {
+            frame_count = 0;
+            cv::Mat gray_l, gray_r;
+            cv::cvtColor(small_l, gray_l, cv::COLOR_BGR2GRAY);
+            cv::cvtColor(small_r, gray_r, cv::COLOR_BGR2GRAY);
+
+            corners_found_l = find_corners(gray_l, corners_l);
+            corners_found_r = find_corners(gray_r, corners_r);
+        }
+
+        /* Draw corners on small images */
+        cv::drawChessboardCorners(small_l, BOARD_SIZE,
                                   corners_l, corners_found_l);
-        cv::drawChessboardCorners(disp_r, BOARD_SIZE,
+        cv::drawChessboardCorners(small_r, BOARD_SIZE,
                                   corners_r, corners_found_r);
 
         /* Status overlay */
@@ -657,25 +693,20 @@ void CalibrationWindow::onTimer()
         cv::Scalar cr = corners_found_r
             ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
 
-        cv::putText(disp_l, std::string("Left: ") + sl,
+        cv::putText(small_l, std::string("Left: ") + sl,
                     cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cl, 2);
-        cv::putText(disp_r, std::string("Right: ") + sr,
+        cv::putText(small_r, std::string("Right: ") + sr,
                     cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 1, cr, 2);
 
         char buf[64];
         snprintf(buf, sizeof(buf), "Captured: %d/%d",
                  capture_count, MIN_CALIB_IMAGES);
-        cv::putText(disp_l, buf, cv::Point(10, 70),
+        cv::putText(small_l, buf, cv::Point(10, 70),
                     cv::FONT_HERSHEY_SIMPLEX, 1,
                     cv::Scalar(255, 255, 255), 2);
 
-        /* Scale and display */
-        cv::Mat sc_l, sc_r;
-        cv::resize(disp_l, sc_l, cv::Size(), DISPLAY_SCALE, DISPLAY_SCALE);
-        cv::resize(disp_r, sc_r, cv::Size(), DISPLAY_SCALE, DISPLAY_SCALE);
-
-        left_view->setPixmap(mat_to_pixmap(sc_l));
-        right_view->setPixmap(mat_to_pixmap(sc_r));
+        left_view->setPixmap(mat_to_pixmap(small_l));
+        right_view->setPixmap(mat_to_pixmap(small_r));
     }
     else if (state == ST_RECTIFY) {
         /* Apply rectification */
