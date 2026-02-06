@@ -70,7 +70,7 @@ struct MappedBuffer {
     size_t  length;
 };
 
-struct CameraCapture : public libcamera::Object {
+struct CameraCapture {
     std::shared_ptr<libcamera::Camera>                camera;
     std::unique_ptr<libcamera::CameraConfiguration>   config;
     std::unique_ptr<libcamera::FrameBufferAllocator>  allocator;
@@ -84,30 +84,31 @@ struct CameraCapture : public libcamera::Object {
     std::mutex   frame_mutex;
     cv::Mat      frame;
     bool         new_frame;
-
-    void processRequest(libcamera::Request *request);
 };
 
-/* Called on libcamera's internal thread when a frame is ready. */
-void CameraCapture::processRequest(libcamera::Request *request)
+/* Called on libcamera's internal thread when a frame is ready.
+ * The CameraCapture pointer is recovered from the request cookie. */
+static void process_request(libcamera::Request *request)
 {
     if (request->status() == libcamera::Request::RequestCancelled)
         return;
 
-    const libcamera::FrameBuffer *fb = request->findBuffer(stream);
+    auto *cap = reinterpret_cast<CameraCapture *>(request->cookie());
+
+    const libcamera::FrameBuffer *fb = request->findBuffer(cap->stream);
     if (fb) {
-        auto it = mappings.find(fb);
-        if (it != mappings.end()) {
-            std::lock_guard<std::mutex> lock(frame_mutex);
-            cv::Mat tmp(height, width, CV_8UC3,
-                        it->second.data, (size_t)stride);
-            tmp.copyTo(frame);
-            new_frame = true;
+        auto it = cap->mappings.find(fb);
+        if (it != cap->mappings.end()) {
+            std::lock_guard<std::mutex> lock(cap->frame_mutex);
+            cv::Mat tmp(cap->height, cap->width, CV_8UC3,
+                        it->second.data, (size_t)cap->stride);
+            tmp.copyTo(cap->frame);
+            cap->new_frame = true;
         }
     }
 
     request->reuse(libcamera::Request::ReuseBuffers);
-    camera->queueRequest(request);
+    cap->camera->queueRequest(request);
 }
 
 static bool init_camera(CameraCapture *cap,
@@ -169,9 +170,10 @@ static bool init_camera(CameraCapture *cap,
         cap->mappings[buf.get()] = { mem, planes[0].length };
     }
 
-    /* Create requests and attach buffers */
+    /* Create requests and attach buffers (cookie carries cap pointer) */
     for (const auto &buf : cap->allocator->buffers(cap->stream)) {
-        auto req = cap->camera->createRequest();
+        auto req = cap->camera->createRequest(
+            reinterpret_cast<uint64_t>(cap));
         if (!req || req->addBuffer(cap->stream, buf.get()) != 0) {
             fprintf(stderr, "Request setup failed for camera %d\n", camera_idx);
             return false;
@@ -179,9 +181,9 @@ static bool init_camera(CameraCapture *cap,
         cap->requests.push_back(std::move(req));
     }
 
-    /* Connect completion callback */
-    cap->camera->requestCompleted.connect(
-        cap, &CameraCapture::processRequest);
+    /* Connect completion callback (plain function pointer — called
+       directly on the camera thread, no Object dispatch needed) */
+    cap->camera->requestCompleted.connect(process_request);
 
     /* Start streaming and queue all requests */
     if (cap->camera->start() != 0) {
