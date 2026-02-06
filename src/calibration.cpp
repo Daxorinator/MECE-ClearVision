@@ -70,7 +70,7 @@ struct MappedBuffer {
     size_t  length;
 };
 
-struct CameraCapture {
+struct CameraCapture : public libcamera::Object {
     std::shared_ptr<libcamera::Camera>                camera;
     std::unique_ptr<libcamera::CameraConfiguration>   config;
     std::unique_ptr<libcamera::FrameBufferAllocator>  allocator;
@@ -84,28 +84,30 @@ struct CameraCapture {
     std::mutex   frame_mutex;
     cv::Mat      frame;
     bool         new_frame;
+
+    void processRequest(libcamera::Request *request);
 };
 
 /* Called on libcamera's internal thread when a frame is ready. */
-static void process_request(CameraCapture *cap, libcamera::Request *request)
+void CameraCapture::processRequest(libcamera::Request *request)
 {
     if (request->status() == libcamera::Request::RequestCancelled)
         return;
 
-    const libcamera::FrameBuffer *fb = request->findBuffer(cap->stream);
+    const libcamera::FrameBuffer *fb = request->findBuffer(stream);
     if (fb) {
-        auto it = cap->mappings.find(fb);
-        if (it != cap->mappings.end()) {
-            std::lock_guard<std::mutex> lock(cap->frame_mutex);
-            cv::Mat tmp(cap->height, cap->width, CV_8UC3,
-                        it->second.data, (size_t)cap->stride);
-            tmp.copyTo(cap->frame);
-            cap->new_frame = true;
+        auto it = mappings.find(fb);
+        if (it != mappings.end()) {
+            std::lock_guard<std::mutex> lock(frame_mutex);
+            cv::Mat tmp(height, width, CV_8UC3,
+                        it->second.data, (size_t)stride);
+            tmp.copyTo(frame);
+            new_frame = true;
         }
     }
 
     request->reuse(libcamera::Request::ReuseBuffers);
-    cap->camera->queueRequest(request);
+    camera->queueRequest(request);
 }
 
 static bool init_camera(CameraCapture *cap,
@@ -179,7 +181,7 @@ static bool init_camera(CameraCapture *cap,
 
     /* Connect completion callback */
     cap->camera->requestCompleted.connect(
-        [cap](libcamera::Request *r) { process_request(cap, r); });
+        cap, &CameraCapture::processRequest);
 
     /* Start streaming and queue all requests */
     if (cap->camera->start() != 0) {
