@@ -261,9 +261,9 @@ struct CalibrationResult {
 };
 
 static bool calibrate_stereo(
-    const std::vector<std::vector<cv::Point3f>> &obj_points,
-    const std::vector<std::vector<cv::Point2f>> &img_left,
-    const std::vector<std::vector<cv::Point2f>> &img_right,
+    const std::vector<std::vector<cv::Point3f>> &obj_points_in,
+    const std::vector<std::vector<cv::Point2f>> &img_left_in,
+    const std::vector<std::vector<cv::Point2f>> &img_right_in,
     cv::Size image_size,
     CalibrationResult *out)
 {
@@ -271,20 +271,79 @@ static bool calibrate_stereo(
     printf("RUNNING CALIBRATION\n");
     printf("============================================================\n");
 
-    cv::Mat K_l, dist_l, K_r, dist_r;
-    std::vector<cv::Mat> rvecs, tvecs;
+    /* Mutable copies so we can filter outlier pairs */
+    auto obj_points = obj_points_in;
+    auto img_left   = img_left_in;
+    auto img_right  = img_right_in;
 
-    printf("\n1. Calibrating left camera...\n");
+    cv::Mat K_l, dist_l, K_r, dist_r;
+    std::vector<cv::Mat> rvecs_l, tvecs_l, rvecs_r, tvecs_r;
+
+    printf("\n1. Calibrating left camera (initial)...\n");
     double rms_l = cv::calibrateCamera(obj_points, img_left, image_size,
-                                       K_l, dist_l, rvecs, tvecs);
+                                       K_l, dist_l, rvecs_l, tvecs_l);
     printf("   Left RMS reprojection error: %.4f px\n", rms_l);
 
-    printf("\n2. Calibrating right camera...\n");
+    printf("\n2. Calibrating right camera (initial)...\n");
     double rms_r = cv::calibrateCamera(obj_points, img_right, image_size,
-                                       K_r, dist_r, rvecs, tvecs);
+                                       K_r, dist_r, rvecs_r, tvecs_r);
     printf("   Right RMS reprojection error: %.4f px\n", rms_r);
 
-    printf("\n3. Calibrating stereo pair...\n");
+    /* --- Filter outlier image pairs by per-image reprojection error --- */
+    printf("\n   Per-image reprojection errors:\n");
+    const double MAX_PER_IMAGE_ERR = 1.0;
+    int n = (int)obj_points.size();
+    std::vector<bool> keep(n, true);
+    int removed = 0;
+
+    for (int i = 0; i < n; i++) {
+        std::vector<cv::Point2f> proj_l, proj_r;
+        cv::projectPoints(obj_points[i], rvecs_l[i], tvecs_l[i],
+                          K_l, dist_l, proj_l);
+        cv::projectPoints(obj_points[i], rvecs_r[i], tvecs_r[i],
+                          K_r, dist_r, proj_r);
+
+        double err_l = cv::norm(img_left[i], proj_l, cv::NORM_L2)
+                       / sqrt((double)proj_l.size());
+        double err_r = cv::norm(img_right[i], proj_r, cv::NORM_L2)
+                       / sqrt((double)proj_r.size());
+
+        printf("   Pair %2d: L=%.3f px  R=%.3f px", i, err_l, err_r);
+        if (err_l > MAX_PER_IMAGE_ERR || err_r > MAX_PER_IMAGE_ERR) {
+            keep[i] = false;
+            removed++;
+            printf("  [REMOVED]\n");
+        } else {
+            printf("\n");
+        }
+    }
+
+    if (removed > 0) {
+        printf("   Removed %d outlier pair(s), %d remaining\n",
+               removed, n - removed);
+
+        std::vector<std::vector<cv::Point3f>> obj_f;
+        std::vector<std::vector<cv::Point2f>> left_f, right_f;
+        for (int i = 0; i < n; i++) {
+            if (keep[i]) {
+                obj_f.push_back(obj_points[i]);
+                left_f.push_back(img_left[i]);
+                right_f.push_back(img_right[i]);
+            }
+        }
+        obj_points = obj_f;
+        img_left   = left_f;
+        img_right  = right_f;
+
+        if ((int)obj_points.size() < MIN_CALIB_IMAGES) {
+            printf("   ERROR: Only %d pairs remain after filtering (need %d)!\n",
+                   (int)obj_points.size(), MIN_CALIB_IMAGES);
+            return false;
+        }
+    }
+
+    printf("\n3. Stereo calibration (joint optimisation)...\n");
+    printf("   Using SAME_FOCAL_LENGTH constraint (identical cameras)\n");
     cv::Mat R, T, E, F;
     cv::TermCriteria crit(cv::TermCriteria::EPS | cv::TermCriteria::MAX_ITER,
                           100, 1e-5);
@@ -292,21 +351,34 @@ static bool calibrate_stereo(
         obj_points, img_left, img_right,
         K_l, dist_l, K_r, dist_r,
         image_size, R, T, E, F,
-        cv::CALIB_FIX_INTRINSIC, crit);
+        cv::CALIB_SAME_FOCAL_LENGTH, crit);
     printf("   Stereo RMS error: %.4f px\n", rms_s);
+
+    /* --- Sanity checks --- */
+    double fl = K_l.at<double>(0, 0);
+    double fr = K_r.at<double>(0, 0);
+    double baseline = cv::norm(T);
+    double tx = T.at<double>(0), ty = T.at<double>(1), tz = T.at<double>(2);
+
+    printf("\n   Sanity checks:\n");
+    printf("   Focal lengths: L=%.1f px  R=%.1f px\n", fl, fr);
+    if (fabs(fl - fr) / fmax(fl, fr) > 0.05)
+        printf("   WARNING: Focal lengths differ by >5%%!\n");
+
+    printf("   T = [%.1f, %.1f, %.1f] mm  baseline=%.1f mm\n",
+           tx, ty, tz, baseline);
+    if (fabs(ty) / baseline > 0.15 || fabs(tz) / baseline > 0.15)
+        printf("   WARNING: Large Y/Z in T vector; check camera alignment.\n");
 
     printf("\n4. Computing rectification transforms...\n");
     cv::Mat R1, R2, P1, P2, Q;
     cv::Rect roi_l, roi_r;
     cv::stereoRectify(K_l, dist_l, K_r, dist_r, image_size, R, T,
                       R1, R2, P1, P2, Q,
-                      cv::CALIB_ZERO_DISPARITY, 1,
-                      cv::Size(), &roi_l, &roi_r);
+                      cv::CALIB_ZERO_DISPARITY, 0,
+                      image_size, &roi_l, &roi_r);
 
-    double baseline = cv::norm(T);
-
-    printf("   T vector: [%.1f, %.1f, %.1f] mm\n",
-           T.at<double>(0), T.at<double>(1), T.at<double>(2));
+    printf("   T vector: [%.1f, %.1f, %.1f] mm\n", tx, ty, tz);
     printf("   P1 focal=%.1f  cx=%.1f  cy=%.1f\n",
            P1.at<double>(0,0), P1.at<double>(0,2), P1.at<double>(1,2));
     printf("   P2 focal=%.1f  cx=%.1f  cy=%.1f\n",
@@ -314,6 +386,9 @@ static bool calibrate_stereo(
     printf("   ROI L: %dx%d+%d+%d  ROI R: %dx%d+%d+%d\n",
            roi_l.width, roi_l.height, roi_l.x, roi_l.y,
            roi_r.width, roi_r.height, roi_r.x, roi_r.y);
+
+    if (roi_l.area() == 0 || roi_r.area() == 0)
+        printf("   WARNING: Empty ROI -- rectification may be unreliable.\n");
 
     printf("\n============================================================\n");
     printf("CALIBRATION RESULTS\n");
