@@ -120,7 +120,7 @@ def init_pi_cameras(left_cam_id, right_cam_id, width, height):
         main={"size": (width, height), "format": "BGR888"}
     )
     picam_left.configure(config_left)
-    picam_left.start_preview(Preview.QTGL, x=0, y=0, width=800, height=600)
+    picam_left.start_preview(Preview.QT, x=0, y=0, width=800, height=600)
     picam_left.start()
     
     # Initialize right camera

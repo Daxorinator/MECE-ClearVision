@@ -3,12 +3,14 @@ name = "mece-clearvision"
 version = "0.1.0"
 description = "Head-tracked off-axis projection demo using MediaPipe and OpenGL"
 readme = "README.md"
-requires-python = "~=3.12"
+requires-python = "~=3.12.0"
 dependencies = [
-    "mediapipe>=0.10.21",
-    "numpy>=1.26.4",
-    "opencv-python>=4.11.0.86",
-    "pillow>=10.0.0",
-    "pygame>=2.5.0",
-    "pyopengl>=3.1.0",
+    "mediapipe == 0.10.18",
+    "numpy >= 1.26.0",
+    "opencv-python ~= 4.10.0",
+    "picamera2 >= 0.3.33",
+    "pygame >= 2.6.0",
+    "pykms @ file:////home/pi/pykms-0.1.0-py3-none-any.whl",
+    "pylibcamera @ file:////home/pi/pylibcamera-0.6.0-py3-none-any.whl",
+    "pyopengl >= 3.1.0",
 ]
