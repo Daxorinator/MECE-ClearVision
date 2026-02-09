@@ -16,3 +16,10 @@ target_link_libraries(calibration
     Qt5::Widgets
     PkgConfig::LIBCAMERA
 )
+
+add_executable(depth_pipeline src/depth_pipeline.cpp)
+target_link_libraries(depth_pipeline
+    ${OpenCV_LIBS}
+    Qt5::Widgets
+    PkgConfig::LIBCAMERA
+)
