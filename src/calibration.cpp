@@ -299,9 +299,21 @@ static bool calibrate_stereo(
     cv::Mat R1, R2, P1, P2, Q;
     cv::Rect roi_l, roi_r;
     cv::stereoRectify(K_l, dist_l, K_r, dist_r, image_size, R, T,
-                      R1, R2, P1, P2, Q, 0, -1, cv::Size(), &roi_l, &roi_r);
+                      R1, R2, P1, P2, Q,
+                      cv::CALIB_ZERO_DISPARITY, 1,
+                      cv::Size(), &roi_l, &roi_r);
 
     double baseline = cv::norm(T);
+
+    printf("   T vector: [%.1f, %.1f, %.1f] mm\n",
+           T.at<double>(0), T.at<double>(1), T.at<double>(2));
+    printf("   P1 focal=%.1f  cx=%.1f  cy=%.1f\n",
+           P1.at<double>(0,0), P1.at<double>(0,2), P1.at<double>(1,2));
+    printf("   P2 focal=%.1f  cx=%.1f  cy=%.1f\n",
+           P2.at<double>(0,0), P2.at<double>(0,2), P2.at<double>(1,2));
+    printf("   ROI L: %dx%d+%d+%d  ROI R: %dx%d+%d+%d\n",
+           roi_l.width, roi_l.height, roi_l.x, roi_l.y,
+           roi_r.width, roi_r.height, roi_r.x, roi_r.y);
 
     printf("\n============================================================\n");
     printf("CALIBRATION RESULTS\n");
@@ -591,12 +603,12 @@ void CalibrationWindow::keyPressEvent(QKeyEvent *e)
                                           img_sz, &calib);
             if (calibrated) {
                 /* Save to timestamped JSON */
-                mkdir("calibration", 0755);
+                mkdir("calibration_output", 0755);
                 time_t now = time(NULL);
                 struct tm *t = localtime(&now);
                 char fname[256];
                 snprintf(fname, sizeof(fname),
-                         "calibration/stereo_calibration_"
+                         "calibration_output/stereo_calibration_"
                          "%04d%02d%02d_%02d%02d%02d.json",
                          t->tm_year + 1900, t->tm_mon + 1, t->tm_mday,
                          t->tm_hour, t->tm_min, t->tm_sec);
