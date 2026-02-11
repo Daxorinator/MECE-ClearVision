@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc)
 find_package(Qt5 REQUIRED COMPONENTS Widgets)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)

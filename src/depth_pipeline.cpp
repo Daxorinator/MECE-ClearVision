@@ -16,6 +16,8 @@
  *   ESC   - Exit
  *   +/-   - Increase/decrease numDisparities (by 16)
  *   [/]   - Decrease/increase blockSize (by 2, must be odd)
+ *   S     - Toggle StereoBM / StereoSGBM
+ *   W     - Toggle WLS disparity filter
  *   1/2/3 - Processing scale: 1.0x, 0.5x, 0.25x
  */
 
@@ -41,6 +43,7 @@
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
+#include <opencv2/ximgproc/disparity_filter.hpp>
 
 #include <QApplication>
 #include <QWidget>
@@ -388,9 +391,13 @@ private:
     cv::Mat map_lx, map_ly, map_rx, map_ry;
 
     /* Stereo matcher */
-    cv::Ptr<cv::StereoBM> stereo;
+    cv::Ptr<cv::StereoMatcher> stereo;
+    cv::Ptr<cv::StereoMatcher> right_stereo;
+    cv::Ptr<cv::ximgproc::DisparityWLSFilter> wls_filter;
     int num_disparities;
     int block_size;
+    bool use_sgbm;
+    bool use_wls;
 
     /* Processing scale */
     double proc_scale;
@@ -419,6 +426,7 @@ DepthWindow::DepthWindow(
     QWidget *parent)
     : QWidget(parent), cm(cm_in), cameras_ok(false),
       num_disparities(64), block_size(9),
+      use_sgbm(false), use_wls(false),
       proc_scale(0.5), current_fps(0.0),
       show_rectified(false)
 {
@@ -509,6 +517,8 @@ DepthWindow::DepthWindow(
     printf("Calib RMS error: %.4f px\n", calib.rms_error);
     printf("numDisparities:  %d\n", num_disparities);
     printf("blockSize:       %d\n", block_size);
+    printf("Matcher:         %s\n", use_sgbm ? "StereoSGBM" : "StereoBM");
+    printf("WLS filter:      %s\n", use_wls ? "ON" : "OFF");
     printf("Processing scale: %.2fx\n", proc_scale);
     printf("Backend:         %s\n", backend_status.c_str());
     printf("============================================================\n");
@@ -516,6 +526,8 @@ DepthWindow::DepthWindow(
     printf("  ESC   - Exit\n");
     printf("  +/-   - numDisparities +/- 16\n");
     printf("  [/]   - blockSize -/+ 2\n");
+    printf("  S     - Toggle StereoBM / StereoSGBM\n");
+    printf("  W     - Toggle WLS disparity filter\n");
     printf("  1/2/3 - Scale: 1.0x / 0.5x / 0.25x\n");
     printf("  D     - Toggle debug view (rectified L/R)\n");
     printf("============================================================\n\n");
@@ -549,14 +561,29 @@ void DepthWindow::shutdownCameras()
 
 void DepthWindow::rebuildStereo()
 {
-    stereo = cv::StereoBM::create(num_disparities, block_size);
-    stereo->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
-    stereo->setPreFilterCap(31);
-    stereo->setUniquenessRatio(15);
-    stereo->setSpeckleWindowSize(100);
-    stereo->setSpeckleRange(32);
-    stereo->setTextureThreshold(0);
-    stereo->setMinDisparity(0);
+    if (use_sgbm) {
+        int P1 = 8 * block_size * block_size;
+        int P2 = 32 * block_size * block_size;
+        stereo = cv::StereoSGBM::create(
+            0, num_disparities, block_size,
+            P1, P2, -1, 31, 10, 100, 32,
+            cv::StereoSGBM::MODE_SGBM_3WAY);
+    } else {
+        auto bm = cv::StereoBM::create(num_disparities, block_size);
+        bm->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
+        bm->setPreFilterCap(31);
+        bm->setUniquenessRatio(15);
+        bm->setSpeckleWindowSize(100);
+        bm->setSpeckleRange(32);
+        bm->setTextureThreshold(0);
+        bm->setMinDisparity(0);
+        stereo = bm;
+    }
+
+    right_stereo = cv::ximgproc::createRightMatcher(stereo);
+    wls_filter = cv::ximgproc::createDisparityWLSFilter(stereo);
+    wls_filter->setLambda(8000.0);
+    wls_filter->setSigmaColor(1.5);
 }
 
 /* ---- status bar ---- */
@@ -568,9 +595,12 @@ void DepthWindow::updateStatus()
 
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "FPS: %.1f  |  numDisp: %d  blockSize: %d  |  "
+             "FPS: %.1f  |  %s  numDisp: %d  block: %d  WLS: %s  |  "
              "proc: %dx%d (%.0f%%)  |  %s",
-             current_fps, num_disparities, block_size,
+             current_fps,
+             use_sgbm ? "SGBM" : "BM",
+             num_disparities, block_size,
+             use_wls ? "ON" : "OFF",
              proc_w, proc_h, proc_scale * 100.0,
              backend_status.c_str());
     status_lbl->setText(buf);
@@ -615,6 +645,16 @@ void DepthWindow::keyPressEvent(QKeyEvent *e)
         proc_scale = 0.25;
         changed = true;
     }
+    else if (e->key() == Qt::Key_S) {
+        use_sgbm = !use_sgbm;
+        changed = true;
+        printf("Matcher: %s\n", use_sgbm ? "StereoSGBM" : "StereoBM");
+    }
+    else if (e->key() == Qt::Key_W) {
+        use_wls = !use_wls;
+        printf("WLS filter: %s\n", use_wls ? "ON" : "OFF");
+        updateStatus();
+    }
     else if (e->key() == Qt::Key_D) {
         show_rectified = !show_rectified;
         printf("Debug view: %s\n", show_rectified ? "rectified L/R" : "disparity");
@@ -622,8 +662,10 @@ void DepthWindow::keyPressEvent(QKeyEvent *e)
 
     if (changed) {
         rebuildStereo();
-        printf("numDisparities=%d  blockSize=%d  scale=%.2f\n",
-               num_disparities, block_size, proc_scale);
+        printf("%s  numDisp=%d  block=%d  scale=%.2f  WLS=%s\n",
+               use_sgbm ? "SGBM" : "BM",
+               num_disparities, block_size, proc_scale,
+               use_wls ? "ON" : "OFF");
         updateStatus();
     }
 
@@ -714,6 +756,14 @@ void DepthWindow::onTimer()
         cv::Mat disp_raw;
         stereo->compute(proc_l, proc_r, disp_raw);
 
+        if (use_wls && wls_filter) {
+            cv::Mat disp_right;
+            right_stereo->compute(proc_r, proc_l, disp_right);
+            cv::Mat disp_filtered;
+            wls_filter->filter(disp_raw, proc_l, disp_filtered, disp_right);
+            disp_raw = disp_filtered;
+        }
+
         /* 6. Convert fixed-point to float and clamp invalid pixels */
         cv::Mat disp_float;
         disp_raw.convertTo(disp_float, CV_32F, 1.0 / 16.0);
@@ -760,8 +810,11 @@ void DepthWindow::onTimer()
     if (since_print >= FPS_PRINT_INTERVAL) {
         int proc_w = (int)(CAMERA_WIDTH  * proc_scale);
         int proc_h = (int)(CAMERA_HEIGHT * proc_scale);
-        printf("FPS: %.1f  |  numDisp=%d  block=%d  proc=%dx%d\n",
-               current_fps, num_disparities, block_size,
+        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  proc=%dx%d\n",
+               current_fps,
+               use_sgbm ? "SGBM" : "BM",
+               num_disparities, block_size,
+               use_wls ? "ON" : "OFF",
                proc_w, proc_h);
         last_fps_print = now;
     }
