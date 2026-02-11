@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc)
-find_package(Qt5 REQUIRED COMPONENTS Widgets)
+find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
 
@@ -22,4 +22,14 @@ target_link_libraries(depth_pipeline
     ${OpenCV_LIBS}
     Qt5::Widgets
     PkgConfig::LIBCAMERA
+)
+
+add_executable(view_synthesis src/view_synthesis.cpp)
+target_link_libraries(view_synthesis
+    ${OpenCV_LIBS}
+    Qt5::Widgets
+    Qt5::OpenGL
+    PkgConfig::LIBCAMERA
+    GLESv2
+    EGL
 )
