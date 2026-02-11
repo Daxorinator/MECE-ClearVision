@@ -306,18 +306,28 @@ static bool load_calibration(const char *path, CalibData *out)
         return false;
     }
 
-    /* Recompute rectification from R/T with correct parameters.
-     * CALIB_ZERO_DISPARITY aligns principal points (required for StereoBM).
-     * alpha=1 keeps all source pixels (black borders but nothing lost). */
-    cv::Rect roi_l, roi_r;
-    cv::stereoRectify(out->K_left, out->dist_left,
-                      out->K_right, out->dist_right,
-                      out->image_size, out->R, out->T,
-                      out->R1, out->R2, out->P1, out->P2, out->Q,
-                      cv::CALIB_ZERO_DISPARITY, 1,
-                      cv::Size(), &roi_l, &roi_r);
+    /* Load pre-saved rectification matrices from calibration.
+     * Fall back to recomputing from R/T if not present in the JSON. */
+    out->R1 = json_array_to_mat(obj["R1"].toArray());
+    out->R2 = json_array_to_mat(obj["R2"].toArray());
+    out->P1 = json_array_to_mat(obj["P1"].toArray());
+    out->P2 = json_array_to_mat(obj["P2"].toArray());
+    out->Q  = json_array_to_mat(obj["Q"].toArray());
 
-    printf("Rectification recomputed (CALIB_ZERO_DISPARITY, alpha=1)\n");
+    if (out->R1.empty() || out->R2.empty() ||
+        out->P1.empty() || out->P2.empty() || out->Q.empty()) {
+        printf("Rectification matrices not in JSON, recomputing from R/T...\n");
+        cv::Rect roi_l, roi_r;
+        cv::stereoRectify(out->K_left, out->dist_left,
+                          out->K_right, out->dist_right,
+                          out->image_size, out->R, out->T,
+                          out->R1, out->R2, out->P1, out->P2, out->Q,
+                          cv::CALIB_ZERO_DISPARITY, 0,
+                          out->image_size, &roi_l, &roi_r);
+    } else {
+        printf("Rectification matrices loaded from calibration JSON\n");
+    }
+
     printf("  T vector: [%.1f, %.1f, %.1f]\n",
            out->T.at<double>(0), out->T.at<double>(1), out->T.at<double>(2));
     printf("  P1 focal=%.1f  cx=%.1f  cy=%.1f\n",
@@ -326,9 +336,6 @@ static bool load_calibration(const char *path, CalibData *out)
     printf("  P2 focal=%.1f  cx=%.1f  cy=%.1f\n",
            out->P2.at<double>(0,0), out->P2.at<double>(0,2),
            out->P2.at<double>(1,2));
-    printf("  ROI L: %dx%d+%d+%d  ROI R: %dx%d+%d+%d\n",
-           roi_l.width, roi_l.height, roi_l.x, roi_l.y,
-           roi_r.width, roi_r.height, roi_r.x, roi_r.y);
 
     return true;
 }
