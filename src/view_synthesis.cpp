@@ -2,8 +2,8 @@
  * View Synthesis: DIBR (Depth-Image Based Rendering) via GPU Compute Shaders
  *
  * Synthesises a novel viewpoint from a virtual camera positioned halfway
- * between the two physical cameras using forward warping on the Pi 5's
- * VideoCore VII (OpenGL ES 3.1 compute shaders).
+ * between the two physical cameras using forward warping via
+ * OpenGL ES 3.1 compute shaders.
  *
  * Build:
  *   cd build && cmake .. && make view_synthesis
@@ -20,6 +20,8 @@
  *   W     - Toggle WLS disparity filter
  *   1/2/3 - Processing scale: 1.0x, 0.5x, 0.25x
  *   H     - Toggle hole filling
+ *   F     - Toggle face-tracking shift
+ *   C     - Recalibrate face tracker (look straight ahead first)
  */
 
 #include <cstdio>
@@ -35,15 +37,12 @@
 #include <memory>
 #include <algorithm>
 
-#include <sys/mman.h>
-#include <dirent.h>
-
-#include <libcamera/libcamera.h>
-
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/ximgproc/disparity_filter.hpp>
+
+#include "face_tracker.h"
 
 #include <QApplication>
 #include <QOpenGLWidget>
@@ -73,151 +72,15 @@
 #define FPS_WINDOW          30
 #define FPS_PRINT_INTERVAL  2.0
 #define HOLE_FILL_MAX_SEARCH 64
+#define FACE_CAM_INDEX      2   // V4L2 index of the USB viewer-facing webcam
+                                // CSI stereo cameras occupy /dev/video0 and /dev/video1
+                                // on Jetson Nano; USB webcam is typically /dev/video2
 
 /* ========================================================================
- * Camera capture (identical to depth_pipeline.cpp)
+ * Camera capture
  * ======================================================================== */
 
-struct MappedBuffer {
-    void   *data;
-    size_t  length;
-};
-
-struct CameraCapture {
-    std::shared_ptr<libcamera::Camera>                camera;
-    std::unique_ptr<libcamera::CameraConfiguration>   config;
-    std::unique_ptr<libcamera::FrameBufferAllocator>  allocator;
-    libcamera::Stream                                *stream;
-    std::vector<std::unique_ptr<libcamera::Request>>  requests;
-    std::map<const libcamera::FrameBuffer *, MappedBuffer> mappings;
-
-    int          width, height;
-    unsigned int stride;
-
-    std::mutex   frame_mutex;
-    cv::Mat      frame;
-    bool         new_frame;
-};
-
-static void process_request(libcamera::Request *request)
-{
-    if (request->status() == libcamera::Request::RequestCancelled)
-        return;
-
-    auto *cap = reinterpret_cast<CameraCapture *>(request->cookie());
-
-    const libcamera::FrameBuffer *fb = request->findBuffer(cap->stream);
-    if (fb) {
-        auto it = cap->mappings.find(fb);
-        if (it != cap->mappings.end()) {
-            std::lock_guard<std::mutex> lock(cap->frame_mutex);
-            cv::Mat tmp(cap->height, cap->width, CV_8UC3,
-                        it->second.data, (size_t)cap->stride);
-            tmp.copyTo(cap->frame);
-            cap->new_frame = true;
-        }
-    }
-
-    request->reuse(libcamera::Request::ReuseBuffers);
-    cap->camera->queueRequest(request);
-}
-
-static bool init_camera(CameraCapture *cap,
-                        std::shared_ptr<libcamera::CameraManager> cm,
-                        int camera_idx, int width, int height)
-{
-    auto cameras = cm->cameras();
-    if (camera_idx >= (int)cameras.size()) {
-        fprintf(stderr, "Camera %d not found (%zu available)\n",
-                camera_idx, cameras.size());
-        return false;
-    }
-
-    cap->camera = cm->get(cameras[camera_idx]->id());
-    if (!cap->camera || cap->camera->acquire()) {
-        fprintf(stderr, "Failed to acquire camera %d\n", camera_idx);
-        return false;
-    }
-
-    cap->config = cap->camera->generateConfiguration(
-        { libcamera::StreamRole::VideoRecording });
-    if (!cap->config || cap->config->empty()) {
-        fprintf(stderr, "Failed to generate config for camera %d\n", camera_idx);
-        return false;
-    }
-
-    libcamera::StreamConfiguration &sc = cap->config->at(0);
-    sc.size        = libcamera::Size(width, height);
-    sc.pixelFormat = libcamera::formats::BGR888;
-
-    if (cap->camera->configure(cap->config.get()) != 0) {
-        fprintf(stderr, "Failed to configure camera %d\n", camera_idx);
-        return false;
-    }
-
-    cap->stream = sc.stream();
-    cap->width  = sc.size.width;
-    cap->height = sc.size.height;
-    cap->stride = sc.stride;
-
-    cap->allocator =
-        std::make_unique<libcamera::FrameBufferAllocator>(cap->camera);
-    if (cap->allocator->allocate(cap->stream) < 0) {
-        fprintf(stderr, "Buffer allocation failed for camera %d\n", camera_idx);
-        return false;
-    }
-
-    for (const auto &buf : cap->allocator->buffers(cap->stream)) {
-        const auto &planes = buf->planes();
-        void *mem = mmap(NULL, planes[0].length,
-                         PROT_READ | PROT_WRITE, MAP_SHARED,
-                         planes[0].fd.get(), 0);
-        if (mem == MAP_FAILED) {
-            perror("mmap");
-            return false;
-        }
-        cap->mappings[buf.get()] = { mem, planes[0].length };
-    }
-
-    for (const auto &buf : cap->allocator->buffers(cap->stream)) {
-        auto req = cap->camera->createRequest(
-            reinterpret_cast<uint64_t>(cap));
-        if (!req || req->addBuffer(cap->stream, buf.get()) != 0) {
-            fprintf(stderr, "Request setup failed for camera %d\n", camera_idx);
-            return false;
-        }
-        cap->requests.push_back(std::move(req));
-    }
-
-    cap->camera->requestCompleted.connect(process_request);
-
-    if (cap->camera->start() != 0) {
-        fprintf(stderr, "Failed to start camera %d\n", camera_idx);
-        return false;
-    }
-    for (auto &req : cap->requests)
-        cap->camera->queueRequest(req.get());
-
-    cap->new_frame = false;
-    printf("Camera %d: %dx%d BGR888 (stride %u)\n",
-           camera_idx, cap->width, cap->height, cap->stride);
-    return true;
-}
-
-static void cleanup_camera(CameraCapture *cap)
-{
-    if (!cap->camera)
-        return;
-    cap->camera->stop();
-    for (auto &[fb, mb] : cap->mappings)
-        munmap(mb.data, mb.length);
-    cap->mappings.clear();
-    cap->requests.clear();
-    cap->allocator.reset();
-    cap->config.reset();
-    cap->camera->release();
-    cap->camera.reset();
-}
+#include "camera_capture.h"
 
 /* ========================================================================
  * JSON calibration loader (identical to depth_pipeline.cpp)
@@ -571,9 +434,7 @@ class SynthWindow : public QOpenGLWidget {
     Q_OBJECT
 
 public:
-    SynthWindow(std::shared_ptr<libcamera::CameraManager> cm,
-                const CalibData &calib,
-                QWidget *parent = nullptr);
+    SynthWindow(const CalibData &calib, QWidget *parent = nullptr);
     ~SynthWindow();
 
 protected:
@@ -583,7 +444,6 @@ protected:
     void keyPressEvent(QKeyEvent *e) override;
 
 private:
-    std::shared_ptr<libcamera::CameraManager> cm;
     CalibData calib;
     CameraCapture left_cap, right_cap;
     bool cameras_ok;
@@ -617,6 +477,10 @@ private:
     /* Timer */
     QTimer *timer;
 
+    /* Face tracking */
+    FaceTracker *face_tracker          = nullptr;
+    bool         face_tracking_enabled = false;
+
     /* FPS tracking */
     std::deque<std::chrono::steady_clock::time_point> frame_times;
     std::chrono::steady_clock::time_point last_fps_print;
@@ -635,11 +499,8 @@ private:
 
 /* ---- constructor ---- */
 
-SynthWindow::SynthWindow(
-    std::shared_ptr<libcamera::CameraManager> cm_in,
-    const CalibData &calib_in,
-    QWidget *parent)
-    : QOpenGLWidget(parent), cm(cm_in), calib(calib_in), cameras_ok(false),
+SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
+    : QOpenGLWidget(parent), calib(calib_in), cameras_ok(false),
       num_disparities(64), block_size(9),
       use_sgbm(true), use_wls(true), use_hole_fill(true),
       proc_scale(0.5),
@@ -668,9 +529,9 @@ SynthWindow::SynthWindow(
     rebuildStereo();
 
     /* Initialise cameras */
-    bool ok_l = init_camera(&left_cap, cm, LEFT_CAMERA_ID,
+    bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
                             CAMERA_WIDTH, CAMERA_HEIGHT);
-    bool ok_r = init_camera(&right_cap, cm, RIGHT_CAMERA_ID,
+    bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
                             CAMERA_WIDTH, CAMERA_HEIGHT);
     cameras_ok = ok_l && ok_r;
 
@@ -700,7 +561,46 @@ SynthWindow::SynthWindow(
     printf("  W     - Toggle WLS disparity filter\n");
     printf("  H     - Toggle hole filling\n");
     printf("  1/2/3 - Scale: 1.0x / 0.5x / 0.25x\n");
+    printf("  F     - Toggle face-tracking shift\n");
+    printf("  C     - Recalibrate face tracker (look straight ahead first)\n");
     printf("============================================================\n\n");
+
+    /* ---- Face tracker (USB webcam, background thread) ---- */
+    {
+        // Look for the YuNet ONNX model alongside the binary or in the
+        // source tree; fall back gracefully if it is not present.
+        const char *candidates[] = {
+            "face_detection_yunet_2023mar.onnx",
+            "models/face_detection_yunet_2023mar.onnx",
+            "src/models/face_detection_yunet_2023mar.onnx",
+        };
+        std::string yunet_path;
+        for (const char *c : candidates) {
+            if (FILE *f = std::fopen(c, "rb")) {
+                std::fclose(f);
+                yunet_path = c;
+                break;
+            }
+        }
+
+        if (yunet_path.empty()) {
+            printf("[FaceTracker] Model not found — face tracking disabled.\n");
+            printf("  Download: face_detection_yunet_2023mar.onnx\n");
+            printf("  (see: opencv_zoo/models/face_detection_yunet)\n");
+        } else {
+            face_tracker = new FaceTracker();
+            if (face_tracker->start(FACE_CAM_INDEX, yunet_path)) {
+                face_tracking_enabled = true;
+                printf("[FaceTracker] Started on camera %d  model: %s\n",
+                       FACE_CAM_INDEX, yunet_path.c_str());
+                printf("[FaceTracker] Press C to calibrate, F to toggle\n");
+            } else {
+                printf("[FaceTracker] Failed to start\n");
+                delete face_tracker;
+                face_tracker = nullptr;
+            }
+        }
+    }
 
     last_fps_print = std::chrono::steady_clock::now();
 }
@@ -709,6 +609,11 @@ SynthWindow::SynthWindow(
 
 SynthWindow::~SynthWindow()
 {
+    if (face_tracker) {
+        face_tracker->stop();
+        delete face_tracker;
+        face_tracker = nullptr;
+    }
     shutdownCameras();
     makeCurrent();
     if (prog_depth_splat) glDeleteProgram(prog_depth_splat);
@@ -909,6 +814,22 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
         use_hole_fill = !use_hole_fill;
         printf("Hole filling: %s\n", use_hole_fill ? "ON" : "OFF");
     }
+    else if (e->key() == Qt::Key_F) {
+        if (face_tracker) {
+            face_tracking_enabled = !face_tracking_enabled;
+            printf("Face tracking: %s\n", face_tracking_enabled ? "ON" : "OFF");
+        } else {
+            printf("Face tracking not available (model not loaded)\n");
+        }
+    }
+    else if (e->key() == Qt::Key_C) {
+        if (face_tracker && face_tracking_enabled) {
+            face_tracker->calibrate();
+            printf("Face tracker recalibrated\n");
+        } else {
+            printf("Face tracking not active — cannot calibrate\n");
+        }
+    }
 
     if (changed) {
         int new_w = (int)(CAMERA_WIDTH  * proc_scale);
@@ -1028,12 +949,18 @@ void SynthWindow::paintGL()
     GLuint groups_x = (proc_w + 15) / 16;
     GLuint groups_y = (proc_h + 15) / 16;
 
+    /* ---- Resolve virtual camera shift ---- */
+    const float u_shift = (face_tracking_enabled && face_tracker &&
+                           face_tracker->isActive())
+                          ? face_tracker->shift()
+                          : 0.5f;
+
     /* ---- Pass 1: Depth splat (left view → z-buffer) ---- */
     glUseProgram(prog_depth_splat);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glUniform1i(glGetUniformLocation(prog_depth_splat, "u_disparity"), 0);
-    glUniform1f(glGetUniformLocation(prog_depth_splat, "u_shift"), 0.5f);
+    glUniform1f(glGetUniformLocation(prog_depth_splat, "u_shift"), u_shift);
     glUniform2i(glGetUniformLocation(prog_depth_splat, "u_output_size"), proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -1048,7 +975,7 @@ void SynthWindow::paintGL()
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glUniform1i(glGetUniformLocation(prog_color_splat, "u_disparity"), 1);
-    glUniform1f(glGetUniformLocation(prog_color_splat, "u_shift"), 0.5f);
+    glUniform1f(glGetUniformLocation(prog_color_splat, "u_shift"), u_shift);
     glUniform2i(glGetUniformLocation(prog_color_splat, "u_output_size"), proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
@@ -1102,15 +1029,18 @@ void SynthWindow::paintGL()
     font.setBold(true);
     painter.setFont(font);
 
-    char info[256];
+    char info[320];
     snprintf(info, sizeof(info),
-             "FPS: %.1f | %s nDisp=%d blk=%d WLS=%s Hole=%s | %dx%d",
+             "FPS: %.1f | %s nDisp=%d blk=%d WLS=%s Hole=%s | %dx%d | Track:%s shift=%.2f",
              current_fps,
              use_sgbm ? "SGBM" : "BM",
              num_disparities, block_size,
              use_wls ? "ON" : "OFF",
              use_hole_fill ? "ON" : "OFF",
-             proc_w, proc_h);
+             proc_w, proc_h,
+             (face_tracking_enabled && face_tracker && face_tracker->isActive())
+                 ? "ON" : "OFF",
+             u_shift);
 
     /* Draw text shadow for readability */
     painter.setPen(Qt::black);
@@ -1123,13 +1053,16 @@ void SynthWindow::paintGL()
     double since_print = std::chrono::duration<double>(
         now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
-        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d\n",
+        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d  track=%s  shift=%.2f\n",
                current_fps,
                use_sgbm ? "SGBM" : "BM",
                num_disparities, block_size,
                use_wls ? "ON" : "OFF",
                use_hole_fill ? "ON" : "OFF",
-               proc_w, proc_h);
+               proc_w, proc_h,
+               (face_tracking_enabled && face_tracker && face_tracker->isActive())
+                   ? "ON" : "OFF",
+               u_shift);
         last_fps_print = now;
     }
 }
@@ -1181,31 +1114,10 @@ int main(int argc, char *argv[])
            calib.image_size.width, calib.image_size.height,
            calib.baseline, calib.rms_error);
 
-    /* Start camera manager */
-    auto cm = std::make_shared<libcamera::CameraManager>();
-    if (cm->start()) {
-        fprintf(stderr, "Failed to start camera manager\n");
-        return 1;
-    }
-
-    printf("Found %zu camera(s)\n", cm->cameras().size());
-
-    if (cm->cameras().size() < 2) {
-        fprintf(stderr, "Need at least 2 cameras, found %zu\n",
-                cm->cameras().size());
-        cm->stop();
-        return 1;
-    }
-
-    {
-        SynthWindow win(cm, calib);
-        win.resize(960, 540);
-        win.show();
-        app.exec();
-    }
-
-    cm->stop();
-    return 0;
+    SynthWindow win(calib);
+    win.resize(960, 540);
+    win.show();
+    return app.exec();
 }
 
 #include "view_synthesis.moc"

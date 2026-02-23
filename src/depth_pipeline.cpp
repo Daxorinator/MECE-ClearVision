@@ -3,7 +3,7 @@
  *
  * Consumes calibration JSON from calibration.cpp to produce a live
  * colormapped disparity map using StereoBM.  Uses cv::Mat with NEON
- * auto-vectorization (Pi 5 has no usable OpenCL runtime).
+ * auto-vectorization.
  *
  * Build:
  *   cd build && cmake .. && make depth_pipeline
@@ -33,11 +33,6 @@
 #include <string>
 #include <memory>
 #include <algorithm>
-
-#include <sys/mman.h>
-#include <dirent.h>
-
-#include <libcamera/libcamera.h>
 
 #include <opencv2/core.hpp>
 #include <opencv2/core/ocl.hpp>
@@ -72,149 +67,10 @@
 #define FPS_PRINT_INTERVAL  2.0
 
 /* ========================================================================
- * Camera capture (reused from calibration.cpp)
+ * Camera capture
  * ======================================================================== */
 
-struct MappedBuffer {
-    void   *data;
-    size_t  length;
-};
-
-struct CameraCapture {
-    std::shared_ptr<libcamera::Camera>                camera;
-    std::unique_ptr<libcamera::CameraConfiguration>   config;
-    std::unique_ptr<libcamera::FrameBufferAllocator>  allocator;
-    libcamera::Stream                                *stream;
-    std::vector<std::unique_ptr<libcamera::Request>>  requests;
-    std::map<const libcamera::FrameBuffer *, MappedBuffer> mappings;
-
-    int          width, height;
-    unsigned int stride;
-
-    std::mutex   frame_mutex;
-    cv::Mat      frame;
-    bool         new_frame;
-};
-
-static void process_request(libcamera::Request *request)
-{
-    if (request->status() == libcamera::Request::RequestCancelled)
-        return;
-
-    auto *cap = reinterpret_cast<CameraCapture *>(request->cookie());
-
-    const libcamera::FrameBuffer *fb = request->findBuffer(cap->stream);
-    if (fb) {
-        auto it = cap->mappings.find(fb);
-        if (it != cap->mappings.end()) {
-            std::lock_guard<std::mutex> lock(cap->frame_mutex);
-            cv::Mat tmp(cap->height, cap->width, CV_8UC3,
-                        it->second.data, (size_t)cap->stride);
-            tmp.copyTo(cap->frame);
-            cap->new_frame = true;
-        }
-    }
-
-    request->reuse(libcamera::Request::ReuseBuffers);
-    cap->camera->queueRequest(request);
-}
-
-static bool init_camera(CameraCapture *cap,
-                        std::shared_ptr<libcamera::CameraManager> cm,
-                        int camera_idx, int width, int height)
-{
-    auto cameras = cm->cameras();
-    if (camera_idx >= (int)cameras.size()) {
-        fprintf(stderr, "Camera %d not found (%zu available)\n",
-                camera_idx, cameras.size());
-        return false;
-    }
-
-    cap->camera = cm->get(cameras[camera_idx]->id());
-    if (!cap->camera || cap->camera->acquire()) {
-        fprintf(stderr, "Failed to acquire camera %d\n", camera_idx);
-        return false;
-    }
-
-    cap->config = cap->camera->generateConfiguration(
-        { libcamera::StreamRole::VideoRecording });
-    if (!cap->config || cap->config->empty()) {
-        fprintf(stderr, "Failed to generate config for camera %d\n", camera_idx);
-        return false;
-    }
-
-    libcamera::StreamConfiguration &sc = cap->config->at(0);
-    sc.size        = libcamera::Size(width, height);
-    sc.pixelFormat = libcamera::formats::BGR888;
-
-    if (cap->camera->configure(cap->config.get()) != 0) {
-        fprintf(stderr, "Failed to configure camera %d\n", camera_idx);
-        return false;
-    }
-
-    cap->stream = sc.stream();
-    cap->width  = sc.size.width;
-    cap->height = sc.size.height;
-    cap->stride = sc.stride;
-
-    cap->allocator =
-        std::make_unique<libcamera::FrameBufferAllocator>(cap->camera);
-    if (cap->allocator->allocate(cap->stream) < 0) {
-        fprintf(stderr, "Buffer allocation failed for camera %d\n", camera_idx);
-        return false;
-    }
-
-    for (const auto &buf : cap->allocator->buffers(cap->stream)) {
-        const auto &planes = buf->planes();
-        void *mem = mmap(NULL, planes[0].length,
-                         PROT_READ | PROT_WRITE, MAP_SHARED,
-                         planes[0].fd.get(), 0);
-        if (mem == MAP_FAILED) {
-            perror("mmap");
-            return false;
-        }
-        cap->mappings[buf.get()] = { mem, planes[0].length };
-    }
-
-    for (const auto &buf : cap->allocator->buffers(cap->stream)) {
-        auto req = cap->camera->createRequest(
-            reinterpret_cast<uint64_t>(cap));
-        if (!req || req->addBuffer(cap->stream, buf.get()) != 0) {
-            fprintf(stderr, "Request setup failed for camera %d\n", camera_idx);
-            return false;
-        }
-        cap->requests.push_back(std::move(req));
-    }
-
-    cap->camera->requestCompleted.connect(process_request);
-
-    if (cap->camera->start() != 0) {
-        fprintf(stderr, "Failed to start camera %d\n", camera_idx);
-        return false;
-    }
-    for (auto &req : cap->requests)
-        cap->camera->queueRequest(req.get());
-
-    cap->new_frame = false;
-    printf("Camera %d: %dx%d BGR888 (stride %u)\n",
-           camera_idx, cap->width, cap->height, cap->stride);
-    return true;
-}
-
-static void cleanup_camera(CameraCapture *cap)
-{
-    if (!cap->camera)
-        return;
-    cap->camera->stop();
-    for (auto &[fb, mb] : cap->mappings)
-        munmap(mb.data, mb.length);
-    cap->mappings.clear();
-    cap->requests.clear();
-    cap->allocator.reset();
-    cap->config.reset();
-    cap->camera->release();
-    cap->camera.reset();
-}
+#include "camera_capture.h"
 
 /* ========================================================================
  * Qt5 helpers
@@ -368,9 +224,7 @@ class DepthWindow : public QWidget {
     Q_OBJECT
 
 public:
-    DepthWindow(std::shared_ptr<libcamera::CameraManager> cm,
-                const CalibData &calib,
-                QWidget *parent = nullptr);
+    DepthWindow(const CalibData &calib, QWidget *parent = nullptr);
     ~DepthWindow();
 
 protected:
@@ -383,11 +237,10 @@ private:
     QLabel *view, *status_lbl;
     QTimer *timer;
 
-    std::shared_ptr<libcamera::CameraManager> cm;
     CameraCapture left_cap, right_cap;
     bool cameras_ok;
 
-    /* Rectification maps (cv::Mat — no OpenCL on Pi 5) */
+    /* Rectification maps */
     cv::Mat map_lx, map_ly, map_rx, map_ry;
 
     /* Stereo matcher */
@@ -420,11 +273,8 @@ private:
 
 /* ---- constructor ---- */
 
-DepthWindow::DepthWindow(
-    std::shared_ptr<libcamera::CameraManager> cm_in,
-    const CalibData &calib,
-    QWidget *parent)
-    : QWidget(parent), cm(cm_in), cameras_ok(false),
+DepthWindow::DepthWindow(const CalibData &calib, QWidget *parent)
+    : QWidget(parent), cameras_ok(false),
       num_disparities(64), block_size(9),
       use_sgbm(false), use_wls(false),
       proc_scale(0.5), current_fps(0.0),
@@ -498,9 +348,9 @@ DepthWindow::DepthWindow(
     rebuildStereo();
 
     /* Initialise cameras */
-    bool ok_l = init_camera(&left_cap, cm, LEFT_CAMERA_ID,
+    bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
                             CAMERA_WIDTH, CAMERA_HEIGHT);
-    bool ok_r = init_camera(&right_cap, cm, RIGHT_CAMERA_ID,
+    bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
                             CAMERA_WIDTH, CAMERA_HEIGHT);
     cameras_ok = ok_l && ok_r;
 
@@ -866,30 +716,9 @@ int main(int argc, char *argv[])
            calib.image_size.width, calib.image_size.height,
            calib.baseline, calib.rms_error);
 
-    /* Start camera manager */
-    auto cm = std::make_shared<libcamera::CameraManager>();
-    if (cm->start()) {
-        fprintf(stderr, "Failed to start camera manager\n");
-        return 1;
-    }
-
-    printf("Found %zu camera(s)\n", cm->cameras().size());
-
-    if (cm->cameras().size() < 2) {
-        fprintf(stderr, "Need at least 2 cameras, found %zu\n",
-                cm->cameras().size());
-        cm->stop();
-        return 1;
-    }
-
-    {
-        DepthWindow win(cm, calib);
-        win.show();
-        app.exec();
-    }
-
-    cm->stop();
-    return 0;
+    DepthWindow win(calib);
+    win.show();
+    return app.exec();
 }
 
 #include "depth_pipeline.moc"
