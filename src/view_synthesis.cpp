@@ -600,10 +600,12 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     {
         // Look for the YuNet ONNX model alongside the binary or in the
         // source tree; fall back gracefully if it is not present.
+        // 2022mar is compatible with OpenCV 4.5.x (Jetson L4T build).
+        // 2023mar requires OpenCV 4.8+ and will crash older builds.
         const char *candidates[] = {
-            "face_detection_yunet_2023mar.onnx",
-            "models/face_detection_yunet_2023mar.onnx",
-            "src/models/face_detection_yunet_2023mar.onnx",
+            "face_detection_yunet_2022mar.onnx",
+            "models/face_detection_yunet_2022mar.onnx",
+            "src/models/face_detection_yunet_2022mar.onnx",
         };
         std::string yunet_path;
         for (const char *c : candidates) {
@@ -616,7 +618,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
 
         if (yunet_path.empty()) {
             printf("[FaceTracker] Model not found — face tracking disabled.\n");
-            printf("  Download: face_detection_yunet_2023mar.onnx\n");
+            printf("  Download: face_detection_yunet_2022mar.onnx\n");
             printf("  (see: opencv_zoo/models/face_detection_yunet)\n");
         } else {
             face_tracker = new FaceTracker();
