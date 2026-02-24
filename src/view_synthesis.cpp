@@ -522,7 +522,7 @@ private:
 SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     : QOpenGLWidget(parent), calib(calib_in), cameras_ok(false),
       num_disparities(64), block_size(9),
-      use_sgbm(true), use_wls(true), use_hole_fill(true),
+      use_sgbm(false), use_wls(false), use_hole_fill(true),
       proc_scale(0.5),
       prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0),
       tex_left_color(0), tex_right_color(0),
