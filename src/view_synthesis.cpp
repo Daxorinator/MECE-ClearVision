@@ -41,6 +41,10 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/ximgproc/disparity_filter.hpp>
+#include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudawarping.hpp>
+#include <opencv2/cudastereo.hpp>
 
 #include "face_tracker.h"
 
@@ -488,8 +492,23 @@ private:
 
     /* Staging buffers to avoid per-frame allocation */
     cv::Mat rgba_buf;
-    std::vector<GLuint> clear_zeros;
     std::vector<GLubyte> clear_black;
+
+    /* CUDA acceleration */
+    bool use_cuda{false};
+    cv::cuda::GpuMat gpu_map_lx, gpu_map_ly, gpu_map_rx, gpu_map_ry;
+    cv::cuda::GpuMat gpu_frame_l,  gpu_frame_r;
+    cv::cuda::GpuMat gpu_rect_l,   gpu_rect_r;
+    cv::cuda::GpuMat gpu_proc_l,   gpu_proc_r;
+    cv::cuda::GpuMat gpu_gray_l,   gpu_gray_r;
+    cv::cuda::GpuMat gpu_disp_l;
+    cv::Ptr<cv::cuda::StereoBM> cuda_bm;
+
+    /* Cached GL uniform locations (set once in initializeGL) */
+    GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1};
+    GLint uloc_cs_color{-1}, uloc_cs_disp{-1}, uloc_cs_shift{-1}, uloc_cs_size{-1};
+    GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
+    GLint uloc_disp_texture{-1};
 
     void shutdownCameras();
     void rebuildStereo();
@@ -519,12 +538,21 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     /* Precompute rectification maps */
     cv::initUndistortRectifyMap(
         calib.K_left, calib.dist_left, calib.R1, calib.P1,
-        calib.image_size, CV_16SC2, map_lx, map_ly);
+        calib.image_size, CV_32FC1, map_lx, map_ly);
     cv::initUndistortRectifyMap(
         calib.K_right, calib.dist_right, calib.R2, calib.P2,
-        calib.image_size, CV_16SC2, map_rx, map_ry);
+        calib.image_size, CV_32FC1, map_rx, map_ry);
     printf("Rectification maps precomputed (%dx%d)\n",
            calib.image_size.width, calib.image_size.height);
+
+    if (cv::cuda::getCudaEnabledDeviceCount() > 0) {
+        use_cuda = true;
+        gpu_map_lx.upload(map_lx);  gpu_map_ly.upload(map_ly);
+        gpu_map_rx.upload(map_rx);  gpu_map_ry.upload(map_ry);
+        printf("CUDA available — GPU preprocessing enabled\n");
+    } else {
+        printf("No CUDA — CPU preprocessing fallback\n");
+    }
 
     rebuildStereo();
 
@@ -645,6 +673,7 @@ void SynthWindow::shutdownCameras()
 
 void SynthWindow::rebuildStereo()
 {
+    cuda_bm.reset();
     if (use_sgbm) {
         int P1 = 8 * block_size * block_size;
         int P2 = 32 * block_size * block_size;
@@ -661,6 +690,8 @@ void SynthWindow::rebuildStereo()
         bm->setSpeckleRange(32);
         bm->setTextureThreshold(0);
         bm->setMinDisparity(0);
+        if (use_cuda)
+            cuda_bm = cv::cuda::createStereoBM(num_disparities, block_size);
         stereo = bm;
     }
 
@@ -689,7 +720,6 @@ void SynthWindow::recreateTextures()
     tex_filled      = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth      = create_ssbo(proc_w * proc_h);
 
-    clear_zeros.assign(proc_w * proc_h, 0);
     clear_black.assign(proc_w * proc_h * 4, 0);
 
     printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
@@ -701,8 +731,10 @@ void SynthWindow::clearGPUBuffers()
 {
     /* Clear depth SSBO to 0 */
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_depth);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                    proc_w * proc_h * sizeof(GLuint), clear_zeros.data());
+    static const GLuint zero = 0u;
+    glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI,
+                         0, proc_w * proc_h * sizeof(GLuint),
+                         GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     /* Clear output to black */
@@ -754,6 +786,16 @@ void SynthWindow::initializeGL()
     glBindVertexArray(0);
 
     gl_ready = true;
+    uloc_ds_disparity = glGetUniformLocation(prog_depth_splat, "u_disparity");
+    uloc_ds_shift     = glGetUniformLocation(prog_depth_splat, "u_shift");
+    uloc_ds_size      = glGetUniformLocation(prog_depth_splat, "u_output_size");
+    uloc_cs_color     = glGetUniformLocation(prog_color_splat, "u_color");
+    uloc_cs_disp      = glGetUniformLocation(prog_color_splat, "u_disparity");
+    uloc_cs_shift     = glGetUniformLocation(prog_color_splat, "u_shift");
+    uloc_cs_size      = glGetUniformLocation(prog_color_splat, "u_output_size");
+    uloc_hf_maxsearch = glGetUniformLocation(prog_hole_fill,   "u_max_search");
+    uloc_hf_size      = glGetUniformLocation(prog_hole_fill,   "u_output_size");
+    uloc_disp_texture = glGetUniformLocation(prog_display,     "u_texture");
     printf("GPU pipeline initialised\n");
 
     /* Start frame timer */
@@ -868,19 +910,19 @@ void SynthWindow::paintGL()
     if (!gl_ready || !cameras_ok)
         return;
 
-    /* 1. Grab L/R frames */
+    /* 1. Grab L/R frames — cv::swap avoids clone() memcpy */
     cv::Mat frame_l, frame_r;
     {
         std::lock_guard<std::mutex> lock(left_cap.frame_mutex);
         if (left_cap.new_frame) {
-            frame_l = left_cap.frame.clone();
+            cv::swap(frame_l, left_cap.frame);
             left_cap.new_frame = false;
         }
     }
     {
         std::lock_guard<std::mutex> lock(right_cap.frame_mutex);
         if (right_cap.new_frame) {
-            frame_r = right_cap.frame.clone();
+            cv::swap(frame_r, right_cap.frame);
             right_cap.new_frame = false;
         }
     }
@@ -888,53 +930,112 @@ void SynthWindow::paintGL()
     if (frame_l.empty() || frame_r.empty())
         return;
 
-    /* 2. Rectify at full resolution */
-    cv::Mat rect_l_bgr, rect_r_bgr;
-    cv::remap(frame_l, rect_l_bgr, map_lx, map_ly, cv::INTER_LINEAR);
-    cv::remap(frame_r, rect_r_bgr, map_rx, map_ry, cv::INTER_LINEAR);
+    /* Preprocessing — CUDA or CPU path */
+    cv::Mat disp_l_float, left_rgba;
+    if (use_cuda) {
+        /* 2. Upload frames to GPU */
+        gpu_frame_l.upload(frame_l);
+        gpu_frame_r.upload(frame_r);
 
-    /* 3. Resize for processing */
-    cv::Mat proc_l_bgr, proc_r_bgr;
-    if (proc_scale < 1.0) {
-        cv::resize(rect_l_bgr, proc_l_bgr, cv::Size(proc_w, proc_h), 0, 0,
-                   cv::INTER_AREA);
-        cv::resize(rect_r_bgr, proc_r_bgr, cv::Size(proc_w, proc_h), 0, 0,
-                   cv::INTER_AREA);
+        /* 3. Remap (rectify) on GPU */
+        cv::cuda::remap(gpu_frame_l, gpu_rect_l, gpu_map_lx, gpu_map_ly, cv::INTER_LINEAR);
+        cv::cuda::remap(gpu_frame_r, gpu_rect_r, gpu_map_rx, gpu_map_ry, cv::INTER_LINEAR);
+
+        /* 4. Resize for processing */
+        if (proc_scale < 1.0) {
+            cv::cuda::resize(gpu_rect_l, gpu_proc_l, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
+            cv::cuda::resize(gpu_rect_r, gpu_proc_r, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
+        } else {
+            gpu_proc_l = gpu_rect_l;
+            gpu_proc_r = gpu_rect_r;
+        }
+
+        /* 5. BGR→Gray */
+        cv::cuda::cvtColor(gpu_proc_l, gpu_gray_l, cv::COLOR_BGR2GRAY);
+        cv::cuda::cvtColor(gpu_proc_r, gpu_gray_r, cv::COLOR_BGR2GRAY);
+
+        /* 6. Stereo match */
+        cv::Mat disp_raw_l, disp_raw_r;
+        cv::Mat gray_l_cpu, gray_r_cpu;
+        if (cuda_bm && !use_sgbm) {
+            /* BM on GPU */
+            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
+            gpu_disp_l.download(disp_raw_l);
+            if (use_wls) {
+                gpu_gray_l.download(gray_l_cpu);
+                gpu_gray_r.download(gray_r_cpu);
+                right_stereo->compute(gray_r_cpu, gray_l_cpu, disp_raw_r);
+            }
+        } else {
+            /* SGBM (or BM fallback) — download grays, CPU compute */
+            gpu_gray_l.download(gray_l_cpu);
+            gpu_gray_r.download(gray_r_cpu);
+            stereo->compute(gray_l_cpu, gray_r_cpu, disp_raw_l);
+            right_stereo->compute(gray_r_cpu, gray_l_cpu, disp_raw_r);
+        }
+
+        /* 7. WLS filter */
+        if (use_wls && wls_filter) {
+            cv::Mat disp_filtered;
+            wls_filter->filter(disp_raw_l, gray_l_cpu, disp_filtered, disp_raw_r);
+            disp_raw_l = disp_filtered;
+        }
+
+        /* 8. Convert disparity to float */
+        disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
+        cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
+
+        /* 9. Download color and convert to RGBA */
+        cv::Mat proc_l_bgr;
+        gpu_proc_l.download(proc_l_bgr);
+        cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
+
     } else {
-        proc_l_bgr = rect_l_bgr;
-        proc_r_bgr = rect_r_bgr;
+        /* ---- CPU path ---- */
+        /* 2. Rectify at full resolution */
+        cv::Mat rect_l_bgr, rect_r_bgr;
+        cv::remap(frame_l, rect_l_bgr, map_lx, map_ly, cv::INTER_LINEAR);
+        cv::remap(frame_r, rect_r_bgr, map_rx, map_ry, cv::INTER_LINEAR);
+
+        /* 3. Resize for processing */
+        cv::Mat proc_l_bgr, proc_r_bgr;
+        if (proc_scale < 1.0) {
+            cv::resize(rect_l_bgr, proc_l_bgr, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
+            cv::resize(rect_r_bgr, proc_r_bgr, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
+        } else {
+            proc_l_bgr = rect_l_bgr;
+            proc_r_bgr = rect_r_bgr;
+        }
+
+        /* 4. Grayscale for stereo matching */
+        cv::Mat gray_l, gray_r;
+        cv::cvtColor(proc_l_bgr, gray_l, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(proc_r_bgr, gray_r, cv::COLOR_BGR2GRAY);
+
+        /* 5. Stereo match — left disparity */
+        cv::Mat disp_raw_l;
+        stereo->compute(gray_l, gray_r, disp_raw_l);
+
+        /* 6. Right disparity (for WLS) */
+        cv::Mat disp_raw_r;
+        right_stereo->compute(gray_r, gray_l, disp_raw_r);
+
+        /* 7. WLS filter */
+        if (use_wls && wls_filter) {
+            cv::Mat disp_filtered;
+            wls_filter->filter(disp_raw_l, gray_l, disp_filtered, disp_raw_r);
+            disp_raw_l = disp_filtered;
+        }
+
+        /* 8. Convert left disparity to float */
+        disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
+        cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
+
+        /* 9. Convert left BGR → RGBA for GPU upload */
+        cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
     }
 
-    /* 4. Grayscale for stereo matching */
-    cv::Mat gray_l, gray_r;
-    cv::cvtColor(proc_l_bgr, gray_l, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(proc_r_bgr, gray_r, cv::COLOR_BGR2GRAY);
-
-    /* 5. Stereo match — left disparity */
-    cv::Mat disp_raw_l;
-    stereo->compute(gray_l, gray_r, disp_raw_l);
-
-    /* 6. Right disparity (always needed for DIBR) */
-    cv::Mat disp_raw_r;
-    right_stereo->compute(gray_r, gray_l, disp_raw_r);
-
-    /* 7. Optional WLS filter on left disparity */
-    if (use_wls && wls_filter) {
-        cv::Mat disp_filtered;
-        wls_filter->filter(disp_raw_l, gray_l, disp_filtered, disp_raw_r);
-        disp_raw_l = disp_filtered;
-    }
-
-    /* 8. Convert left disparity to float */
-    cv::Mat disp_l_float;
-    disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
-    cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
-
-    /* 9. Convert left BGR → RGBA for GPU upload */
-    cv::Mat left_rgba;
-    cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
-
-    /* 10. Upload left color + disparity to GPU */
+    /* 10. Upload left color + disparity to GL */
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, left_rgba.data);
@@ -959,9 +1060,9 @@ void SynthWindow::paintGL()
     glUseProgram(prog_depth_splat);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(glGetUniformLocation(prog_depth_splat, "u_disparity"), 0);
-    glUniform1f(glGetUniformLocation(prog_depth_splat, "u_shift"), u_shift);
-    glUniform2i(glGetUniformLocation(prog_depth_splat, "u_output_size"), proc_w, proc_h);
+    glUniform1i(uloc_ds_disparity, 0);
+    glUniform1f(uloc_ds_shift, u_shift);
+    glUniform2i(uloc_ds_size, proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glDispatchCompute(groups_x, groups_y, 1);
 
@@ -971,12 +1072,12 @@ void SynthWindow::paintGL()
     glUseProgram(prog_color_splat);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
-    glUniform1i(glGetUniformLocation(prog_color_splat, "u_color"), 0);
+    glUniform1i(uloc_cs_color, 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(glGetUniformLocation(prog_color_splat, "u_disparity"), 1);
-    glUniform1f(glGetUniformLocation(prog_color_splat, "u_shift"), u_shift);
-    glUniform2i(glGetUniformLocation(prog_color_splat, "u_output_size"), proc_w, proc_h);
+    glUniform1i(uloc_cs_disp, 1);
+    glUniform1f(uloc_cs_shift, u_shift);
+    glUniform2i(uloc_cs_size, proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -990,9 +1091,8 @@ void SynthWindow::paintGL()
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
         glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
         glBindImageTexture(2, tex_filled, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-        glUniform1i(glGetUniformLocation(prog_hole_fill, "u_max_search"),
-                    HOLE_FILL_MAX_SEARCH);
-        glUniform2i(glGetUniformLocation(prog_hole_fill, "u_output_size"), proc_w, proc_h);
+        glUniform1i(uloc_hf_maxsearch, HOLE_FILL_MAX_SEARCH);
+        glUniform2i(uloc_hf_size, proc_w, proc_h);
         glDispatchCompute(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
         display_tex = tex_filled;
@@ -1006,7 +1106,7 @@ void SynthWindow::paintGL()
     glUseProgram(prog_display);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, display_tex);
-    glUniform1i(glGetUniformLocation(prog_display, "u_texture"), 0);
+    glUniform1i(uloc_disp_texture, 0);
     glBindVertexArray(quad_vao);
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
