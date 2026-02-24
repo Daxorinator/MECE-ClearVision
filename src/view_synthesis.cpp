@@ -497,12 +497,13 @@ private:
 
     /* CUDA acceleration */
     bool use_cuda{false};
-    cv::cuda::GpuMat gpu_map_lx, gpu_map_ly, gpu_map_rx, gpu_map_ry;
+    cv::cuda::GpuMat gpu_map_lx,   gpu_map_ly,   gpu_map_rx,   gpu_map_ry;   // full-res maps
+    cv::cuda::GpuMat gpu_map_lx_s, gpu_map_ly_s, gpu_map_rx_s, gpu_map_ry_s; // proc_scale maps
     cv::cuda::GpuMat gpu_frame_l,  gpu_frame_r;
-    cv::cuda::GpuMat gpu_rect_l,   gpu_rect_r;
     cv::cuda::GpuMat gpu_proc_l,   gpu_proc_r;
     cv::cuda::GpuMat gpu_gray_l,   gpu_gray_r;
     cv::cuda::GpuMat gpu_disp_l;
+    cv::cuda::GpuMat gpu_rgba_l;
     cv::Ptr<cv::cuda::StereoBM> cuda_bm;
 
     /* Cached GL uniform locations (set once in initializeGL) */
@@ -731,6 +732,18 @@ void SynthWindow::recreateTextures()
     clear_zeros.assign(proc_w * proc_h, 0);
     clear_black.assign(proc_w * proc_h * 4, 0);
 
+    /* Pre-scale rectification maps to proc_scale so remap outputs directly
+     * at processing resolution without a separate GPU resize pass */
+    if (use_cuda) {
+        cv::Mat slx, sly, srx, sry;
+        cv::resize(map_lx, slx, cv::Size(proc_w, proc_h));
+        cv::resize(map_ly, sly, cv::Size(proc_w, proc_h));
+        cv::resize(map_rx, srx, cv::Size(proc_w, proc_h));
+        cv::resize(map_ry, sry, cv::Size(proc_w, proc_h));
+        gpu_map_lx_s.upload(slx);  gpu_map_ly_s.upload(sly);
+        gpu_map_rx_s.upload(srx);  gpu_map_ry_s.upload(sry);
+    }
+
     printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
 }
 
@@ -946,32 +959,22 @@ void SynthWindow::paintGL()
         gpu_frame_l.upload(frame_l);
         gpu_frame_r.upload(frame_r);
 
-        /* 3. Remap (rectify) on GPU */
-        cv::cuda::remap(gpu_frame_l, gpu_rect_l, gpu_map_lx, gpu_map_ly, cv::INTER_LINEAR);
-        cv::cuda::remap(gpu_frame_r, gpu_rect_r, gpu_map_rx, gpu_map_ry, cv::INTER_LINEAR);
+        /* 3. Remap + rectify directly to proc_scale in one pass (pre-scaled maps
+         *    eliminate the separate resize step, reducing remap work by proc_scale²) */
+        cv::cuda::remap(gpu_frame_l, gpu_proc_l, gpu_map_lx_s, gpu_map_ly_s, cv::INTER_LINEAR);
+        cv::cuda::remap(gpu_frame_r, gpu_proc_r, gpu_map_rx_s, gpu_map_ry_s, cv::INTER_LINEAR);
 
-        /* 4. Resize for processing */
-        if (proc_scale < 1.0) {
-            cv::cuda::resize(gpu_rect_l, gpu_proc_l, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
-            cv::cuda::resize(gpu_rect_r, gpu_proc_r, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
-        } else {
-            gpu_proc_l = gpu_rect_l;
-            gpu_proc_r = gpu_rect_r;
-        }
-
-        /* 5. BGR→Gray */
+        /* 4. BGR→Gray */
         cv::cuda::cvtColor(gpu_proc_l, gpu_gray_l, cv::COLOR_BGR2GRAY);
         cv::cuda::cvtColor(gpu_proc_r, gpu_gray_r, cv::COLOR_BGR2GRAY);
 
-        /* 6. Stereo match */
+        /* 5. Stereo match */
         cv::Mat disp_raw_l, disp_raw_r;
         cv::Mat gray_l_cpu, gray_r_cpu;
         if (cuda_bm && !use_sgbm) {
-            /* BM on GPU — skip WLS (CPU right-matcher costs as much as BM itself) */
+            /* BM on GPU — WLS skipped (CPU right-matcher costs as much as BM itself) */
             cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
             gpu_disp_l.download(disp_raw_l);
-            /* Speckle filter replaces WLS for the GPU path */
-            cv::filterSpeckles(disp_raw_l, -16, 100, 32);
         } else {
             /* SGBM (or BM fallback) — download grays, CPU compute */
             gpu_gray_l.download(gray_l_cpu);
@@ -980,21 +983,23 @@ void SynthWindow::paintGL()
             right_stereo->compute(gray_r_cpu, gray_l_cpu, disp_raw_r);
         }
 
-        /* 7. WLS filter — only runs on SGBM path (gray_l_cpu populated) */
+        /* 6. WLS filter — only runs on SGBM path (gray_l_cpu populated) */
         if (use_wls && wls_filter && !gray_l_cpu.empty()) {
             cv::Mat disp_filtered;
             wls_filter->filter(disp_raw_l, gray_l_cpu, disp_filtered, disp_raw_r);
             disp_raw_l = disp_filtered;
         }
 
-        /* 8. Convert disparity to float */
+        /* 7. Convert disparity to float, clamp negatives */
         disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
         cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
-        /* 9. Download color and convert to RGBA */
-        cv::Mat proc_l_bgr;
-        gpu_proc_l.download(proc_l_bgr);
-        cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
+        /* 8. Median blur suppresses BM horizontal-streak artifacts */
+        cv::medianBlur(disp_l_float, disp_l_float, 3);
+
+        /* 9. BGR→RGBA on GPU, download directly (avoids CPU cvtColor round-trip) */
+        cv::cuda::cvtColor(gpu_proc_l, gpu_rgba_l, cv::COLOR_BGR2RGBA);
+        gpu_rgba_l.download(left_rgba);
 
     } else {
         /* ---- CPU path ---- */
