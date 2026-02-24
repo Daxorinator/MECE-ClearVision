@@ -72,8 +72,7 @@ static std::string csi_pipeline(int sensor_id, int width, int height,
             " ! nvvidconv flip-method=" + std::to_string(flip_method)
           + " ! video/x-raw, format=BGRx"
             " ! videoconvert"
-            " ! video/x-raw, format=BGR"
-            " ! appsink drop=1 max-buffers=2";
+            " ! appsink drop=true max-buffers=1";
 }
 #endif  /* CAMERA_BACKEND_CSI */
 
