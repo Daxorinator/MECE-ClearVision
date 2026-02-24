@@ -250,7 +250,8 @@ private:
     /* CUDA resources */
     bool use_cuda{false};
     cv::cuda::GpuMat gpu_map_lx, gpu_map_ly, gpu_map_rx, gpu_map_ry;
-    cv::Ptr<cv::StereoMatcher> cuda_stereo;  /* holds cuda::StereoBM or cuda::StereoSGM */
+    cv::Ptr<cv::cuda::StereoBM>  cuda_bm;   /* used when !use_sgbm */
+    cv::Ptr<cv::cuda::StereoSGM> cuda_sgm;  /* used when  use_sgbm */
 
     /* CPU stereo matcher (used for WLS right-disparity and non-CUDA fallback) */
     cv::Ptr<cv::StereoMatcher> stereo;
@@ -418,14 +419,19 @@ void DepthWindow::shutdownCameras()
 
 void DepthWindow::rebuildStereo()
 {
-    /* CUDA matchers — used for the main left disparity on the GPU path */
+    /* CUDA matchers — used for the main left disparity on the GPU path.
+     * Separate typed pointers are required: StereoBM needs the 4-arg
+     * compute(..., Stream&) to avoid dispatching through cv::StereoMatcher's
+     * 3-arg base which calls getMat_() and crashes on GpuMat. */
     if (use_cuda) {
+        cuda_bm.release();
+        cuda_sgm.release();
         if (use_sgbm) {
-            cuda_stereo = cv::cuda::StereoSGM::create(
+            cuda_sgm = cv::cuda::StereoSGM::create(
                 0, num_disparities, 10, 120, 5,
                 cv::cuda::StereoSGM::MODE_HH4);
         } else {
-            cuda_stereo = cv::cuda::StereoBM::create(num_disparities, block_size);
+            cuda_bm = cv::cuda::StereoBM::create(num_disparities, block_size);
         }
     }
 
@@ -624,7 +630,11 @@ void DepthWindow::onTimer()
             }
 
             cv::cuda::GpuMat d_disp;
-            cuda_stereo->compute(d_proc_l, d_proc_r, d_disp);
+            if (use_sgbm && cuda_sgm)
+                cuda_sgm->compute(d_proc_l, d_proc_r, d_disp);
+            else if (cuda_bm)
+                cuda_bm->compute(d_proc_l, d_proc_r, d_disp,
+                                 cv::cuda::Stream::Null());
 
             cv::Mat disp_raw;
             d_disp.download(disp_raw);
