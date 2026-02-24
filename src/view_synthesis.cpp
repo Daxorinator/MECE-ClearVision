@@ -492,6 +492,7 @@ private:
 
     /* Staging buffers to avoid per-frame allocation */
     cv::Mat rgba_buf;
+    std::vector<GLuint> clear_zeros;
     std::vector<GLubyte> clear_black;
 
     /* CUDA acceleration */
@@ -720,6 +721,7 @@ void SynthWindow::recreateTextures()
     tex_filled      = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth      = create_ssbo(proc_w * proc_h);
 
+    clear_zeros.assign(proc_w * proc_h, 0);
     clear_black.assign(proc_w * proc_h * 4, 0);
 
     printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
@@ -731,10 +733,8 @@ void SynthWindow::clearGPUBuffers()
 {
     /* Clear depth SSBO to 0 */
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_depth);
-    static const GLuint zero = 0u;
-    glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI,
-                         0, proc_w * proc_h * sizeof(GLuint),
-                         GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                    proc_w * proc_h * sizeof(GLuint), clear_zeros.data());
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     /* Clear output to black */
