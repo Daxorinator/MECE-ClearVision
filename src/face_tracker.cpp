@@ -94,7 +94,11 @@ void FaceTracker::threadLoop()
         return;
     }
 
-    /* Grab one frame to learn the resolution */
+    /* Cap resolution to 640×480 — YuNet on Cortex-A57 at full HD is too slow */
+    cap.set(cv::CAP_PROP_FRAME_WIDTH,  640);
+    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+
+    /* Grab one frame to learn the negotiated resolution */
     cv::Mat frame;
     cap >> frame;
     if (frame.empty()) {
@@ -208,7 +212,7 @@ void FaceTracker::threadLoop()
 
             const float rel_yaw = ema_yaw - ref_yaw;
             u_shift_val = ft_clamp(0.5f + rel_yaw * FT_SENSITIVITY,
-                                   0.0f, 1.0f);
+                                   FT_SHIFT_MIN, FT_SHIFT_MAX);
         }
     }
 

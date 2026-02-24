@@ -558,12 +558,10 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     rebuildStereo();
 
     /* Initialise cameras */
-    /* Request nvvidconv hardware downscale to proc resolution to reduce
-     * videoconvert CPU load (4× less pixels at proc_scale=0.5) */
     bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
+                            CAMERA_WIDTH, CAMERA_HEIGHT);
     bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
+                            CAMERA_WIDTH, CAMERA_HEIGHT);
     cameras_ok = ok_l && ok_r;
 
     if (!cameras_ok) {

@@ -13,6 +13,12 @@
 /* ---- Tuning constants ---- */
 #define FT_SMOOTH      0.35f   // EMA alpha — higher = faster but noisier
 #define FT_SENSITIVITY 0.8f    // radians of yaw → u_shift offset
+// Valid range for u_shift: restrict to the bilateral overlap of both cameras.
+// u_shift=0 → pure left-camera view (no parallax), u_shift=1 → full disparity
+// shift.  Values outside [0.2, 0.8] produce extreme one-sided views with many
+// unfillable holes.
+#define FT_SHIFT_MIN   0.2f
+#define FT_SHIFT_MAX   0.8f
 #define FT_BACKEND     cv::dnn::DNN_BACKEND_DEFAULT
 #define FT_TARGET      cv::dnn::DNN_TARGET_CPU
 
