@@ -692,7 +692,8 @@ void SynthWindow::rebuildStereo()
         bm->setTextureThreshold(0);
         bm->setMinDisparity(0);
         if (use_cuda) {
-            cuda_bm = cv::cuda::createStereoBM(num_disparities, block_size);
+            int cuda_ndisp = std::min(num_disparities, 256);
+            cuda_bm = cv::cuda::createStereoBM(cuda_ndisp, block_size);
             cuda_bm->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
             cuda_bm->setPreFilterCap(31);
             cuda_bm->setUniquenessRatio(15);
@@ -822,7 +823,8 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
     bool changed = false;
 
     if (e->key() == Qt::Key_Plus || e->key() == Qt::Key_Equal) {
-        num_disparities = std::min(num_disparities + 16, 512);
+        int max_disp = (use_cuda && !use_sgbm) ? 256 : 512;
+        num_disparities = std::min(num_disparities + 16, max_disp);
         changed = true;
     }
     else if (e->key() == Qt::Key_Minus) {
