@@ -691,8 +691,14 @@ void SynthWindow::rebuildStereo()
         bm->setSpeckleRange(32);
         bm->setTextureThreshold(0);
         bm->setMinDisparity(0);
-        if (use_cuda)
+        if (use_cuda) {
             cuda_bm = cv::cuda::createStereoBM(num_disparities, block_size);
+            cuda_bm->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
+            cuda_bm->setPreFilterCap(31);
+            cuda_bm->setUniquenessRatio(15);
+            cuda_bm->setTextureThreshold(0);
+            cuda_bm->setMinDisparity(0);
+        }
         stereo = bm;
     }
 
@@ -959,14 +965,11 @@ void SynthWindow::paintGL()
         cv::Mat disp_raw_l, disp_raw_r;
         cv::Mat gray_l_cpu, gray_r_cpu;
         if (cuda_bm && !use_sgbm) {
-            /* BM on GPU */
+            /* BM on GPU — skip WLS (CPU right-matcher costs as much as BM itself) */
             cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
             gpu_disp_l.download(disp_raw_l);
-            if (use_wls) {
-                gpu_gray_l.download(gray_l_cpu);
-                gpu_gray_r.download(gray_r_cpu);
-                right_stereo->compute(gray_r_cpu, gray_l_cpu, disp_raw_r);
-            }
+            /* Speckle filter replaces WLS for the GPU path */
+            cv::filterSpeckles(disp_raw_l, -16, 100, 32);
         } else {
             /* SGBM (or BM fallback) — download grays, CPU compute */
             gpu_gray_l.download(gray_l_cpu);
@@ -975,8 +978,8 @@ void SynthWindow::paintGL()
             right_stereo->compute(gray_r_cpu, gray_l_cpu, disp_raw_r);
         }
 
-        /* 7. WLS filter */
-        if (use_wls && wls_filter) {
+        /* 7. WLS filter — only runs on SGBM path (gray_l_cpu populated) */
+        if (use_wls && wls_filter && !gray_l_cpu.empty()) {
             cv::Mat disp_filtered;
             wls_filter->filter(disp_raw_l, gray_l_cpu, disp_filtered, disp_raw_r);
             disp_raw_l = disp_filtered;
