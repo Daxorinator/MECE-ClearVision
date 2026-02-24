@@ -174,10 +174,12 @@ void FaceTracker::threadLoop()
 
         /* ---- solvePnP: 3-D model → 2-D landmarks ---- */
         cv::Mat rvec, tvec;
+        /* SOLVEPNP_ITERATIVE needs ≥6 points on OpenCV 4.5.x (DLT init);
+         * SOLVEPNP_EPNP handles 4+ non-coplanar points correctly. */
         if (!cv::solvePnP(model_points, image_points,
                           cam_matrix, dist_coeffs,
                           rvec, tvec,
-                          false, cv::SOLVEPNP_ITERATIVE))
+                          false, cv::SOLVEPNP_EPNP))
             continue;
 
         /* ---- Extract yaw from rotation matrix ---- */
