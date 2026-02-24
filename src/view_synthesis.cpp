@@ -930,9 +930,10 @@ void SynthWindow::paintGL()
     if (frame_l.empty() || frame_r.empty())
         return;
 
-    /* Preprocessing — CUDA or CPU path */
+    /* Preprocessing — CUDA path only when GPU BM is available;
+     * SGBM always uses CPU (GPU upload+download overhead outweighs benefit) */
     cv::Mat disp_l_float, left_rgba;
-    if (use_cuda) {
+    if (use_cuda && cuda_bm) {
         /* 2. Upload frames to GPU */
         gpu_frame_l.upload(frame_l);
         gpu_frame_r.upload(frame_r);
