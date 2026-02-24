@@ -35,10 +35,14 @@
 #include <algorithm>
 
 #include <opencv2/core.hpp>
-#include <opencv2/core/ocl.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/ximgproc/disparity_filter.hpp>
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/cudaarithm.hpp>
+#include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudawarping.hpp>
+#include <opencv2/cudastereo.hpp>
 
 #include <QApplication>
 #include <QWidget>
@@ -240,10 +244,15 @@ private:
     CameraCapture left_cap, right_cap;
     bool cameras_ok;
 
-    /* Rectification maps */
+    /* Rectification maps (CPU) */
     cv::Mat map_lx, map_ly, map_rx, map_ry;
 
-    /* Stereo matcher */
+    /* CUDA resources */
+    bool use_cuda{false};
+    cv::cuda::GpuMat gpu_map_lx, gpu_map_ly, gpu_map_rx, gpu_map_ry;
+    cv::Ptr<cv::StereoMatcher> cuda_stereo;  /* holds cuda::StereoBM or cuda::StereoSGM */
+
+    /* CPU stereo matcher (used for WLS right-disparity and non-CUDA fallback) */
     cv::Ptr<cv::StereoMatcher> stereo;
     cv::Ptr<cv::StereoMatcher> right_stereo;
     cv::Ptr<cv::ximgproc::DisparityWLSFilter> wls_filter;
@@ -302,46 +311,44 @@ DepthWindow::DepthWindow(const CalibData &calib, QWidget *parent)
     vbox->addWidget(status_lbl);
 
     /* Report compute backend */
-    if (cv::ocl::haveOpenCL()) {
-        cv::ocl::setUseOpenCL(true);
-        cv::ocl::Context ctx = cv::ocl::Context::getDefault();
-        if (!ctx.empty()) {
-            cv::ocl::Device dev = ctx.device(0);
-            backend_status = "OpenCL: " + dev.name();
-            printf("OpenCL enabled: %s\n", dev.name().c_str());
-        } else {
-            cv::ocl::setUseOpenCL(false);
-            backend_status = "CPU (Cortex-A76 NEON)";
-            printf("OpenCL context failed — using CPU+NEON\n");
-        }
+    use_cuda = cv::cuda::getCudaEnabledDeviceCount() > 0;
+    if (use_cuda) {
+        cv::cuda::DeviceInfo info(0);
+        backend_status = std::string("CUDA: ") + info.name();
+        printf("CUDA enabled: %s\n", info.name());
     } else {
-        backend_status = "CPU (Cortex-A76 NEON)";
-        printf("No OpenCL runtime — using CPU+NEON\n");
+        backend_status = "CPU (NEON)";
+        printf("No CUDA device — using CPU+NEON\n");
     }
 
-    /* Precompute rectification maps */
+    /* Precompute rectification maps as CV_32FC1 (compatible with cuda::remap) */
     cv::initUndistortRectifyMap(
         calib.K_left, calib.dist_left, calib.R1, calib.P1,
-        calib.image_size, CV_16SC2, map_lx, map_ly);
+        calib.image_size, CV_32FC1, map_lx, map_ly);
     cv::initUndistortRectifyMap(
         calib.K_right, calib.dist_right, calib.R2, calib.P2,
-        calib.image_size, CV_16SC2, map_rx, map_ry);
+        calib.image_size, CV_32FC1, map_rx, map_ry);
     printf("Rectification maps precomputed (%dx%d)\n",
            calib.image_size.width, calib.image_size.height);
 
     /* Diagnostic: check map coordinate ranges */
     {
-        cv::Mat map_x_float;
-        /* map_lx is CV_16SC2 (interleaved x,y) — split and check */
-        std::vector<cv::Mat> xy;
-        cv::split(map_lx, xy);
         double mn, mx;
-        cv::minMaxLoc(xy[0], &mn, &mx);
+        cv::minMaxLoc(map_lx, &mn, &mx);
         printf("  Left map X range:  [%.0f, %.0f]  (image width=%d)\n",
                mn, mx, calib.image_size.width);
-        cv::minMaxLoc(xy[1], &mn, &mx);
+        cv::minMaxLoc(map_ly, &mn, &mx);
         printf("  Left map Y range:  [%.0f, %.0f]  (image height=%d)\n",
                mn, mx, calib.image_size.height);
+    }
+
+    /* Upload rectification maps to GPU */
+    if (use_cuda) {
+        gpu_map_lx.upload(map_lx);
+        gpu_map_ly.upload(map_ly);
+        gpu_map_rx.upload(map_rx);
+        gpu_map_ry.upload(map_ry);
+        printf("Rectification maps uploaded to GPU\n");
     }
 
     /* Create stereo matcher with tuned defaults */
@@ -411,6 +418,18 @@ void DepthWindow::shutdownCameras()
 
 void DepthWindow::rebuildStereo()
 {
+    /* CUDA matchers — used for the main left disparity on the GPU path */
+    if (use_cuda) {
+        if (use_sgbm) {
+            cuda_stereo = cv::cuda::StereoSGM::create(
+                0, num_disparities, 10, 120, 5,
+                cv::cuda::StereoSGM::MODE_HH4);
+        } else {
+            cuda_stereo = cv::cuda::StereoBM::create(num_disparities, block_size);
+        }
+    }
+
+    /* CPU matchers — used for WLS right-disparity and non-CUDA fallback */
     if (use_sgbm) {
         int P1 = 8 * block_size * block_size;
         int P2 = 32 * block_size * block_size;
@@ -549,90 +568,161 @@ void DepthWindow::onTimer()
     if (frame_l.empty() || frame_r.empty())
         return;
 
-    /* 2. Convert to grayscale */
-    cv::Mat gray_l, gray_r;
-    cv::cvtColor(frame_l, gray_l, cv::COLOR_BGR2GRAY);
-    cv::cvtColor(frame_r, gray_r, cv::COLOR_BGR2GRAY);
-
-    /* 3. Rectify at full resolution (CV_16SC2 maps = fastest remap) */
-    cv::Mat rect_l, rect_r;
-    cv::remap(gray_l, rect_l, map_lx, map_ly, cv::INTER_LINEAR);
-    cv::remap(gray_r, rect_r, map_rx, map_ry, cv::INTER_LINEAR);
-
     cv::Mat output;
 
-    if (show_rectified) {
-        /* Debug view: rectified L/R side by side with epipolar lines */
-        cv::Mat rect_l_color, rect_r_color;
-        cv::cvtColor(rect_l, rect_l_color, cv::COLOR_GRAY2BGR);
-        cv::cvtColor(rect_r, rect_r_color, cv::COLOR_GRAY2BGR);
+    if (use_cuda) {
+        /* ---- GPU path ---- */
+        cv::cuda::GpuMat d_l, d_r;
+        d_l.upload(frame_l);
+        d_r.upload(frame_r);
 
-        /* Draw horizontal epipolar lines every 40 pixels */
-        for (int y = 0; y < rect_l_color.rows; y += 40) {
-            cv::line(rect_l_color, cv::Point(0, y),
-                     cv::Point(rect_l_color.cols, y),
-                     cv::Scalar(0, 255, 0), 1);
-            cv::line(rect_r_color, cv::Point(0, y),
-                     cv::Point(rect_r_color.cols, y),
-                     cv::Scalar(0, 255, 0), 1);
-        }
+        cv::cuda::GpuMat d_gray_l, d_gray_r;
+        cv::cuda::cvtColor(d_l, d_gray_l, cv::COLOR_BGR2GRAY);
+        cv::cuda::cvtColor(d_r, d_gray_r, cv::COLOR_BGR2GRAY);
 
-        cv::putText(rect_l_color, "LEFT (rectified)",
-                    cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
-                    1.0, cv::Scalar(0, 255, 0), 2);
-        cv::putText(rect_r_color, "RIGHT (rectified)",
-                    cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
-                    1.0, cv::Scalar(0, 255, 0), 2);
+        cv::cuda::GpuMat d_rect_l, d_rect_r;
+        cv::cuda::remap(d_gray_l, d_rect_l, gpu_map_lx, gpu_map_ly, cv::INTER_LINEAR);
+        cv::cuda::remap(d_gray_r, d_rect_r, gpu_map_rx, gpu_map_ry, cv::INTER_LINEAR);
 
-        cv::hconcat(rect_l_color, rect_r_color, output);
-        /* Scale side-by-side to fit display width */
-        double side_scale = DISPLAY_SCALE * 0.5;
-        cv::resize(output, output, cv::Size(), side_scale, side_scale,
-                   cv::INTER_LINEAR);
-    } else {
-        /* 4. Resize for stereo matching if scale < 1.0 */
-        cv::Mat proc_l, proc_r;
-        if (proc_scale < 1.0) {
-            cv::resize(rect_l, proc_l, cv::Size(), proc_scale, proc_scale,
-                       cv::INTER_AREA);
-            cv::resize(rect_r, proc_r, cv::Size(), proc_scale, proc_scale,
-                       cv::INTER_AREA);
+        if (show_rectified) {
+            cv::Mat rect_l, rect_r;
+            d_rect_l.download(rect_l);
+            d_rect_r.download(rect_r);
+
+            cv::Mat rect_l_color, rect_r_color;
+            cv::cvtColor(rect_l, rect_l_color, cv::COLOR_GRAY2BGR);
+            cv::cvtColor(rect_r, rect_r_color, cv::COLOR_GRAY2BGR);
+
+            for (int y = 0; y < rect_l_color.rows; y += 40) {
+                cv::line(rect_l_color, cv::Point(0, y),
+                         cv::Point(rect_l_color.cols, y),
+                         cv::Scalar(0, 255, 0), 1);
+                cv::line(rect_r_color, cv::Point(0, y),
+                         cv::Point(rect_r_color.cols, y),
+                         cv::Scalar(0, 255, 0), 1);
+            }
+            cv::putText(rect_l_color, "LEFT (rectified)",
+                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
+                        1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(rect_r_color, "RIGHT (rectified)",
+                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
+                        1.0, cv::Scalar(0, 255, 0), 2);
+            cv::hconcat(rect_l_color, rect_r_color, output);
+            double side_scale = DISPLAY_SCALE * 0.5;
+            cv::resize(output, output, cv::Size(), side_scale, side_scale,
+                       cv::INTER_LINEAR);
         } else {
-            proc_l = rect_l;
-            proc_r = rect_r;
+            cv::cuda::GpuMat d_proc_l, d_proc_r;
+            if (proc_scale < 1.0) {
+                cv::cuda::resize(d_rect_l, d_proc_l, cv::Size(),
+                                 proc_scale, proc_scale, cv::INTER_AREA);
+                cv::cuda::resize(d_rect_r, d_proc_r, cv::Size(),
+                                 proc_scale, proc_scale, cv::INTER_AREA);
+            } else {
+                d_proc_l = d_rect_l;
+                d_proc_r = d_rect_r;
+            }
+
+            cv::cuda::GpuMat d_disp;
+            cuda_stereo->compute(d_proc_l, d_proc_r, d_disp);
+
+            cv::Mat disp_raw;
+            d_disp.download(disp_raw);
+
+            /* WLS requires a right-disparity map; compute it on CPU */
+            if (use_wls && wls_filter) {
+                cv::Mat proc_l_cpu, proc_r_cpu;
+                d_proc_l.download(proc_l_cpu);
+                d_proc_r.download(proc_r_cpu);
+                cv::Mat disp_right;
+                right_stereo->compute(proc_r_cpu, proc_l_cpu, disp_right);
+                cv::Mat disp_filtered;
+                wls_filter->filter(disp_raw, proc_l_cpu, disp_filtered, disp_right);
+                disp_raw = disp_filtered;
+            }
+
+            cv::Mat disp_float;
+            disp_raw.convertTo(disp_float, CV_32F, 1.0 / 16.0);
+            cv::threshold(disp_float, disp_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            cv::Mat disp8;
+            disp_float.convertTo(disp8, CV_8U, 255.0 / (double)num_disparities);
+            cv::Mat color;
+            cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
+            color.setTo(cv::Scalar(0, 0, 0), (disp_raw <= 0));
+            output = color;
+            cv::resize(output, output, cv::Size(),
+                       DISPLAY_SCALE / proc_scale, DISPLAY_SCALE / proc_scale,
+                       cv::INTER_LINEAR);
         }
+    } else {
+        /* ---- CPU path ---- */
+        cv::Mat gray_l, gray_r;
+        cv::cvtColor(frame_l, gray_l, cv::COLOR_BGR2GRAY);
+        cv::cvtColor(frame_r, gray_r, cv::COLOR_BGR2GRAY);
 
-        /* 5. Stereo matching — output is CV_16S, disparities scaled by 16 */
-        cv::Mat disp_raw;
-        stereo->compute(proc_l, proc_r, disp_raw);
+        cv::Mat rect_l, rect_r;
+        cv::remap(gray_l, rect_l, map_lx, map_ly, cv::INTER_LINEAR);
+        cv::remap(gray_r, rect_r, map_rx, map_ry, cv::INTER_LINEAR);
 
-        if (use_wls && wls_filter) {
-            cv::Mat disp_right;
-            right_stereo->compute(proc_r, proc_l, disp_right);
-            cv::Mat disp_filtered;
-            wls_filter->filter(disp_raw, proc_l, disp_filtered, disp_right);
-            disp_raw = disp_filtered;
+        if (show_rectified) {
+            cv::Mat rect_l_color, rect_r_color;
+            cv::cvtColor(rect_l, rect_l_color, cv::COLOR_GRAY2BGR);
+            cv::cvtColor(rect_r, rect_r_color, cv::COLOR_GRAY2BGR);
+
+            for (int y = 0; y < rect_l_color.rows; y += 40) {
+                cv::line(rect_l_color, cv::Point(0, y),
+                         cv::Point(rect_l_color.cols, y),
+                         cv::Scalar(0, 255, 0), 1);
+                cv::line(rect_r_color, cv::Point(0, y),
+                         cv::Point(rect_r_color.cols, y),
+                         cv::Scalar(0, 255, 0), 1);
+            }
+            cv::putText(rect_l_color, "LEFT (rectified)",
+                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
+                        1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(rect_r_color, "RIGHT (rectified)",
+                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
+                        1.0, cv::Scalar(0, 255, 0), 2);
+            cv::hconcat(rect_l_color, rect_r_color, output);
+            double side_scale = DISPLAY_SCALE * 0.5;
+            cv::resize(output, output, cv::Size(), side_scale, side_scale,
+                       cv::INTER_LINEAR);
+        } else {
+            cv::Mat proc_l, proc_r;
+            if (proc_scale < 1.0) {
+                cv::resize(rect_l, proc_l, cv::Size(), proc_scale, proc_scale,
+                           cv::INTER_AREA);
+                cv::resize(rect_r, proc_r, cv::Size(), proc_scale, proc_scale,
+                           cv::INTER_AREA);
+            } else {
+                proc_l = rect_l;
+                proc_r = rect_r;
+            }
+
+            cv::Mat disp_raw;
+            stereo->compute(proc_l, proc_r, disp_raw);
+
+            if (use_wls && wls_filter) {
+                cv::Mat disp_right;
+                right_stereo->compute(proc_r, proc_l, disp_right);
+                cv::Mat disp_filtered;
+                wls_filter->filter(disp_raw, proc_l, disp_filtered, disp_right);
+                disp_raw = disp_filtered;
+            }
+
+            cv::Mat disp_float;
+            disp_raw.convertTo(disp_float, CV_32F, 1.0 / 16.0);
+            cv::threshold(disp_float, disp_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            cv::Mat disp8;
+            disp_float.convertTo(disp8, CV_8U, 255.0 / (double)num_disparities);
+            cv::Mat color;
+            cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
+            color.setTo(cv::Scalar(0, 0, 0), (disp_raw <= 0));
+            output = color;
+            cv::resize(output, output, cv::Size(),
+                       DISPLAY_SCALE / proc_scale, DISPLAY_SCALE / proc_scale,
+                       cv::INTER_LINEAR);
         }
-
-        /* 6. Convert fixed-point to float and clamp invalid pixels */
-        cv::Mat disp_float;
-        disp_raw.convertTo(disp_float, CV_32F, 1.0 / 16.0);
-        cv::threshold(disp_float, disp_float, 0.0, 0.0, cv::THRESH_TOZERO);
-
-        /* 7. Normalize to 0-255 using the known disparity range */
-        cv::Mat disp8;
-        double max_disp = (double)num_disparities;
-        disp_float.convertTo(disp8, CV_8U, 255.0 / max_disp);
-
-        /* 8. Apply colormap and mask invalid to black */
-        cv::Mat color;
-        cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
-        color.setTo(cv::Scalar(0, 0, 0), (disp_raw <= 0));
-
-        output = color;
-        cv::resize(output, output, cv::Size(),
-                   DISPLAY_SCALE / proc_scale, DISPLAY_SCALE / proc_scale,
-                   cv::INTER_LINEAR);
     }
 
     /* FPS calculation */
