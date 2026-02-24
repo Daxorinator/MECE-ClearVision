@@ -61,7 +61,7 @@ struct CameraCapture {
  *                     6=vert 7=ur-diag
  */
 static std::string csi_pipeline(int sensor_id, int width, int height,
-                                 int fps = 30, int flip_method = 0)
+                                 int fps = 30, int flip_method = 2)
 {
     return  "nvarguscamerasrc sensor-id=" + std::to_string(sensor_id)
           + " ! video/x-raw(memory:NVMM)"
