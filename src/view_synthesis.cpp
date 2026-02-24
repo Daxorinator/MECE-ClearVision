@@ -62,7 +62,7 @@
 #include <QFileInfoList>
 #include <QSurfaceFormat>
 
-#include <GLES3/gl31.h>
+#include <GLES3/gl32.h>
 
 /* ========================================================================
  * Configuration
@@ -492,7 +492,6 @@ private:
 
     /* Staging buffers to avoid per-frame allocation */
     cv::Mat rgba_buf;
-    std::vector<GLuint> clear_zeros;
     std::vector<GLubyte> clear_black;
 
     /* CUDA acceleration */
@@ -721,7 +720,6 @@ void SynthWindow::recreateTextures()
     tex_filled      = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth      = create_ssbo(proc_w * proc_h);
 
-    clear_zeros.assign(proc_w * proc_h, 0);
     clear_black.assign(proc_w * proc_h * 4, 0);
 
     printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
@@ -733,8 +731,10 @@ void SynthWindow::clearGPUBuffers()
 {
     /* Clear depth SSBO to 0 */
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_depth);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                    proc_w * proc_h * sizeof(GLuint), clear_zeros.data());
+    static const GLuint zero = 0u;
+    glClearBufferSubData(GL_SHADER_STORAGE_BUFFER, GL_R32UI,
+                         0, proc_w * proc_h * sizeof(GLuint),
+                         GL_RED_INTEGER, GL_UNSIGNED_INT, &zero);
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
     /* Clear output to black */
@@ -1176,7 +1176,7 @@ int main(int argc, char *argv[])
     /* Request OpenGL ES 3.1 context */
     QSurfaceFormat fmt;
     fmt.setRenderableType(QSurfaceFormat::OpenGLES);
-    fmt.setVersion(3, 1);
+    fmt.setVersion(3, 2);
     fmt.setSwapBehavior(QSurfaceFormat::DoubleBuffer);
     QSurfaceFormat::setDefaultFormat(fmt);
 
