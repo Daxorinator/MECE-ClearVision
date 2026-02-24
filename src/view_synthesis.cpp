@@ -303,8 +303,6 @@ void main() {
     }
     if (left_d > 0u && right_d > 0u)
         col = (left_d < right_d) ? left_col : right_col;
-    else if (left_d > 0u) col = left_col;
-    else if (right_d > 0u) col = right_col;
     imageStore(u_filled, pos, col);
 }
 )";
@@ -498,7 +496,8 @@ private:
     /* CUDA acceleration */
     bool use_cuda{false};
     cv::cuda::GpuMat gpu_map_lx,   gpu_map_ly,   gpu_map_rx,   gpu_map_ry;   // full-res maps
-    cv::cuda::GpuMat gpu_map_lx_s, gpu_map_ly_s, gpu_map_rx_s, gpu_map_ry_s; // proc_scale maps
+    cv::cuda::GpuMat gpu_map_lx_s, gpu_map_ly_s, gpu_map_rx_s, gpu_map_ry_s; // proc_scale maps (full-res source)
+    cv::cuda::GpuMat gpu_map_lx_c, gpu_map_ly_c, gpu_map_rx_c, gpu_map_ry_c; // camera-space maps (proc_scale source)
     cv::cuda::GpuMat gpu_frame_l,  gpu_frame_r;
     cv::cuda::GpuMat gpu_proc_l,   gpu_proc_r;
     cv::cuda::GpuMat gpu_gray_l,   gpu_gray_r;
@@ -559,10 +558,12 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     rebuildStereo();
 
     /* Initialise cameras */
+    /* Request nvvidconv hardware downscale to proc resolution to reduce
+     * videoconvert CPU load (4× less pixels at proc_scale=0.5) */
     bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT);
+                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
     bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT);
+                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
     cameras_ok = ok_l && ok_r;
 
     if (!cameras_ok) {
@@ -742,6 +743,14 @@ void SynthWindow::recreateTextures()
         cv::resize(map_ry, sry, cv::Size(proc_w, proc_h));
         gpu_map_lx_s.upload(slx);  gpu_map_ly_s.upload(sly);
         gpu_map_rx_s.upload(srx);  gpu_map_ry_s.upload(sry);
+
+        /* Camera-space maps: same proc_scale output but source coords
+         * are in proc_scale space (when camera hardware-downscales to proc_w×proc_h).
+         * Multiply pre-scaled map values by proc_scale to address the smaller source. */
+        gpu_map_lx_c.upload(slx * proc_scale);
+        gpu_map_ly_c.upload(sly * proc_scale);
+        gpu_map_rx_c.upload(srx * proc_scale);
+        gpu_map_ry_c.upload(sry * proc_scale);
     }
 
     printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
@@ -849,7 +858,7 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
         changed = true;
     }
     else if (e->key() == Qt::Key_BracketLeft) {
-        block_size = std::max(block_size - 2, 5);
+        block_size = std::max(block_size - 2, 3);
         changed = true;
     }
     else if (e->key() == Qt::Key_1) {
@@ -955,14 +964,22 @@ void SynthWindow::paintGL()
      * SGBM always uses CPU (GPU upload+download overhead outweighs benefit) */
     cv::Mat disp_l_float, left_rgba;
     if (use_cuda && cuda_bm) {
-        /* 2. Upload frames to GPU */
+        /* 2. Upload frames to GPU.
+         * If camera hardware-downscaled to proc_w×proc_h, the upload is 4× smaller
+         * and we use camera-space maps (source coords in proc_scale space).
+         * If camera still outputs full-res (e.g. after runtime scale change),
+         * fall back to pre-scaled maps (source coords in full-res space). */
+        bool cam_at_proc = (frame_l.cols == proc_w && frame_l.rows == proc_h);
         gpu_frame_l.upload(frame_l);
         gpu_frame_r.upload(frame_r);
 
-        /* 3. Remap + rectify directly to proc_scale in one pass (pre-scaled maps
-         *    eliminate the separate resize step, reducing remap work by proc_scale²) */
-        cv::cuda::remap(gpu_frame_l, gpu_proc_l, gpu_map_lx_s, gpu_map_ly_s, cv::INTER_LINEAR);
-        cv::cuda::remap(gpu_frame_r, gpu_proc_r, gpu_map_rx_s, gpu_map_ry_s, cv::INTER_LINEAR);
+        /* 3. Remap + rectify directly to proc_scale in one pass */
+        const cv::cuda::GpuMat &map_lx_use = cam_at_proc ? gpu_map_lx_c : gpu_map_lx_s;
+        const cv::cuda::GpuMat &map_ly_use = cam_at_proc ? gpu_map_ly_c : gpu_map_ly_s;
+        const cv::cuda::GpuMat &map_rx_use = cam_at_proc ? gpu_map_rx_c : gpu_map_rx_s;
+        const cv::cuda::GpuMat &map_ry_use = cam_at_proc ? gpu_map_ry_c : gpu_map_ry_s;
+        cv::cuda::remap(gpu_frame_l, gpu_proc_l, map_lx_use, map_ly_use, cv::INTER_LINEAR);
+        cv::cuda::remap(gpu_frame_r, gpu_proc_r, map_rx_use, map_ry_use, cv::INTER_LINEAR);
 
         /* 4. BGR→Gray */
         cv::cuda::cvtColor(gpu_proc_l, gpu_gray_l, cv::COLOR_BGR2GRAY);

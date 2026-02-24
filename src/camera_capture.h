@@ -60,19 +60,31 @@ struct CameraCapture {
  * flip-method values: 0=none 1=ccw90 2=180 3=cw90 4=horiz 5=ul-diag
  *                     6=vert 7=ur-diag
  */
+/*
+ * out_w / out_h (optional): request nvvidconv to hardware-scale the frame
+ * to this output resolution before videoconvert.  Reduces videoconvert
+ * CPU load proportionally (e.g. 4× at proc_scale=0.5).  Pass 0 to skip.
+ */
 static std::string csi_pipeline(int sensor_id, int width, int height,
+                                 int out_w = 0, int out_h = 0,
                                  int fps = 30, int flip_method = 2)
 {
-    return  "nvarguscamerasrc sensor-id=" + std::to_string(sensor_id)
+    std::string s =
+          "nvarguscamerasrc sensor-id=" + std::to_string(sensor_id)
           + " ! video/x-raw(memory:NVMM)"
               ", width="     + std::to_string(width)
           + ", height="    + std::to_string(height)
           + ", framerate=" + std::to_string(fps) + "/1"
           + ", format=NV12"
             " ! nvvidconv flip-method=" + std::to_string(flip_method)
-          + " ! video/x-raw, format=BGRx"
-            " ! videoconvert"
-            " ! appsink drop=true max-buffers=1";
+          + " ! video/x-raw";
+    if (out_w > 0 && out_h > 0 && (out_w != width || out_h != height))
+        s += ", width=" + std::to_string(out_w)
+           + ", height=" + std::to_string(out_h);
+    s += ", format=BGRx"
+         " ! videoconvert"
+         " ! appsink drop=true max-buffers=1";
+    return s;
 }
 #endif  /* CAMERA_BACKEND_CSI */
 
@@ -104,10 +116,11 @@ static void capture_thread_fn(CameraCapture *cap)
  * Returns true on success.
  */
 static bool init_camera(CameraCapture *cap,
-                        int camera_idx, int width, int height)
+                        int camera_idx, int width, int height,
+                        int out_w = 0, int out_h = 0)
 {
 #ifdef CAMERA_BACKEND_CSI
-    const std::string pipeline = csi_pipeline(camera_idx, width, height);
+    const std::string pipeline = csi_pipeline(camera_idx, width, height, out_w, out_h);
     cap->cap.open(pipeline, cv::CAP_GSTREAMER);
     if (!cap->cap.isOpened()) {
         fprintf(stderr, "[Camera %d] Failed to open CSI pipeline:\n  %s\n",
