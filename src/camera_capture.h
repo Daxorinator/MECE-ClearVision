@@ -140,9 +140,11 @@ static bool init_camera(CameraCapture *cap,
 {
 #ifdef CAMERA_BACKEND_CSI
     const std::string pipeline = csi_pipeline(camera_idx, width, height, out_w, out_h);
+    printf("[Camera %d] Opening pipeline:\n  %s\n", camera_idx, pipeline.c_str());
     cap->cap.open(pipeline, cv::CAP_GSTREAMER);
     if (!cap->cap.isOpened()) {
-        fprintf(stderr, "[Camera %d] Failed to open CSI pipeline:\n  %s\n",
+        printf("[Camera %d] FAILED to open CSI pipeline\n", camera_idx);
+        fprintf(stderr, "[Camera %d] FAILED to open CSI pipeline:\n  %s\n",
                 camera_idx, pipeline.c_str());
         return false;
     }

@@ -475,6 +475,8 @@ private:
     GLuint ssbo_depth;
     GLuint quad_vao, quad_vbo;
     bool gl_ready;
+    bool diag_frames_logged{false};   // one-shot: first frame received
+    bool diag_disp_logged{false};     // one-shot: first non-zero disparity
 
     /* Timer */
     QTimer *timer;
@@ -565,9 +567,13 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     cameras_ok = ok_l && ok_r;
 
     if (!cameras_ok) {
-        fprintf(stderr, "Camera init failed\n");
+        printf("[DIAG] CAMERA INIT FAILED  ok_l=%d ok_r=%d\n", ok_l, ok_r);
+        fprintf(stderr, "[DIAG] CAMERA INIT FAILED  ok_l=%d ok_r=%d\n", ok_l, ok_r);
         return;
     }
+    printf("[DIAG] Cameras OK  L:%dx%d  R:%dx%d\n",
+           left_cap.width, left_cap.height,
+           right_cap.width, right_cap.height);
 
     printf("\n============================================================\n");
     printf("VIEW SYNTHESIS (DIBR)\n");
@@ -937,8 +943,8 @@ void SynthWindow::resizeGL(int w, int h)
 
 void SynthWindow::paintGL()
 {
-    if (!gl_ready || !cameras_ok)
-        return;
+    if (!gl_ready) { printf("[DIAG] paintGL: gl_ready=false\n"); return; }
+    if (!cameras_ok) { printf("[DIAG] paintGL: cameras_ok=false\n"); return; }
 
     /* 1. Grab L/R frames — cv::swap avoids clone() memcpy */
     cv::Mat frame_l, frame_r;
@@ -959,6 +965,16 @@ void SynthWindow::paintGL()
 
     if (frame_l.empty() || frame_r.empty())
         return;
+
+    if (!diag_frames_logged) {
+        printf("[DIAG] First frames: L=%dx%d type=%d  R=%dx%d type=%d  proc=%dx%d\n",
+               frame_l.cols, frame_l.rows, frame_l.type(),
+               frame_r.cols, frame_r.rows, frame_r.type(),
+               proc_w, proc_h);
+        printf("[DIAG] use_cuda=%d  cuda_bm=%s  use_sgbm=%d\n",
+               use_cuda, cuda_bm ? "valid" : "null", use_sgbm);
+        diag_frames_logged = true;
+    }
 
     /* Preprocessing — CUDA path only when GPU BM is available;
      * SGBM always uses CPU (GPU upload+download overhead outweighs benefit) */
@@ -1013,6 +1029,18 @@ void SynthWindow::paintGL()
 
         /* 8. Median blur suppresses BM horizontal-streak artifacts */
         cv::medianBlur(disp_l_float, disp_l_float, 3);
+
+        if (!diag_disp_logged) {
+            double dmin, dmax;
+            cv::minMaxLoc(disp_l_float, &dmin, &dmax);
+            cv::Mat mask = disp_l_float > 0.5f;
+            int nonzero = cv::countNonZero(mask);
+            printf("[DIAG] Disparity: min=%.2f max=%.2f nonzero=%d/%d  "
+                   "gray_l=%dx%d\n",
+                   dmin, dmax, nonzero, proc_w * proc_h,
+                   gpu_gray_l.cols, gpu_gray_l.rows);
+            diag_disp_logged = true;
+        }
 
         /* 9. BGR→RGBA on GPU, download directly (avoids CPU cvtColor round-trip) */
         cv::cuda::cvtColor(gpu_proc_l, gpu_rgba_l, cv::COLOR_BGR2RGBA);
