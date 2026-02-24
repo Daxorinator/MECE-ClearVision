@@ -21,6 +21,7 @@
  */
 
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <mutex>
 #include <string>
@@ -61,14 +62,23 @@ struct CameraCapture {
  *                     6=vert 7=ur-diag
  */
 /*
- * out_w / out_h (optional): request nvvidconv to hardware-scale the frame
- * to this output resolution before videoconvert.  Reduces videoconvert
- * CPU load proportionally (e.g. 4× at proc_scale=0.5).  Pass 0 to skip.
+ * out_w / out_h (optional): hardware-scale to this resolution before the
+ * system-memory conversion.  On L4T the scale must stay in NVMM space, so
+ * we insert a second nvvidconv element:
+ *
+ *   nvarguscamerasrc → NV12(NVMM) → nvvidconv(flip+scale) → NV12(NVMM)
+ *                    → nvvidconv(format) → BGRx(system) → videoconvert → BGR
+ *
+ * Reduces CPU videoconvert cost proportionally (4× at proc_scale=0.5).
+ * Pass 0 to skip scaling (original pipeline, always safe).
  */
 static std::string csi_pipeline(int sensor_id, int width, int height,
                                  int out_w = 0, int out_h = 0,
                                  int fps = 30, int flip_method = 2)
 {
+    const bool do_scale = (out_w > 0 && out_h > 0
+                           && (out_w != width || out_h != height));
+
     std::string s =
           "nvarguscamerasrc sensor-id=" + std::to_string(sensor_id)
           + " ! video/x-raw(memory:NVMM)"
@@ -76,12 +86,18 @@ static std::string csi_pipeline(int sensor_id, int width, int height,
           + ", height="    + std::to_string(height)
           + ", framerate=" + std::to_string(fps) + "/1"
           + ", format=NV12"
-            " ! nvvidconv flip-method=" + std::to_string(flip_method)
-          + " ! video/x-raw";
-    if (out_w > 0 && out_h > 0 && (out_w != width || out_h != height))
-        s += ", width=" + std::to_string(out_w)
-           + ", height=" + std::to_string(out_h);
-    s += ", format=BGRx"
+            " ! nvvidconv flip-method=" + std::to_string(flip_method);
+
+    if (do_scale) {
+        /* Scale inside NVMM, then a second nvvidconv converts to system BGRx */
+        s += " ! video/x-raw(memory:NVMM)"
+             ", width="  + std::to_string(out_w)
+           + ", height=" + std::to_string(out_h)
+           + ", format=NV12"
+             " ! nvvidconv";
+    }
+
+    s += " ! video/x-raw, format=BGRx"
          " ! videoconvert"
          " ! appsink drop=true max-buffers=1";
     return s;
@@ -93,8 +109,11 @@ static void capture_thread_fn(CameraCapture *cap)
     while (cap->running.load()) {
         cv::Mat tmp;
         cap->cap >> tmp;
-        if (tmp.empty())
+        if (tmp.empty()) {
+            /* Yield briefly so a broken/slow pipeline can't spin a core to 100% */
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
+        }
 
         /* Swap under lock — O(1) Mat header swap, no pixel copy */
         std::lock_guard<std::mutex> lock(cap->frame_mutex);
