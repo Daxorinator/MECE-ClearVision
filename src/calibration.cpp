@@ -576,14 +576,14 @@ void CalibrationWindow::onTimer()
     {
         std::lock_guard<std::mutex> lock(left_cap.frame_mutex);
         if (left_cap.new_frame) {
-            left_cap.frame.copyTo(frame_l);
+            cv::swap(frame_l, left_cap.frame);
             left_cap.new_frame = false;
         }
     }
     {
         std::lock_guard<std::mutex> lock(right_cap.frame_mutex);
         if (right_cap.new_frame) {
-            right_cap.frame.copyTo(frame_r);
+            cv::swap(frame_r, right_cap.frame);
             right_cap.new_frame = false;
         }
     }
