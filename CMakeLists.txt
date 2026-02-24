@@ -13,8 +13,9 @@ set(CMAKE_AUTOMOC ON)
 option(CAMERA_BACKEND_CSI
     "Use nvarguscamerasrc GStreamer pipeline for Jetson CSI cameras" ON)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc objdetect)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc objdetect dnn)
 find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
+find_package(Threads REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Targets
@@ -24,12 +25,14 @@ add_executable(calibration src/calibration.cpp)
 target_link_libraries(calibration
     ${OpenCV_LIBS}
     Qt5::Widgets
+    Threads::Threads
 )
 
 add_executable(depth_pipeline src/depth_pipeline.cpp)
 target_link_libraries(depth_pipeline
     ${OpenCV_LIBS}
     Qt5::Widgets
+    Threads::Threads
 )
 
 add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
@@ -39,6 +42,7 @@ target_link_libraries(view_synthesis
     Qt5::OpenGL
     GLESv2
     EGL
+    Threads::Threads
 )
 
 # ---------------------------------------------------------------------------
