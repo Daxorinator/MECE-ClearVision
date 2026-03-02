@@ -155,6 +155,13 @@ int main(int argc, char **argv)
     std::printf("YuNet ready — model: %s\n", model_path.c_str());
     std::printf("Press 'q' to quit.\n");
 
+    /* ---- EMA pose smoother ---- */
+    cv::Mat smooth_rvec, smooth_tvec;
+    bool smooth_init = false;
+    // Alpha: fraction of the new measurement to blend in each frame.
+    // Lower = smoother but more lag.  0.25 is a good balance for 30 fps.
+    static constexpr double SMOOTH_ALPHA = 0.25;
+
     /* ---- FPS tracking ---- */
     auto fps_start  = std::chrono::steady_clock::now();
     int  fps_count  = 0;
@@ -171,6 +178,11 @@ int main(int argc, char **argv)
         /* ---- Detect ---- */
         cv::Mat faces;
         detector->detect(frame, faces);
+
+        if (faces.rows == 0) {
+            // No face: reset smoother so next detection starts fresh
+            smooth_init = false;
+        }
 
         if (faces.rows > 0) {
             /*
@@ -214,16 +226,26 @@ int main(int argc, char **argv)
                              rvec, tvec,
                              false, cv::SOLVEPNP_EPNP)) {
 
+                /* EMA smoothing — blend raw pose toward running average */
+                if (!smooth_init) {
+                    rvec.copyTo(smooth_rvec);
+                    tvec.copyTo(smooth_tvec);
+                    smooth_init = true;
+                } else {
+                    smooth_rvec = SMOOTH_ALPHA * rvec + (1.0 - SMOOTH_ALPHA) * smooth_rvec;
+                    smooth_tvec = SMOOTH_ALPHA * tvec + (1.0 - SMOOTH_ALPHA) * smooth_tvec;
+                }
+
                 /* Face-forward direction in camera space.
                  * Model +Z = toward camera, so the face normal = R * [0, 0, 1]
                  * = third column of the rotation matrix.                        */
                 cv::Mat R;
-                cv::Rodrigues(rvec, R);
+                cv::Rodrigues(smooth_rvec, R);
                 cv::Vec3d dir(R.at<double>(0, 2),
                               R.at<double>(1, 2),
                               R.at<double>(2, 2));
 
-                draw_pose_vector(frame, rvec, tvec,
+                draw_pose_vector(frame, smooth_rvec, smooth_tvec,
                                  cam_matrix, dist_coeffs, dir);
 
                 /* Score overlay */
