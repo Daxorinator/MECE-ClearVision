@@ -57,7 +57,7 @@ target_link_libraries(view_synthesis
 )
 
 add_executable(yunet_test demos/yunet_test.cpp)
-target_link_libraries(yunet_test ${OpenCV_LIBS})
+target_link_libraries(yunet_test ${OpenCV_LIBS} Threads::Threads)
 
 # Copy the YuNet face detection model next to the binary after each build
 # so the app can find it regardless of working directory.
