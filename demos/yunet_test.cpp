@@ -311,16 +311,24 @@ int main(int argc, char **argv)
 
             /* ---- solvePnP on smoothed keypoints ---- */
             cv::Mat rvec, tvec;
+            // Temporal seeding: after the first frame use the previous smoothed
+            // pose as the LM starting point (SOLVEPNP_ITERATIVE + useExtrinsicGuess).
+            // This keeps the solver in the same basin of attraction frame-to-frame
+            // and eliminates the near-frontal flip that EPNP exhibits (EPNP
+            // re-solves from scratch each frame and can jump between two
+            // reprojection-equivalent solutions when the face is nearly frontal).
+            // On the first frame we bootstrap with EPNP (no prior available).
+            const bool use_guess = smooth_pose_init;
+            if (use_guess) {
+                smooth_rvec.copyTo(rvec);
+                smooth_tvec.copyTo(tvec);
+            }
             if (cv::solvePnP(MODEL_POINTS, smooth_kpts,
                              cam_matrix, dist_coeffs,
                              rvec, tvec,
-                             false, cv::SOLVEPNP_EPNP)) {
-
-                /* Refine from EPNP seed with Levenberg-Marquardt for
-                 * better near-frontal accuracy (~1 ms, already near minimum) */
-                cv::solvePnPRefineLM(MODEL_POINTS, smooth_kpts,
-                                     cam_matrix, dist_coeffs,
-                                     rvec, tvec);
+                             use_guess,
+                             use_guess ? cv::SOLVEPNP_ITERATIVE
+                                       : cv::SOLVEPNP_EPNP)) {
 
                 /* Second-stage EMA on pose */
                 if (!smooth_pose_init) {
