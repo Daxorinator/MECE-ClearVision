@@ -732,10 +732,19 @@ void SynthWindow::rebuildStereo()
         gpu_gray_r.create(proc_h, proc_w, CV_8U);
         gpu_disp_sgm.create(proc_h, proc_w, CV_16U);
 
-        // P1/P2 matching existing SGBM formula
-        const int P1 = 8  * block_size * block_size;
-        const int P2 = 32 * block_size * block_size;
-        const sgm::StereoSGM::Parameters sgm_params(P1, P2);
+        // P1/P2 must be calibrated to Census Transform cost scale, NOT the
+        // SSD/SAD scale used by OpenCV StereoSGBM.  libSGM uses a 9×7 Census
+        // window whose Hamming distance maxes out at 63.  The SGBM formula
+        // (8/32 × block_size²) gives P1=648, P2=2592 with block_size=9 —
+        // ~10× above max census cost — which locks disparity constant along
+        // each scanline and causes severe horizontal streaking.
+        // libSGM defaults (P1=10, P2=120) are appropriate for census costs.
+        const int P1 = 10;
+        const int P2 = 120;
+        // SCAN_4PATH (H + V + 2 diagonal) halves aggregation work vs 8-path,
+        // recovering FPS on Maxwell while still suppressing most streaking.
+        sgm::StereoSGM::Parameters sgm_params(P1, P2);
+        sgm_params.path_type = sgm::PathType::SCAN_4PATH;
 
         // src_pitch: gpu_gray step in pixels (CV_8U → step == bytes == pixels)
         // dst_pitch: gpu_disp_sgm step in uint16_t units
@@ -747,7 +756,7 @@ void SynthWindow::rebuildStereo()
             sgm::EXECUTE_INOUT_CUDA2CUDA,
             sgm_params);
 
-        printf("[SynthWindow] libSGM CUDA: disp_size=%d P1=%d P2=%d (%dx%d)\n",
+        printf("[SynthWindow] libSGM CUDA: disp_size=%d P1=%d P2=%d 4-path (%dx%d)\n",
                disp_size, P1, P2, proc_w, proc_h);
     }
 }
