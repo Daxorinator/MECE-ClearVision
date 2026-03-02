@@ -14,9 +14,9 @@
  *
  * Controls:
  *   ESC   - Exit
- *   +/-   - Increase/decrease numDisparities (by 16)
+ *   +/-   - Increase/decrease numDisparities (steps of 16 for BM; 64/128/256 for SGBM)
  *   [/]   - Decrease/increase blockSize (by 2, must be odd)
- *   S     - Toggle StereoBM / StereoSGBM
+ *   S     - Toggle StereoBM / StereoSGBM (libSGM CUDA when available)
  *   W     - Toggle WLS disparity filter
  *   1/2/3 - Processing scale: 1.0x, 0.5x, 0.25x
  *   H     - Toggle hole filling
@@ -45,6 +45,8 @@
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/cudastereo.hpp>
+
+#include <libsgm.h>
 
 #include "face_tracker.h"
 
@@ -506,6 +508,8 @@ private:
     cv::cuda::GpuMat gpu_disp_l;
     cv::cuda::GpuMat gpu_rgba_l;
     cv::Ptr<cv::cuda::StereoBM> cuda_bm;
+    std::unique_ptr<sgm::StereoSGM> sgm_cuda;
+    cv::cuda::GpuMat              gpu_disp_sgm;  // CV_16U, libSGM output
 
     /* Cached GL uniform locations (set once in initializeGL) */
     GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1};
@@ -524,7 +528,7 @@ private:
 SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     : QOpenGLWidget(parent), calib(calib_in), cameras_ok(false),
       num_disparities(64), block_size(9),
-      use_sgbm(false), use_wls(false), use_hole_fill(true),
+      use_sgbm(true), use_wls(false), use_hole_fill(true),
       proc_scale(0.5),
       prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0),
       tex_left_color(0), tex_right_color(0),
@@ -584,7 +588,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     printf("Calib RMS error: %.4f px\n", calib.rms_error);
     printf("numDisparities:  %d\n", num_disparities);
     printf("blockSize:       %d\n", block_size);
-    printf("Matcher:         %s\n", use_sgbm ? "StereoSGBM" : "StereoBM");
+    printf("Matcher:         %s\n", use_sgbm ? "SGBM (libSGM CUDA / CPU fallback)" : "StereoBM");
     printf("WLS filter:      %s\n", use_wls ? "ON" : "OFF");
     printf("Hole filling:    %s\n", use_hole_fill ? "ON" : "OFF");
     printf("============================================================\n");
@@ -683,6 +687,7 @@ void SynthWindow::shutdownCameras()
 void SynthWindow::rebuildStereo()
 {
     cuda_bm.reset();
+    sgm_cuda.reset();
     if (use_sgbm) {
         int P1 = 8 * block_size * block_size;
         int P2 = 32 * block_size * block_size;
@@ -715,6 +720,36 @@ void SynthWindow::rebuildStereo()
     wls_filter = cv::ximgproc::createDisparityWLSFilter(stereo);
     wls_filter->setLambda(8000.0);
     wls_filter->setSigmaColor(1.5);
+
+    // libSGM CUDA SGM — replaces CPU SGBM when CUDA is available
+    if (use_sgbm && use_cuda) {
+        // libSGM disparity_size must be 64, 128, or 256
+        const int disp_size = (num_disparities <= 64)  ? 64  :
+                              (num_disparities <= 128) ? 128 : 256;
+
+        // Pre-allocate grayscale + output buffers so pitches are stable
+        gpu_gray_l.create(proc_h, proc_w, CV_8U);
+        gpu_gray_r.create(proc_h, proc_w, CV_8U);
+        gpu_disp_sgm.create(proc_h, proc_w, CV_16U);
+
+        // P1/P2 matching existing SGBM formula
+        const int P1 = 8  * block_size * block_size;
+        const int P2 = 32 * block_size * block_size;
+        const sgm::StereoSGM::Parameters sgm_params(P1, P2);
+
+        // src_pitch: gpu_gray step in pixels (CV_8U → step == bytes == pixels)
+        // dst_pitch: gpu_disp_sgm step in uint16_t units
+        sgm_cuda = std::make_unique<sgm::StereoSGM>(
+            proc_w, proc_h, disp_size,
+            8, 16,
+            static_cast<int>(gpu_gray_l.step),
+            static_cast<int>(gpu_disp_sgm.step / sizeof(uint16_t)),
+            sgm::EXECUTE_INOUT_CUDA2CUDA,
+            sgm_params);
+
+        printf("[SynthWindow] libSGM CUDA: disp_size=%d P1=%d P2=%d (%dx%d)\n",
+               disp_size, P1, P2, proc_w, proc_h);
+    }
 }
 
 /* ---- recreate GPU textures at current proc resolution ---- */
@@ -850,13 +885,28 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
 
     bool changed = false;
 
+    // Valid libSGM disparity sizes in order
+    static constexpr int SGM_DISP_SIZES[] = {64, 128, 256};
+
     if (e->key() == Qt::Key_Plus || e->key() == Qt::Key_Equal) {
-        int max_disp = (use_cuda && !use_sgbm) ? 256 : 512;
-        num_disparities = std::min(num_disparities + 16, max_disp);
+        if (use_sgbm) {
+            // Step up through {64, 128, 256}
+            for (int d : SGM_DISP_SIZES)
+                if (d > num_disparities) { num_disparities = d; break; }
+        } else {
+            num_disparities = std::min(num_disparities + 16,
+                                       use_cuda ? 256 : 512);
+        }
         changed = true;
     }
     else if (e->key() == Qt::Key_Minus) {
-        num_disparities = std::max(num_disparities - 16, 16);
+        if (use_sgbm) {
+            // Step down through {256, 128, 64}
+            for (int i = 2; i >= 0; --i)
+                if (SGM_DISP_SIZES[i] < num_disparities) { num_disparities = SGM_DISP_SIZES[i]; break; }
+        } else {
+            num_disparities = std::max(num_disparities - 16, 16);
+        }
         changed = true;
     }
     else if (e->key() == Qt::Key_BracketRight) {
@@ -881,8 +931,16 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
     }
     else if (e->key() == Qt::Key_S) {
         use_sgbm = !use_sgbm;
+        if (use_sgbm) {
+            // Snap num_disparities to nearest of {64, 128, 256}
+            int best = 64;
+            for (int d : SGM_DISP_SIZES)
+                if (std::abs(d - num_disparities) < std::abs(best - num_disparities))
+                    best = d;
+            num_disparities = best;
+        }
         changed = true;
-        printf("Matcher: %s\n", use_sgbm ? "StereoSGBM" : "StereoBM");
+        printf("Matcher: %s\n", use_sgbm ? "SGBM (libSGM CUDA / CPU fallback)" : "StereoBM");
     }
     else if (e->key() == Qt::Key_W) {
         use_wls = !use_wls;
@@ -971,15 +1029,16 @@ void SynthWindow::paintGL()
                frame_l.cols, frame_l.rows, frame_l.type(),
                frame_r.cols, frame_r.rows, frame_r.type(),
                proc_w, proc_h);
-        printf("[DIAG] use_cuda=%d  cuda_bm=%s  use_sgbm=%d\n",
-               use_cuda, cuda_bm ? "valid" : "null", use_sgbm);
+        printf("[DIAG] use_cuda=%d  cuda_bm=%s  sgm_cuda=%s  use_sgbm=%d\n",
+               use_cuda, cuda_bm ? "valid" : "null",
+               sgm_cuda ? "valid" : "null", use_sgbm);
         diag_frames_logged = true;
     }
 
-    /* Preprocessing — CUDA path only when GPU BM is available;
-     * SGBM always uses CPU (GPU upload+download overhead outweighs benefit) */
+    /* Preprocessing — CUDA path when GPU BM or libSGM is available;
+     * CPU SGBM fallback only when use_cuda=false */
     cv::Mat disp_l_float, left_rgba;
-    if (use_cuda && cuda_bm) {
+    if (use_cuda && (cuda_bm || sgm_cuda)) {
         /* 2. Upload frames to GPU.
          * If camera hardware-downscaled to proc_w×proc_h, the upload is 4× smaller
          * and we use camera-space maps (source coords in proc_scale space).
@@ -1002,33 +1061,31 @@ void SynthWindow::paintGL()
         cv::cuda::cvtColor(gpu_proc_r, gpu_gray_r, cv::COLOR_BGR2GRAY);
 
         /* 5. Stereo match */
-        cv::Mat disp_raw_l, disp_raw_r;
-        cv::Mat gray_l_cpu, gray_r_cpu;
-        if (cuda_bm && !use_sgbm) {
-            /* BM on GPU — WLS skipped (CPU right-matcher costs as much as BM itself) */
-            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
-            gpu_disp_l.download(disp_raw_l);
+        if (sgm_cuda) {
+            /* --- libSGM CUDA path --- */
+            sgm_cuda->execute(gpu_gray_l.data, gpu_gray_r.data, gpu_disp_sgm.data);
+
+            cv::Mat disp_u16;
+            gpu_disp_sgm.download(disp_u16);  // CV_16U, integer pixel disparities
+
+            // Mask libSGM's sentinel value for invalid pixels
+            const auto invalid_val = static_cast<uint16_t>(sgm_cuda->get_invalid_disparity());
+            cv::Mat invalid_mask = (disp_u16 == invalid_val);
+            disp_u16.convertTo(disp_l_float, CV_32F);  // scale 1.0 — already in pixels
+            disp_l_float.setTo(0.0f, invalid_mask);
+            cv::medianBlur(disp_l_float, disp_l_float, 3);
+            // (WLS unavailable — libSGM does internal L-R consistency checking instead)
         } else {
-            /* SGBM (or BM fallback) — download grays, CPU compute */
-            gpu_gray_l.download(gray_l_cpu);
-            gpu_gray_r.download(gray_r_cpu);
-            stereo->compute(gray_l_cpu, gray_r_cpu, disp_raw_l);
-            right_stereo->compute(gray_r_cpu, gray_l_cpu, disp_raw_r);
+            /* --- cuda_bm path --- */
+            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
+            cv::Mat disp_raw_l;
+            gpu_disp_l.download(disp_raw_l);
+
+            // Convert disparity to float, clamp negatives
+            disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
+            cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            cv::medianBlur(disp_l_float, disp_l_float, 3);
         }
-
-        /* 6. WLS filter — only runs on SGBM path (gray_l_cpu populated) */
-        if (use_wls && wls_filter && !gray_l_cpu.empty()) {
-            cv::Mat disp_filtered;
-            wls_filter->filter(disp_raw_l, gray_l_cpu, disp_filtered, disp_raw_r);
-            disp_raw_l = disp_filtered;
-        }
-
-        /* 7. Convert disparity to float, clamp negatives */
-        disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
-        cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
-
-        /* 8. Median blur suppresses BM horizontal-streak artifacts */
-        cv::medianBlur(disp_l_float, disp_l_float, 3);
 
         if (!diag_disp_logged) {
             double dmin, dmax;

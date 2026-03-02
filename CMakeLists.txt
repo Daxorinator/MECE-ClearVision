@@ -18,6 +18,14 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc objdetect 
 find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(Threads REQUIRED)
 
+# ---- libSGM (CUDA semi-global matching) ----
+set(LIBSGM_SHARED        OFF CACHE BOOL "" FORCE)
+set(ENABLE_SAMPLES       OFF CACHE BOOL "" FORCE)
+set(ENABLE_TESTS         OFF CACHE BOOL "" FORCE)
+set(BUILD_OPENCV_WRAPPER OFF CACHE BOOL "" FORCE)
+# AUTO_DETECT_ARCH (ON by default in libSGM) will detect sm_53 on Jetson Nano
+add_subdirectory(extern/libSGM)
+
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
@@ -39,6 +47,7 @@ target_link_libraries(depth_pipeline
 add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
+    sgm
     Qt5::Widgets
     Qt5::OpenGL
     GLESv2
