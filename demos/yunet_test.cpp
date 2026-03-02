@@ -9,7 +9,9 @@
  * Usage:
  *   ./yunet_test [model.onnx] [camera_index]
  *
- * Defaults: face_detection_yunet_2021sep.onnx, camera 0.
+ * Defaults: face_detection_yunet_2021sep.onnx, camera 2.
+ * On Jetson Nano: cameras 0/1 are CSI stereo cameras (need GStreamer pipeline),
+ * camera 2 is the USB face webcam — use default or pass 2 explicitly.
  *
  * Controls:
  *   q — quit
@@ -105,7 +107,7 @@ int main(int argc, char **argv)
 {
     const std::string model_path = (argc > 1)
         ? argv[1] : "face_detection_yunet_2021sep.onnx";
-    const int cam_idx = (argc > 2) ? std::stoi(argv[2]) : 0;
+    const int cam_idx = (argc > 2) ? std::stoi(argv[2]) : 2;  // 2 = USB face webcam on Jetson
 
     /* ---- Open camera ---- */
     cv::VideoCapture cap(cam_idx);
