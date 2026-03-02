@@ -46,18 +46,23 @@ target_link_libraries(view_synthesis
     Threads::Threads
 )
 
+add_executable(yunet_test demos/yunet_test.cpp)
+target_link_libraries(yunet_test ${OpenCV_LIBS})
+
 # Copy the YuNet face detection model next to the binary after each build
 # so the app can find it regardless of working directory.
 # 2021sep is the original model that shipped with FaceDetectorYN (OpenCV 4.5.4).
 # 2022mar/2023mar use newer ONNX opsets that fail to load on OpenCV 4.5.x (Jetson L4T).
 set(YUNET_MODEL "${CMAKE_SOURCE_DIR}/src/models/face_detection_yunet_2021sep.onnx")
 if(EXISTS "${YUNET_MODEL}")
-    add_custom_command(TARGET view_synthesis POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${YUNET_MODEL}"
-            "$<TARGET_FILE_DIR:view_synthesis>/face_detection_yunet_2021sep.onnx"
-        COMMENT "Copying YuNet model to build directory"
-    )
+    foreach(_tgt view_synthesis yunet_test)
+        add_custom_command(TARGET ${_tgt} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${YUNET_MODEL}"
+                "$<TARGET_FILE_DIR:${_tgt}>/face_detection_yunet_2021sep.onnx"
+            COMMENT "Copying YuNet model next to ${_tgt}"
+        )
+    endforeach()
 else()
     message(WARNING "YuNet model not found at ${YUNET_MODEL} — face tracking will be disabled")
 endif()
