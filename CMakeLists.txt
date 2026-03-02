@@ -45,6 +45,7 @@ target_link_libraries(depth_pipeline
 )
 
 add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
+target_include_directories(view_synthesis PRIVATE ${CMAKE_SOURCE_DIR}/extern/libSGM/include)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
     sgm
