@@ -24,11 +24,20 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/objdetect.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+
+// Detection is run at half resolution to reduce CPU load.
+// Keypoints are scaled back to full-res before solvePnP.
+static constexpr int DETECT_W = 320;
+static constexpr int DETECT_H = 240;
 
 /* ---- Canonical 3-D face model (mm), origin at nose tip ----
  *
@@ -103,6 +112,64 @@ static void draw_pose_vector(cv::Mat &frame,
 }
 
 
+/* ---- Background detection state ---- */
+struct DetectResult {
+    cv::Rect2f              bbox;
+    std::vector<cv::Point2f> keypoints;  // already in full-res coords
+    float                   score{0.f};
+    bool                    valid{false};
+};
+
+static std::mutex              detect_mutex;
+static DetectResult            detect_result;
+static std::atomic<bool>       detect_running{false};
+static cv::Mat                 detect_input_frame;
+static std::mutex              detect_input_mutex;
+static std::condition_variable detect_cv;
+static bool                    detect_has_input{false};
+
+
+/* ---- Detection thread ---- */
+static void detection_thread_fn(cv::Ptr<cv::FaceDetectorYN> det,
+                                int fw, int fh)
+{
+    const float sx = static_cast<float>(fw) / DETECT_W;
+    const float sy = static_cast<float>(fh) / DETECT_H;
+    cv::Mat small, faces;
+
+    while (detect_running.load()) {
+        cv::Mat frame_copy;
+        {
+            std::unique_lock<std::mutex> lk(detect_input_mutex);
+            detect_cv.wait(lk, []{ return detect_has_input || !detect_running.load(); });
+            if (!detect_running.load())
+                break;
+            frame_copy = detect_input_frame.clone();
+            detect_has_input = false;
+        }
+
+        cv::resize(frame_copy, small, cv::Size(DETECT_W, DETECT_H));
+        det->detect(small, faces);
+
+        DetectResult res;
+        if (faces.rows > 0) {
+            res.valid = true;
+            res.score = faces.at<float>(0, 14);
+            res.bbox  = cv::Rect2f(faces.at<float>(0, 0) * sx,
+                                   faces.at<float>(0, 1) * sy,
+                                   faces.at<float>(0, 2) * sx,
+                                   faces.at<float>(0, 3) * sy);
+            for (int i = 0; i < 5; ++i)
+                res.keypoints.emplace_back(faces.at<float>(0, 4 + i * 2) * sx,
+                                           faces.at<float>(0, 5 + i * 2) * sy);
+        }
+
+        std::lock_guard<std::mutex> lk(detect_mutex);
+        detect_result = res;
+    }
+}
+
+
 int main(int argc, char **argv)
 {
     const std::string model_path = (argc > 1)
@@ -137,12 +204,12 @@ int main(int argc, char **argv)
         0.0,   0.0,   1.0);
     cv::Mat dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
 
-    /* ---- Create YuNet detector ---- */
+    /* ---- Create YuNet detector at detection resolution ---- */
     cv::Ptr<cv::FaceDetectorYN> detector;
     try {
         detector = cv::FaceDetectorYN::create(
             model_path, "",
-            cv::Size(fw, fh),
+            cv::Size(DETECT_W, DETECT_H),   // half-res for speed
             0.6f,   /* score threshold */
             0.3f,   /* NMS threshold   */
             5000,   /* top-K           */
@@ -152,20 +219,30 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "YuNet init failed: %s\n", ex.what());
         return 1;
     }
-    std::printf("YuNet ready — model: %s\n", model_path.c_str());
+    std::printf("YuNet ready — model: %s  detect size: %dx%d\n",
+                model_path.c_str(), DETECT_W, DETECT_H);
     std::printf("Press 'q' to quit.\n");
 
-    /* ---- EMA pose smoother ---- */
-    cv::Mat smooth_rvec, smooth_tvec;
-    bool smooth_init = false;
+    /* ---- EMA state — smooth keypoints then pose ---- */
     // Alpha: fraction of the new measurement to blend in each frame.
-    // Lower = smoother but more lag.  0.25 is a good balance for 30 fps.
-    static constexpr double SMOOTH_ALPHA = 0.25;
+    // KPT_ALPHA applied to 2-D keypoints before solvePnP (noise at source).
+    // POSE_ALPHA applied to rvec/tvec after solvePnPRefineLM (second stage).
+    static constexpr double KPT_ALPHA  = 0.50;
+    static constexpr double POSE_ALPHA = 0.50;
+
+    std::vector<cv::Point2f> smooth_kpts;
+    bool smooth_kpts_init = false;
+    cv::Mat smooth_rvec, smooth_tvec;
+    bool smooth_pose_init = false;
 
     /* ---- FPS tracking ---- */
     auto fps_start  = std::chrono::steady_clock::now();
     int  fps_count  = 0;
     double fps      = 0.0;
+
+    /* ---- Launch background detection thread ---- */
+    detect_running = true;
+    std::thread det_thread(detection_thread_fn, detector, fw, fh);
 
     while (true) {
         cap >> frame;
@@ -175,16 +252,23 @@ int main(int argc, char **argv)
         /* Mirror effect — matches face_landmarker_demo.py cv.flip(frame, 1) */
         cv::flip(frame, frame, 1);
 
-        /* ---- Detect ---- */
-        cv::Mat faces;
-        detector->detect(frame, faces);
-
-        if (faces.rows == 0) {
-            // No face: reset smoother so next detection starts fresh
-            smooth_init = false;
+        /* Publish latest frame to detection thread (non-blocking) */
+        {
+            std::lock_guard<std::mutex> lk(detect_input_mutex);
+            detect_input_frame = frame.clone();
+            detect_has_input = true;
         }
+        detect_cv.notify_one();
 
-        if (faces.rows > 0) {
+        /* Read latest detection result (non-blocking) */
+        DetectResult cur;
+        { std::lock_guard<std::mutex> lk(detect_mutex); cur = detect_result; }
+
+        if (!cur.valid) {
+            /* No face: reset both EMA states so next detection starts fresh */
+            smooth_kpts_init = false;
+            smooth_pose_init = false;
+        } else {
             /*
              * faces row layout (CV_32F, 15 cols per face):
              *   0-3:   bbox (x, y, w, h)
@@ -194,46 +278,58 @@ int main(int argc, char **argv)
              *   10-11: right_mouth (x, y)
              *   12-13: left_mouth  (x, y)
              *   14:    confidence
+             * All coordinates are already scaled to full-res by detection thread.
              */
-            const float bx    = faces.at<float>(0,  0);
-            const float by    = faces.at<float>(0,  1);
-            const float bw    = faces.at<float>(0,  2);
-            const float bh    = faces.at<float>(0,  3);
-            const float score = faces.at<float>(0, 14);
 
             /* Bounding box */
             cv::rectangle(frame,
-                          cv::Rect(static_cast<int>(bx), static_cast<int>(by),
-                                   static_cast<int>(bw), static_cast<int>(bh)),
+                          cv::Rect(static_cast<int>(cur.bbox.x),
+                                   static_cast<int>(cur.bbox.y),
+                                   static_cast<int>(cur.bbox.width),
+                                   static_cast<int>(cur.bbox.height)),
                           COL_BOX, 2);
 
-            /* Keypoints */
-            std::vector<cv::Point2f> image_pts;
-            image_pts.reserve(5);
-            for (int i = 0; i < 5; ++i) {
-                float px = faces.at<float>(0, 4 + i * 2);
-                float py = faces.at<float>(0, 5 + i * 2);
-                image_pts.emplace_back(px, py);
-                cv::circle(frame, cv::Point(static_cast<int>(px),
-                                            static_cast<int>(py)),
+            /* Keypoints — draw raw, smooth before solvePnP */
+            for (const auto &kp : cur.keypoints)
+                cv::circle(frame, cv::Point(static_cast<int>(kp.x),
+                                            static_cast<int>(kp.y)),
                            4, COL_KPT, -1);
+
+            /* ---- EMA on 2-D keypoints (noise reduction at source) ---- */
+            const auto &image_pts = cur.keypoints;
+            if (!smooth_kpts_init || smooth_kpts.size() != image_pts.size()) {
+                smooth_kpts      = image_pts;
+                smooth_kpts_init = true;
+            } else {
+                for (size_t i = 0; i < image_pts.size(); ++i) {
+                    smooth_kpts[i].x = static_cast<float>(
+                        KPT_ALPHA * image_pts[i].x + (1.0 - KPT_ALPHA) * smooth_kpts[i].x);
+                    smooth_kpts[i].y = static_cast<float>(
+                        KPT_ALPHA * image_pts[i].y + (1.0 - KPT_ALPHA) * smooth_kpts[i].y);
+                }
             }
 
-            /* ---- solvePnP: 3-D model → 2-D landmarks ---- */
+            /* ---- solvePnP on smoothed keypoints ---- */
             cv::Mat rvec, tvec;
-            if (cv::solvePnP(MODEL_POINTS, image_pts,
+            if (cv::solvePnP(MODEL_POINTS, smooth_kpts,
                              cam_matrix, dist_coeffs,
                              rvec, tvec,
                              false, cv::SOLVEPNP_EPNP)) {
 
-                /* EMA smoothing — blend raw pose toward running average */
-                if (!smooth_init) {
+                /* Refine from EPNP seed with Levenberg-Marquardt for
+                 * better near-frontal accuracy (~1 ms, already near minimum) */
+                cv::solvePnPRefineLM(MODEL_POINTS, smooth_kpts,
+                                     cam_matrix, dist_coeffs,
+                                     rvec, tvec);
+
+                /* Second-stage EMA on pose */
+                if (!smooth_pose_init) {
                     rvec.copyTo(smooth_rvec);
                     tvec.copyTo(smooth_tvec);
-                    smooth_init = true;
+                    smooth_pose_init = true;
                 } else {
-                    smooth_rvec = SMOOTH_ALPHA * rvec + (1.0 - SMOOTH_ALPHA) * smooth_rvec;
-                    smooth_tvec = SMOOTH_ALPHA * tvec + (1.0 - SMOOTH_ALPHA) * smooth_tvec;
+                    smooth_rvec = POSE_ALPHA * rvec + (1.0 - POSE_ALPHA) * smooth_rvec;
+                    smooth_tvec = POSE_ALPHA * tvec + (1.0 - POSE_ALPHA) * smooth_tvec;
                 }
 
                 /* Face-forward direction in camera space.
@@ -250,7 +346,7 @@ int main(int argc, char **argv)
 
                 /* Score overlay */
                 char buf[32];
-                std::snprintf(buf, sizeof(buf), "Score: %.2f", score);
+                std::snprintf(buf, sizeof(buf), "Score: %.2f", cur.score);
                 cv::putText(frame, buf, cv::Point(10, 80),
                             cv::FONT_HERSHEY_SIMPLEX, 0.5,
                             cv::Scalar(200, 200, 200), 1);
@@ -276,6 +372,11 @@ int main(int argc, char **argv)
         if ((cv::waitKey(1) & 0xFF) == 'q')
             break;
     }
+
+    /* ---- Shut down detection thread ---- */
+    detect_running = false;
+    detect_cv.notify_all();
+    det_thread.join();
 
     cap.release();
     cv::destroyAllWindows();
