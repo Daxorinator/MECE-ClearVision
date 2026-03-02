@@ -13,7 +13,7 @@ set(CMAKE_AUTOMOC ON)
 option(CAMERA_BACKEND_CSI
     "Use nvarguscamerasrc GStreamer pipeline for Jetson CSI cameras" ON)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d ximgproc objdetect dnn videoio
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui ximgproc objdetect dnn videoio
                                            cudaarithm cudaimgproc cudawarping cudastereo)
 find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(Threads REQUIRED)
