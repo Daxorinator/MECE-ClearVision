@@ -28,8 +28,8 @@ CHECKERBOARD_SIZE = (9, 6)  # width x height of internal corners
 SQUARE_SIZE = 25.0  # millimeters - MEASURE YOUR ACTUAL PRINTED PATTERN!
 
 # Pi Camera numbers (0 for CAM0, 1 for CAM1 on Pi 5)
-LEFT_CAMERA_ID = 0
-RIGHT_CAMERA_ID = 1
+LEFT_CAMERA_ID = 1
+RIGHT_CAMERA_ID = 0
 
 # Camera resolution (Pi Camera 3 native is 4608x2592, but use lower for calibration)
 CAMERA_WIDTH = 1920

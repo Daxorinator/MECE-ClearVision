@@ -61,8 +61,8 @@
  * Configuration
  * ======================================================================== */
 
-#define LEFT_CAMERA_ID      0
-#define RIGHT_CAMERA_ID     1
+#define LEFT_CAMERA_ID      1
+#define RIGHT_CAMERA_ID     0
 #define CAMERA_WIDTH        1920
 #define CAMERA_HEIGHT       1080
 #define DISPLAY_SCALE       0.5
