@@ -420,13 +420,20 @@ CalibrationWindow::CalibrationWindow(QWidget *parent)
     objp = make_object_points();
 
     /* Initialise cameras */
+    printf("[CAL] Opening left camera (id=%d)...\n", LEFT_CAMERA_ID);
     bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
                             CAMERA_WIDTH, CAMERA_HEIGHT);
+    printf("[CAL] Left camera: %s\n", ok_l ? "OK" : "FAILED");
+
+    printf("[CAL] Opening right camera (id=%d)...\n", RIGHT_CAMERA_ID);
     bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
                             CAMERA_WIDTH, CAMERA_HEIGHT);
+    printf("[CAL] Right camera: %s\n", ok_r ? "OK" : "FAILED");
+
     cameras_ok = ok_l && ok_r;
 
     if (!cameras_ok) {
+        printf("[CAL] ERROR: camera init failed  ok_l=%d ok_r=%d\n", ok_l, ok_r);
         status_lbl->setText("Camera init failed - check terminal");
         return;
     }
@@ -692,11 +699,26 @@ void CalibrationWindow::onTimer()
 
 int main(int argc, char *argv[])
 {
+    /* Force stdout/stderr unbuffered so all printf output reaches the
+     * terminal even if the process crashes or is launched without a tty */
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    setvbuf(stderr, nullptr, _IONBF, 0);
+
+    printf("calibration: starting\n");
+
     QApplication app(argc, argv);
 
+    printf("calibration: QApplication created\n");
+
     CalibrationWindow win;
+
+    printf("calibration: window constructed, calling show()\n");
     win.show();
-    return app.exec();
+
+    printf("calibration: entering event loop\n");
+    int ret = app.exec();
+    printf("calibration: event loop exited (%d)\n", ret);
+    return ret;
 }
 
 #include "calibration.moc"
