@@ -77,7 +77,7 @@
 #define TIMER_INTERVAL_MS   33
 #define FPS_WINDOW          30
 #define FPS_PRINT_INTERVAL  2.0
-#define HOLE_FILL_MAX_SEARCH 64
+#define HOLE_FILL_MAX_SEARCH 16
 #define FACE_CAM_INDEX      2   // V4L2 index of the USB viewer-facing webcam
                                 // CSI stereo cameras occupy /dev/video0 and /dev/video1
                                 // on Jetson Nano; USB webcam is typically /dev/video2
