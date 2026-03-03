@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <ctime>
+#include <chrono>
 #include <mutex>
 #include <vector>
 #include <map>
@@ -49,8 +50,8 @@
 #define SQUARE_SIZE_MM      25.0
 #define LEFT_CAMERA_ID      0
 #define RIGHT_CAMERA_ID     1
-#define CAMERA_WIDTH        1920
-#define CAMERA_HEIGHT       1080
+#define CAMERA_WIDTH        1280
+#define CAMERA_HEIGHT        720
 #define MIN_CALIB_IMAGES    15
 #define DISPLAY_SCALE       0.5
 #define DETECT_EVERY_N      4
@@ -374,6 +375,9 @@ private:
     /* Latest full-res frames (kept for sub-pixel refinement on capture) */
     cv::Mat last_frame_l, last_frame_r;
 
+    /* Stall detection timestamps */
+    std::chrono::steady_clock::time_point last_frame_time_l, last_frame_time_r;
+
     void shutdownCameras();
 };
 
@@ -439,6 +443,8 @@ CalibrationWindow::CalibrationWindow(QWidget *parent)
     status_lbl->setText(
         QString("Captured: 0/%1  |  C = capture   Q = calibrate   ESC = exit")
             .arg(MIN_CALIB_IMAGES));
+
+    last_frame_time_l = last_frame_time_r = std::chrono::steady_clock::now();
 
     timer = new QTimer(this);
     connect(timer, &QTimer::timeout, this, &CalibrationWindow::onTimer);
@@ -588,8 +594,24 @@ void CalibrationWindow::onTimer()
         }
     }
 
-    if (frame_l.empty() || frame_r.empty())
+    auto now = std::chrono::steady_clock::now();
+    if (!frame_l.empty()) last_frame_time_l = now;
+    if (!frame_r.empty()) last_frame_time_r = now;
+
+    auto stale_l = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_frame_time_l).count();
+    auto stale_r = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - last_frame_time_r).count();
+
+    if (frame_l.empty() || frame_r.empty()) {
+        const long STALL_MS = 500;
+        if (stale_l > STALL_MS || stale_r > STALL_MS) {
+            status_lbl->setText(
+                QString("CAMERA STALLED — L: %1 ms  R: %2 ms  (Ctrl+C or ESC to quit)")
+                    .arg(stale_l).arg(stale_r));
+        }
         return;
+    }
 
     if (state == ST_CAPTURE) {
         /* Keep full-res frames for sub-pixel refinement on capture */

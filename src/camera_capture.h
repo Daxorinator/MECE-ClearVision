@@ -183,7 +183,7 @@ static bool init_camera(CameraCapture *cap,
 static void cleanup_camera(CameraCapture *cap)
 {
     cap->running = false;
+    cap->cap.release();          // EOS → appsink returns NULL → cap >> tmp returns empty
     if (cap->thread.joinable())
-        cap->thread.join();
-    cap->cap.release();
+        cap->thread.join();      // thread sees empty frame, checks running==false, exits
 }
