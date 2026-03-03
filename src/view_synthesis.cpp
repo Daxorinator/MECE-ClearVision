@@ -328,6 +328,18 @@ void main() {
 }
 )";
 
+/* Zero the depth SSBO entirely on the GPU — avoids uploading a 4 MB
+ * CPU zero-vector every frame via glBufferSubData. */
+static const char *CLEAR_CS = R"(#version 310 es
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer DepthBuf { uint depth[]; };
+uniform int u_total;
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx < uint(u_total)) depth[idx] = 0u;
+}
+)";
+
 /* ========================================================================
  * GL helpers
  * ======================================================================== */
@@ -470,6 +482,8 @@ private:
 
     /* GPU resources */
     GLuint prog_depth_splat, prog_color_splat, prog_hole_fill, prog_display;
+    GLuint prog_clear{0};
+    GLint  uloc_clear_total{-1};
     GLuint tex_left_color, tex_right_color;
     GLuint tex_left_disp, tex_right_disp;
     GLuint tex_output, tex_filled;
@@ -493,7 +507,6 @@ private:
 
     /* Staging buffers to avoid per-frame allocation */
     cv::Mat rgba_buf;
-    std::vector<GLuint> clear_zeros;
     std::vector<GLubyte> clear_black;
     cv::Mat m_disp_l_float;
     cv::Mat m_left_rgba;
@@ -665,6 +678,7 @@ SynthWindow::~SynthWindow()
     if (prog_color_splat) glDeleteProgram(prog_color_splat);
     if (prog_hole_fill)   glDeleteProgram(prog_hole_fill);
     if (prog_display)     glDeleteProgram(prog_display);
+    if (prog_clear)       glDeleteProgram(prog_clear);
     GLuint textures[] = { tex_left_color, tex_right_color,
                           tex_left_disp, tex_right_disp,
                           tex_output, tex_filled };
@@ -784,7 +798,6 @@ void SynthWindow::recreateTextures()
     tex_filled      = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth      = create_ssbo(proc_w * proc_h);
 
-    clear_zeros.assign(proc_w * proc_h, 0);
     clear_black.assign(proc_w * proc_h * 4, 0);
     m_disp_l_float.create(proc_h, proc_w, CV_32F);
     m_left_rgba.create(proc_h, proc_w, CV_8UC4);
@@ -816,13 +829,15 @@ void SynthWindow::recreateTextures()
 
 void SynthWindow::clearGPUBuffers()
 {
-    /* Clear depth SSBO to 0 */
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_depth);
-    glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                    proc_w * proc_h * sizeof(GLuint), clear_zeros.data());
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    /* Clear depth SSBO to 0 on GPU — avoids uploading a ~4 MB zero-vector
+     * every frame via glBufferSubData. */
+    glUseProgram(prog_clear);
+    glUniform1i(uloc_clear_total, proc_w * proc_h);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
+    glDispatchCompute((proc_w * proc_h + 63) / 64, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    /* Clear output to black */
+    /* Clear output texture to black */
     glBindTexture(GL_TEXTURE_2D, tex_output);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, clear_black.data());
@@ -841,8 +856,9 @@ void SynthWindow::initializeGL()
     prog_color_splat = create_compute_program(COLOR_SPLAT_CS);
     prog_hole_fill   = create_compute_program(HOLE_FILL_CS);
     prog_display     = create_render_program(DISPLAY_VS, DISPLAY_FS);
+    prog_clear       = create_compute_program(CLEAR_CS);
 
-    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display) {
+    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear) {
         fprintf(stderr, "FATAL: shader compilation failed\n");
         return;
     }
@@ -881,6 +897,7 @@ void SynthWindow::initializeGL()
     uloc_hf_maxsearch = glGetUniformLocation(prog_hole_fill,   "u_max_search");
     uloc_hf_size      = glGetUniformLocation(prog_hole_fill,   "u_output_size");
     uloc_disp_texture = glGetUniformLocation(prog_display,     "u_texture");
+    uloc_clear_total  = glGetUniformLocation(prog_clear,       "u_total");
     printf("GPU pipeline initialised\n");
 
     /* Kick off the self-sustaining render loop (no fixed-interval cap) */
