@@ -495,6 +495,8 @@ private:
     cv::Mat rgba_buf;
     std::vector<GLuint> clear_zeros;
     std::vector<GLubyte> clear_black;
+    cv::Mat m_disp_l_float;
+    cv::Mat m_left_rgba;
 
     /* CUDA acceleration */
     bool use_cuda{false};
@@ -783,6 +785,8 @@ void SynthWindow::recreateTextures()
 
     clear_zeros.assign(proc_w * proc_h, 0);
     clear_black.assign(proc_w * proc_h * 4, 0);
+    m_disp_l_float.create(proc_h, proc_w, CV_32F);
+    m_left_rgba.create(proc_h, proc_w, CV_8UC4);
 
     /* Pre-scale rectification maps to proc_scale so remap outputs directly
      * at processing resolution without a separate GPU resize pass */
@@ -1046,7 +1050,8 @@ void SynthWindow::paintGL()
 
     /* Preprocessing — CUDA path when GPU BM or libSGM is available;
      * CPU SGBM fallback only when use_cuda=false */
-    cv::Mat disp_l_float, left_rgba;
+    cv::Mat &disp_l_float = m_disp_l_float;
+    cv::Mat &left_rgba    = m_left_rgba;
     if (use_cuda && (cuda_bm || sgm_cuda)) {
         /* 2. Upload frames to GPU.
          * If camera hardware-downscaled to proc_w×proc_h, the upload is 4× smaller
