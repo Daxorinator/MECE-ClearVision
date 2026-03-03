@@ -74,7 +74,6 @@
 #define RIGHT_CAMERA_ID     1
 #define CAMERA_WIDTH        1920
 #define CAMERA_HEIGHT       1080
-#define TIMER_INTERVAL_MS   33
 #define FPS_WINDOW          30
 #define FPS_PRINT_INTERVAL  2.0
 #define HOLE_FILL_MAX_SEARCH 16
@@ -480,8 +479,8 @@ private:
     bool diag_frames_logged{false};   // one-shot: first frame received
     bool diag_disp_logged{false};     // one-shot: first non-zero disparity
 
-    /* Timer */
-    QTimer *timer;
+    /* Timer — singleShot chain drives the render loop (no fixed-interval cap) */
+    bool render_running{false};
 
     /* Face tracking */
     FaceTracker *face_tracker          = nullptr;
@@ -535,7 +534,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
       tex_left_disp(0), tex_right_disp(0),
       tex_output(0), tex_filled(0), ssbo_depth(0),
       quad_vao(0), quad_vbo(0),
-      gl_ready(false), timer(nullptr), current_fps(0.0)
+      gl_ready(false), current_fps(0.0)
 {
     setWindowTitle("View Synthesis (DIBR)");
 
@@ -679,7 +678,7 @@ void SynthWindow::shutdownCameras()
     if (!cameras_ok)
         return;
     cameras_ok = false;
-    if (timer) timer->stop();
+    render_running = false;
     cleanup_camera(&left_cap);
     cleanup_camera(&right_cap);
 }
@@ -879,10 +878,9 @@ void SynthWindow::initializeGL()
     uloc_disp_texture = glGetUniformLocation(prog_display,     "u_texture");
     printf("GPU pipeline initialised\n");
 
-    /* Start frame timer */
-    timer = new QTimer(this);
-    connect(timer, &QTimer::timeout, this, [this]() { update(); });
-    timer->start(TIMER_INTERVAL_MS);
+    /* Kick off the self-sustaining render loop (no fixed-interval cap) */
+    render_running = true;
+    QTimer::singleShot(0, this, [this](){ update(); });
 }
 
 /* ---- key handling ---- */
@@ -1289,6 +1287,11 @@ void SynthWindow::paintGL()
                u_shift);
         last_fps_print = now;
     }
+
+    /* Re-arm the render loop — singleShot(0) posts to the event queue so
+     * other Qt events (key presses etc.) are processed between frames. */
+    if (render_running)
+        QTimer::singleShot(0, this, [this](){ update(); });
 }
 
 /* ========================================================================
