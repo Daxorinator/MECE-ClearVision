@@ -563,11 +563,13 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
 
     rebuildStereo();
 
-    /* Initialise cameras */
+    /* Initialise cameras — request hardware downscale to proc resolution via
+     * a second nvvidconv stage inside the GStreamer pipeline (CSI backend only).
+     * This reduces the per-frame CPU/bus payload from ~12 MB to ~3 MB. */
     bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT);
+                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
     bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT);
+                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
     cameras_ok = ok_l && ok_r;
 
     if (!cameras_ok) {
