@@ -1106,7 +1106,7 @@ void SynthWindow::paintGL()
             disp_u16.convertTo(disp_l_float, CV_32F);  // scale 1.0 — already in pixels
             disp_l_float.setTo(0.0f, invalid_mask);
             gpu_disp_float.upload(disp_l_float);
-            cv::cuda::GaussianBlur(gpu_disp_float, gpu_disp_float, cv::Size(3,3), 0, 0);
+            cv::cuda::createGaussianFilter(gpu_disp_float.type(), gpu_disp_float.type(), cv::Size(3,3), 0, 0)->apply(gpu_disp_float, gpu_disp_float);
             gpu_disp_float.download(disp_l_float);
             // (WLS unavailable — libSGM does internal L-R consistency checking instead)
         } else {
@@ -1119,7 +1119,7 @@ void SynthWindow::paintGL()
             disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
             cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
             gpu_disp_float.upload(disp_l_float);
-            cv::cuda::GaussianBlur(gpu_disp_float, gpu_disp_float, cv::Size(3,3), 0, 0);
+            cv::cuda::createGaussianFilter(gpu_disp_float.type(), gpu_disp_float.type(), cv::Size(3,3), 0, 0)->apply(gpu_disp_float, gpu_disp_float);
             gpu_disp_float.download(disp_l_float);
         }
 
