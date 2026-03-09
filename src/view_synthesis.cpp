@@ -581,6 +581,7 @@ private:
     GLuint ssbo_depth;
     GLuint ssbo_depth_r{0};
     GLuint tex_right_col_rect{0};
+    GLuint tex_right_disp_gl{0};
     GLuint tex_output_r{0};
     GLuint quad_vao, quad_vbo;
     bool gl_ready;
@@ -603,6 +604,7 @@ private:
     cv::Mat rgba_buf;
     std::vector<GLubyte> clear_black;
     cv::Mat m_disp_l_float;
+    cv::Mat m_disp_r_float;
     cv::Mat m_left_rgba;
     cv::Mat m_right_rgba;
 
@@ -618,7 +620,9 @@ private:
     cv::cuda::GpuMat gpu_rgba_l;
     cv::Ptr<cv::cuda::StereoBM> cuda_bm;
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
-    cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
+    cv::cuda::GpuMat              gpu_disp_sgm;    // CV_16U, libSGM left output
+    cv::cuda::GpuMat              gpu_disp_sgm_r;  // CV_16U, libSGM right output
+    cv::cuda::GpuMat              gpu_disp_r_raw;  // CV_16S, cuda_bm right output
     cv::cuda::GpuMat              gpu_disp_float;
     cv::cuda::GpuMat              disp_filtered_gpu;
     bool                          disp_filtered_init{false};
@@ -648,7 +652,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
       tex_left_color(0), tex_right_color(0),
       tex_left_disp(0), tex_right_disp(0),
       tex_output(0), tex_filled(0), ssbo_depth(0), ssbo_depth_r(0),
-      tex_right_col_rect(0), tex_output_r(0),
+      tex_right_col_rect(0), tex_right_disp_gl(0), tex_output_r(0),
       quad_vao(0), quad_vbo(0),
       gl_ready(false), current_fps(0.0)
 {
@@ -784,7 +788,7 @@ SynthWindow::~SynthWindow()
     GLuint textures[] = { tex_left_color, tex_right_color,
                           tex_left_disp, tex_right_disp,
                           tex_output, tex_filled,
-                          tex_right_col_rect, tex_output_r };
+                          tex_right_col_rect, tex_right_disp_gl, tex_output_r };
     for (auto t : textures)
         if (t) glDeleteTextures(1, &t);
     if (ssbo_depth)   glDeleteBuffers(1, &ssbo_depth);
@@ -853,6 +857,7 @@ void SynthWindow::rebuildStereo()
         gpu_gray_l.create(proc_h, proc_w, CV_8U);
         gpu_gray_r.create(proc_h, proc_w, CV_8U);
         gpu_disp_sgm.create(proc_h, proc_w, CV_16U);
+        gpu_disp_sgm_r.create(proc_h, proc_w, CV_16U);
 
         // P1/P2 must be calibrated to Census Transform cost scale, NOT the
         // SSD/SAD scale used by OpenCV StereoSGBM.  libSGM uses a 9×7 Census
@@ -904,6 +909,7 @@ void SynthWindow::recreateTextures()
     tex_filled         = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth         = create_ssbo(proc_w * proc_h);
     tex_right_col_rect = create_texture_rgba8(proc_w, proc_h);
+    tex_right_disp_gl  = create_texture_r32f(proc_w, proc_h);
     tex_output_r       = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth_r       = create_ssbo(proc_w * proc_h);
 
@@ -1209,29 +1215,40 @@ void SynthWindow::paintGL()
         cv::cuda::cvtColor(gpu_proc_l, gpu_gray_l, cv::COLOR_BGR2GRAY);
         cv::cuda::cvtColor(gpu_proc_r, gpu_gray_r, cv::COLOR_BGR2GRAY);
 
-        /* 5. Stereo match */
+        /* 5. Stereo match — left and right disparity */
         if (sgm_cuda) {
             /* --- libSGM CUDA path --- */
             sgm_cuda->execute(gpu_gray_l.data, gpu_gray_r.data, gpu_disp_sgm.data);
+            sgm_cuda->execute(gpu_gray_r.data, gpu_gray_l.data, gpu_disp_sgm_r.data);
+
+            const auto invalid_val = static_cast<uint16_t>(sgm_cuda->get_invalid_disparity());
 
             cv::Mat disp_u16;
-            gpu_disp_sgm.download(disp_u16);  // CV_16U, integer pixel disparities
-
-            // Mask libSGM's sentinel value for invalid pixels
-            const auto invalid_val = static_cast<uint16_t>(sgm_cuda->get_invalid_disparity());
+            gpu_disp_sgm.download(disp_u16);
             cv::Mat invalid_mask = (disp_u16 == invalid_val);
-            disp_u16.convertTo(disp_l_float, CV_32F);  // scale 1.0 — already in pixels
+            disp_u16.convertTo(disp_l_float, CV_32F);
             disp_l_float.setTo(0.0f, invalid_mask);
-            // (WLS unavailable — libSGM does internal L-R consistency checking instead)
+
+            cv::Mat disp_u16_r;
+            gpu_disp_sgm_r.download(disp_u16_r);
+            cv::Mat invalid_mask_r = (disp_u16_r == invalid_val);
+            disp_u16_r.convertTo(m_disp_r_float, CV_32F);
+            m_disp_r_float.setTo(0.0f, invalid_mask_r);
         } else {
             /* --- cuda_bm path --- */
-            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
+            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l,   cv::cuda::Stream::Null());
+            cuda_bm->compute(gpu_gray_r, gpu_gray_l, gpu_disp_r_raw, cv::cuda::Stream::Null());
+
             cv::Mat disp_raw_l;
             gpu_disp_l.download(disp_raw_l);
-
-            // Convert disparity to float, clamp negatives
             disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
             cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
+
+            // Right BM with swapped inputs yields negative values; negate scale to make positive
+            cv::Mat disp_raw_r;
+            gpu_disp_r_raw.download(disp_raw_r);
+            disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
+            cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
         }
 
         if (!diag_disp_logged) {
@@ -1292,9 +1309,12 @@ void SynthWindow::paintGL()
             disp_raw_l = disp_filtered;
         }
 
-        /* 8. Convert left disparity to float */
+        /* 8. Convert left and right disparity to float */
         disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
         cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
+
+        disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
+        cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
         /* 9. Convert left/right BGR → RGBA for GPU upload */
         cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
@@ -1323,10 +1343,14 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
 
-    /* Upload right rectified colour to GL */
+    /* Upload right rectified colour and right disparity to GL */
     glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, m_right_rgba.data);
+
+    glBindTexture(GL_TEXTURE_2D, tex_right_disp_gl);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+                    GL_RED, GL_FLOAT, m_disp_r_float.data);
 
     /* 11. Clear depth buffer and output */
     clearGPUBuffers();
@@ -1366,6 +1390,8 @@ void SynthWindow::paintGL()
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     /* ---- Right-camera DIBR passes ---- */
+    const float right_shift = -(1.0f - u_shift);
+
     /* Clear right depth SSBO */
     glUseProgram(prog_clear);
     glUniform1i(uloc_clear_total, proc_w * proc_h);
@@ -1378,13 +1404,12 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, clear_black.data());
 
-    /* Right depth splat — reuse left disparity with u_shift=-1.0 to invert it on GPU:
-     * dst_x = src_x + disp * (-1.0) = src_x - disp, placing each value at its right-camera x */
+    /* Right depth splat — use actual right disparity with right_shift */
     glUseProgram(prog_depth_splat);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
+    glBindTexture(GL_TEXTURE_2D, tex_right_disp_gl);
     glUniform1i(uloc_ds_disparity, 0);
-    glUniform1f(uloc_ds_shift, -1.0f);
+    glUniform1f(uloc_ds_shift, right_shift);
     glUniform2i(uloc_ds_size, proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -1396,7 +1421,7 @@ void SynthWindow::paintGL()
     glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
     glUniform1i(uloc_bc_colour, 0);
     glUniform2i(uloc_bc_size, proc_w, proc_h);
-    glUniform1f(uloc_bc_shift, -1.0f);
+    glUniform1f(uloc_bc_shift, right_shift);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
     glBindImageTexture(1, tex_output_r, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
