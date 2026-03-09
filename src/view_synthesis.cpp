@@ -228,10 +228,25 @@ void main() {
     if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
     float disp = texelFetch(u_disparity, src, 0).r;
     if (disp < 0.5) return;
-    int dst_x = int(round(float(src.x) + disp * u_shift));
-    if (dst_x < 0 || dst_x >= u_output_size.x) return;
+
+    float dst_xf = float(src.x) + disp * u_shift;
+    int dst_x0 = int(floor(dst_xf));
+    int dst_x1 = dst_x0 + 1;
+
     uint depth_val = floatBitsToUint(disp);
-    atomicMax(depth[src.y * u_output_size.x + dst_x], depth_val);
+
+    if (dst_x0 >= 0 && dst_x0 < u_output_size.x)
+        atomicMax(depth[src.y * u_output_size.x + dst_x0], depth_val);
+
+    bool write_second = true;
+    if (src.x + 1 < u_output_size.x) {
+        float disp_neighbour = texelFetch(u_disparity, ivec2(src.x + 1, src.y), 0).r;
+        if (abs(disp - disp_neighbour) > 2.0)
+            write_second = false;
+    }
+
+    if (write_second && dst_x1 >= 0 && dst_x1 < u_output_size.x)
+        atomicMax(depth[src.y * u_output_size.x + dst_x1], depth_val);
 }
 )";
 
