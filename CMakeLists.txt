@@ -1,13 +1,12 @@
 cmake_minimum_required(VERSION 3.10)
-set(CMAKE_CUDA_COMPILER /usr/local/cuda-10.2/bin/nvcc)
-project(stereo_calibration CXX CUDA)
+project(stereo_calibration CXX)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=armv8-a> $<$<COMPILE_LANGUAGE:CXX>:-mcpu=cortex-a57> $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>)
+    add_compile_options(-march=armv8-a -mcpu=cortex-a57 -ffast-math)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -53,16 +52,11 @@ target_link_libraries(depth_pipeline
     Threads::Threads
 )
 
-add_library(disp_invert_cuda STATIC src/disp_invert.cu)
-set_target_properties(disp_invert_cuda PROPERTIES POSITION_INDEPENDENT_CODE OFF)
-target_include_directories(disp_invert_cuda PRIVATE ${OpenCV_INCLUDE_DIRS})
-
 add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
 target_include_directories(view_synthesis PRIVATE ${CMAKE_SOURCE_DIR}/extern/libSGM/include)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
     sgm
-    disp_invert_cuda
     Qt5::Widgets
     Qt5::OpenGL
     GLESv2

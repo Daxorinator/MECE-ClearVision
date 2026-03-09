@@ -49,7 +49,6 @@
 #include <libsgm.h>
 
 #include "face_tracker.h"
-#include "disp_invert.h"
 
 #include <QApplication>
 #include <QOpenGLWidget>
@@ -379,6 +378,7 @@ static const char *COMPOSITE_CS = R"(#version 310 es
 layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform ivec2 u_output_size;
+uniform float u_shift;
 layout(rgba8, binding = 0) readonly uniform highp image2D u_left;
 layout(rgba8, binding = 1) readonly uniform highp image2D u_right;
 layout(rgba8, binding = 2) writeonly uniform highp image2D u_out;
@@ -393,13 +393,22 @@ void main() {
     uint ld = left_depth[idx];
     uint rd = right_depth[idx];
 
+    // Weight each view by proximity of the virtual camera to each physical camera.
+    // At u_shift=0.5 both are equally weighted; at u_shift=0 left dominates; at u_shift=1 right dominates.
+    float w_left  = 1.0 - u_shift;
+    float w_right = u_shift;
+
     vec4 col;
-    if (ld > 0u) {
+    if (ld > 0u && rd > 0u) {
+        vec4 left_col  = imageLoad(u_left,  pos);
+        vec4 right_col = imageLoad(u_right, pos);
+        col = left_col * w_left + right_col * w_right;
+    } else if (ld > 0u) {
         col = imageLoad(u_left, pos);
     } else if (rd > 0u) {
         col = imageLoad(u_right, pos);
     } else {
-        col = vec4(0.0);
+        col = vec4(0.0);  // true hole — hole fill pass handles this
     }
 
     imageStore(u_out, pos, col);
@@ -572,7 +581,6 @@ private:
     GLuint ssbo_depth;
     GLuint ssbo_depth_r{0};
     GLuint tex_right_col_rect{0};
-    GLuint tex_right_disp_gl{0};
     GLuint tex_output_r{0};
     GLuint quad_vao, quad_vbo;
     bool gl_ready;
@@ -612,7 +620,6 @@ private:
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
     cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
     cv::cuda::GpuMat              gpu_disp_float;
-    cv::cuda::GpuMat              gpu_disp_r_inv;   // right disparity inverted from left, CV_32F
     cv::cuda::GpuMat              disp_filtered_gpu;
     bool                          disp_filtered_init{false};
 
@@ -622,7 +629,7 @@ private:
     GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
     GLint uloc_disp_texture{-1};
     GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
-    GLint uloc_comp_size{-1};
+    GLint uloc_comp_size{-1}, uloc_comp_shift{-1};
 
     void shutdownCameras();
     void rebuildStereo();
@@ -641,7 +648,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
       tex_left_color(0), tex_right_color(0),
       tex_left_disp(0), tex_right_disp(0),
       tex_output(0), tex_filled(0), ssbo_depth(0), ssbo_depth_r(0),
-      tex_right_col_rect(0), tex_right_disp_gl(0), tex_output_r(0),
+      tex_right_col_rect(0), tex_output_r(0),
       quad_vao(0), quad_vbo(0),
       gl_ready(false), current_fps(0.0)
 {
@@ -777,7 +784,7 @@ SynthWindow::~SynthWindow()
     GLuint textures[] = { tex_left_color, tex_right_color,
                           tex_left_disp, tex_right_disp,
                           tex_output, tex_filled,
-                          tex_right_col_rect, tex_right_disp_gl, tex_output_r };
+                          tex_right_col_rect, tex_output_r };
     for (auto t : textures)
         if (t) glDeleteTextures(1, &t);
     if (ssbo_depth)   glDeleteBuffers(1, &ssbo_depth);
@@ -883,7 +890,7 @@ void SynthWindow::recreateTextures()
     GLuint old[] = { tex_left_color, tex_right_color,
                      tex_left_disp, tex_right_disp,
                      tex_output, tex_filled,
-                     tex_right_col_rect, tex_right_disp_gl, tex_output_r };
+                     tex_right_col_rect, tex_output_r };
     for (auto t : old)
         if (t) glDeleteTextures(1, &t);
     if (ssbo_depth)   glDeleteBuffers(1, &ssbo_depth);
@@ -897,7 +904,6 @@ void SynthWindow::recreateTextures()
     tex_filled         = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth         = create_ssbo(proc_w * proc_h);
     tex_right_col_rect = create_texture_rgba8(proc_w, proc_h);
-    tex_right_disp_gl  = create_texture_r32f(proc_w, proc_h);
     tex_output_r       = create_texture_rgba8(proc_w, proc_h);
     ssbo_depth_r       = create_ssbo(proc_w * proc_h);
 
@@ -1008,6 +1014,7 @@ void SynthWindow::initializeGL()
     uloc_bc_size      = glGetUniformLocation(prog_backward_color, "u_output_size");
     uloc_bc_shift     = glGetUniformLocation(prog_backward_color, "u_shift");
     uloc_comp_size    = glGetUniformLocation(prog_composite,      "u_output_size");
+    uloc_comp_shift   = glGetUniformLocation(prog_composite,      "u_shift");
     printf("GPU pipeline initialised\n");
 
     /* Kick off the self-sustaining render loop (no fixed-interval cap) */
@@ -1316,20 +1323,10 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
 
-    /* Compute approximate right-camera disparity by inverting left disparity on GPU */
-    gpu_disp_float.upload(disp_l_float);
-    invert_disparity_cuda(gpu_disp_float, gpu_disp_r_inv);
-    cv::Mat disp_r_host;
-    gpu_disp_r_inv.download(disp_r_host);
-
-    /* Upload right rectified colour and right disparity to GL */
+    /* Upload right rectified colour to GL */
     glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, m_right_rgba.data);
-
-    glBindTexture(GL_TEXTURE_2D, tex_right_disp_gl);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
-                    GL_RED, GL_FLOAT, disp_r_host.data);
 
     /* 11. Clear depth buffer and output */
     clearGPUBuffers();
@@ -1369,8 +1366,6 @@ void SynthWindow::paintGL()
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
     /* ---- Right-camera DIBR passes ---- */
-    const float right_shift = -(1.0f - u_shift);
-
     /* Clear right depth SSBO */
     glUseProgram(prog_clear);
     glUniform1i(uloc_clear_total, proc_w * proc_h);
@@ -1383,12 +1378,13 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, clear_black.data());
 
-    /* Right depth splat */
+    /* Right depth splat — reuse left disparity with u_shift=-1.0 to invert it on GPU:
+     * dst_x = src_x + disp * (-1.0) = src_x - disp, placing each value at its right-camera x */
     glUseProgram(prog_depth_splat);
     glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_right_disp_gl);
+    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glUniform1i(uloc_ds_disparity, 0);
-    glUniform1f(uloc_ds_shift, right_shift);
+    glUniform1f(uloc_ds_shift, -1.0f);
     glUniform2i(uloc_ds_size, proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -1400,7 +1396,7 @@ void SynthWindow::paintGL()
     glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
     glUniform1i(uloc_bc_colour, 0);
     glUniform2i(uloc_bc_size, proc_w, proc_h);
-    glUniform1f(uloc_bc_shift, right_shift);
+    glUniform1f(uloc_bc_shift, -1.0f);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
     glBindImageTexture(1, tex_output_r, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -1411,6 +1407,7 @@ void SynthWindow::paintGL()
      * After this pass: tex_filled holds the composite colour; ssbo_depth holds composite depth. */
     glUseProgram(prog_composite);
     glUniform2i(uloc_comp_size, proc_w, proc_h);
+    glUniform1f(uloc_comp_shift, u_shift);
     glBindImageTexture(0, tex_output,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
     glBindImageTexture(1, tex_output_r, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
     glBindImageTexture(2, tex_filled,   0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
