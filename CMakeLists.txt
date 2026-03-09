@@ -53,12 +53,16 @@ target_link_libraries(depth_pipeline
     Threads::Threads
 )
 
-add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp src/disp_invert.cu)
-set_target_properties(view_synthesis PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+add_library(disp_invert_cuda STATIC src/disp_invert.cu)
+set_target_properties(disp_invert_cuda PROPERTIES POSITION_INDEPENDENT_CODE OFF)
+target_include_directories(disp_invert_cuda PRIVATE ${OpenCV_INCLUDE_DIRS})
+
+add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
 target_include_directories(view_synthesis PRIVATE ${CMAKE_SOURCE_DIR}/extern/libSGM/include)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
     sgm
+    disp_invert_cuda
     Qt5::Widgets
     Qt5::OpenGL
     GLESv2
