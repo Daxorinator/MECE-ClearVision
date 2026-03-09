@@ -54,6 +54,7 @@ target_link_libraries(depth_pipeline
 )
 
 add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp src/disp_invert.cu)
+set_target_properties(view_synthesis PROPERTIES POSITION_INDEPENDENT_CODE OFF)
 target_include_directories(view_synthesis PRIVATE ${CMAKE_SOURCE_DIR}/extern/libSGM/include)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
