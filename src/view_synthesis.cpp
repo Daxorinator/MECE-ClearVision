@@ -572,6 +572,8 @@ private:
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
     cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
     cv::cuda::GpuMat              gpu_disp_float;
+    cv::cuda::GpuMat              disp_filtered_gpu;
+    bool                          disp_filtered_init{false};
 
     /* Cached GL uniform locations (set once in initializeGL) */
     GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1};
@@ -1229,6 +1231,19 @@ void SynthWindow::paintGL()
 
         /* 9. Convert left BGR → RGBA for GPU upload */
         cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
+    }
+
+    /* IIR temporal disparity filter — smooths frame-to-frame flicker */
+    if (use_cuda) {
+        const float alpha = 0.2f;
+        gpu_disp_float.upload(disp_l_float);
+        if (!disp_filtered_init || disp_filtered_gpu.size() != gpu_disp_float.size()) {
+            gpu_disp_float.copyTo(disp_filtered_gpu);
+            disp_filtered_init = true;
+        } else {
+            cv::cuda::addWeighted(gpu_disp_float, alpha, disp_filtered_gpu, 1.0 - alpha, 0.0, disp_filtered_gpu);
+        }
+        disp_filtered_gpu.download(disp_l_float);
     }
 
     /* 10. Upload left color + disparity to GL */
