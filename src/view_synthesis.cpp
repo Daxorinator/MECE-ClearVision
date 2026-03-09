@@ -621,8 +621,6 @@ private:
     cv::Ptr<cv::cuda::StereoBM> cuda_bm;
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
     cv::cuda::GpuMat              gpu_disp_sgm;    // CV_16U, libSGM left output
-    cv::cuda::GpuMat              gpu_disp_sgm_r;  // CV_16U, libSGM right output
-    cv::cuda::GpuMat              gpu_disp_r_raw;  // CV_16S, cuda_bm right output
     cv::cuda::GpuMat              gpu_disp_float;
     cv::cuda::GpuMat              disp_filtered_gpu;
     bool                          disp_filtered_init{false};
@@ -857,7 +855,6 @@ void SynthWindow::rebuildStereo()
         gpu_gray_l.create(proc_h, proc_w, CV_8U);
         gpu_gray_r.create(proc_h, proc_w, CV_8U);
         gpu_disp_sgm.create(proc_h, proc_w, CV_16U);
-        gpu_disp_sgm_r.create(proc_h, proc_w, CV_16U);
 
         // P1/P2 must be calibrated to Census Transform cost scale, NOT the
         // SSD/SAD scale used by OpenCV StereoSGBM.  libSGM uses a 9×7 Census
@@ -1219,7 +1216,6 @@ void SynthWindow::paintGL()
         if (sgm_cuda) {
             /* --- libSGM CUDA path --- */
             sgm_cuda->execute(gpu_gray_l.data, gpu_gray_r.data, gpu_disp_sgm.data);
-            sgm_cuda->execute(gpu_gray_r.data, gpu_gray_l.data, gpu_disp_sgm_r.data);
 
             const auto invalid_val = static_cast<uint16_t>(sgm_cuda->get_invalid_disparity());
 
@@ -1229,25 +1225,30 @@ void SynthWindow::paintGL()
             disp_u16.convertTo(disp_l_float, CV_32F);
             disp_l_float.setTo(0.0f, invalid_mask);
 
-            cv::Mat disp_u16_r;
-            gpu_disp_sgm_r.download(disp_u16_r);
-            cv::Mat invalid_mask_r = (disp_u16_r == invalid_val);
-            disp_u16_r.convertTo(m_disp_r_float, CV_32F);
-            m_disp_r_float.setTo(0.0f, invalid_mask_r);
+            /* Right disparity via CPU right matcher (correct search direction) */
+            cv::Mat gray_l_host, gray_r_host;
+            gpu_gray_l.download(gray_l_host);
+            gpu_gray_r.download(gray_r_host);
+            cv::Mat disp_raw_r;
+            right_stereo->compute(gray_r_host, gray_l_host, disp_raw_r);
+            disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
+            cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
         } else {
             /* --- cuda_bm path --- */
-            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l,   cv::cuda::Stream::Null());
-            cuda_bm->compute(gpu_gray_r, gpu_gray_l, gpu_disp_r_raw, cv::cuda::Stream::Null());
+            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
 
             cv::Mat disp_raw_l;
             gpu_disp_l.download(disp_raw_l);
             disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
             cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
-            // Right BM with swapped inputs yields negative values; negate scale to make positive
+            /* Right disparity via CPU right matcher (correct search direction) */
+            cv::Mat gray_l_host, gray_r_host;
+            gpu_gray_l.download(gray_l_host);
+            gpu_gray_r.download(gray_r_host);
             cv::Mat disp_raw_r;
-            gpu_disp_r_raw.download(disp_raw_r);
-            disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
+            right_stereo->compute(gray_r_host, gray_l_host, disp_raw_r);
+            disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
             cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
         }
 
