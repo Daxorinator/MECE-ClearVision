@@ -374,6 +374,39 @@ void main() {
 }
 )";
 
+static const char *COMPOSITE_CS = R"(#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform ivec2 u_output_size;
+layout(rgba8, binding = 0) readonly uniform highp image2D u_left;
+layout(rgba8, binding = 1) readonly uniform highp image2D u_right;
+layout(rgba8, binding = 2) writeonly uniform highp image2D u_out;
+layout(std430, binding = 0) buffer LeftDepth { uint left_depth[]; };
+layout(std430, binding = 1) readonly buffer RightDepth { uint right_depth[]; };
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_output_size.x || pos.y >= u_output_size.y) return;
+
+    int idx = pos.y * u_output_size.x + pos.x;
+    uint ld = left_depth[idx];
+    uint rd = right_depth[idx];
+
+    vec4 col;
+    if (ld > 0u) {
+        col = imageLoad(u_left, pos);
+    } else if (rd > 0u) {
+        col = imageLoad(u_right, pos);
+    } else {
+        col = vec4(0.0);
+    }
+
+    imageStore(u_out, pos, col);
+    // Write composite depth for hole-fill pass
+    left_depth[idx] = (ld > 0u) ? ld : rd;
+}
+)";
+
 /* Zero the depth SSBO entirely on the GPU — avoids uploading a 4 MB
  * CPU zero-vector every frame via glBufferSubData. */
 static const char *CLEAR_CS = R"(#version 310 es
@@ -530,11 +563,16 @@ private:
     GLuint prog_depth_splat, prog_color_splat, prog_hole_fill, prog_display;
     GLuint prog_clear{0};
     GLuint prog_backward_color{0};
+    GLuint prog_composite{0};
     GLint  uloc_clear_total{-1};
     GLuint tex_left_color, tex_right_color;
     GLuint tex_left_disp, tex_right_disp;
     GLuint tex_output, tex_filled;
     GLuint ssbo_depth;
+    GLuint ssbo_depth_r{0};
+    GLuint tex_right_col_rect{0};
+    GLuint tex_right_disp_gl{0};
+    GLuint tex_output_r{0};
     GLuint quad_vao, quad_vbo;
     bool gl_ready;
     bool diag_frames_logged{false};   // one-shot: first frame received
@@ -557,6 +595,7 @@ private:
     std::vector<GLubyte> clear_black;
     cv::Mat m_disp_l_float;
     cv::Mat m_left_rgba;
+    cv::Mat m_right_rgba;
 
     /* CUDA acceleration */
     bool use_cuda{false};
@@ -581,6 +620,7 @@ private:
     GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
     GLint uloc_disp_texture{-1};
     GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
+    GLint uloc_comp_size{-1};
 
     void shutdownCameras();
     void rebuildStereo();
@@ -595,10 +635,11 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
       num_disparities(64), block_size(9),
       use_sgbm(true), use_wls(false), use_hole_fill(true),
       proc_scale(0.5),
-      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0),
+      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0), prog_composite(0),
       tex_left_color(0), tex_right_color(0),
       tex_left_disp(0), tex_right_disp(0),
-      tex_output(0), tex_filled(0), ssbo_depth(0),
+      tex_output(0), tex_filled(0), ssbo_depth(0), ssbo_depth_r(0),
+      tex_right_col_rect(0), tex_right_disp_gl(0), tex_output_r(0),
       quad_vao(0), quad_vbo(0),
       gl_ready(false), current_fps(0.0)
 {
@@ -730,12 +771,15 @@ SynthWindow::~SynthWindow()
     if (prog_display)        glDeleteProgram(prog_display);
     if (prog_clear)          glDeleteProgram(prog_clear);
     if (prog_backward_color) glDeleteProgram(prog_backward_color);
+    if (prog_composite)      glDeleteProgram(prog_composite);
     GLuint textures[] = { tex_left_color, tex_right_color,
                           tex_left_disp, tex_right_disp,
-                          tex_output, tex_filled };
+                          tex_output, tex_filled,
+                          tex_right_col_rect, tex_right_disp_gl, tex_output_r };
     for (auto t : textures)
         if (t) glDeleteTextures(1, &t);
-    if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
+    if (ssbo_depth)   glDeleteBuffers(1, &ssbo_depth);
+    if (ssbo_depth_r) glDeleteBuffers(1, &ssbo_depth_r);
     if (quad_vbo) glDeleteBuffers(1, &quad_vbo);
     if (quad_vao) glDeleteVertexArrays(1, &quad_vao);
     doneCurrent();
@@ -836,22 +880,29 @@ void SynthWindow::recreateTextures()
 {
     GLuint old[] = { tex_left_color, tex_right_color,
                      tex_left_disp, tex_right_disp,
-                     tex_output, tex_filled };
+                     tex_output, tex_filled,
+                     tex_right_col_rect, tex_right_disp_gl, tex_output_r };
     for (auto t : old)
         if (t) glDeleteTextures(1, &t);
-    if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
+    if (ssbo_depth)   glDeleteBuffers(1, &ssbo_depth);
+    if (ssbo_depth_r) glDeleteBuffers(1, &ssbo_depth_r);
 
-    tex_left_color  = create_texture_rgba8(proc_w, proc_h);
-    tex_right_color = create_texture_rgba8(proc_w, proc_h);
-    tex_left_disp   = create_texture_r32f(proc_w, proc_h);
-    tex_right_disp  = create_texture_r32f(proc_w, proc_h);
-    tex_output      = create_texture_rgba8(proc_w, proc_h);
-    tex_filled      = create_texture_rgba8(proc_w, proc_h);
-    ssbo_depth      = create_ssbo(proc_w * proc_h);
+    tex_left_color     = create_texture_rgba8(proc_w, proc_h);
+    tex_right_color    = create_texture_rgba8(proc_w, proc_h);
+    tex_left_disp      = create_texture_r32f(proc_w, proc_h);
+    tex_right_disp     = create_texture_r32f(proc_w, proc_h);
+    tex_output         = create_texture_rgba8(proc_w, proc_h);
+    tex_filled         = create_texture_rgba8(proc_w, proc_h);
+    ssbo_depth         = create_ssbo(proc_w * proc_h);
+    tex_right_col_rect = create_texture_rgba8(proc_w, proc_h);
+    tex_right_disp_gl  = create_texture_r32f(proc_w, proc_h);
+    tex_output_r       = create_texture_rgba8(proc_w, proc_h);
+    ssbo_depth_r       = create_ssbo(proc_w * proc_h);
 
     clear_black.assign(proc_w * proc_h * 4, 0);
     m_disp_l_float.create(proc_h, proc_w, CV_32F);
     m_left_rgba.create(proc_h, proc_w, CV_8UC4);
+    m_right_rgba.create(proc_h, proc_w, CV_8UC4);
 
     /* Pre-scale rectification maps to proc_scale so remap outputs directly
      * at processing resolution without a separate GPU resize pass */
@@ -909,8 +960,9 @@ void SynthWindow::initializeGL()
     prog_display        = create_render_program(DISPLAY_VS, DISPLAY_FS);
     prog_clear          = create_compute_program(CLEAR_CS);
     prog_backward_color = create_compute_program(BACKWARD_COLOR_CS);
+    prog_composite      = create_compute_program(COMPOSITE_CS);
 
-    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear || !prog_backward_color) {
+    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear || !prog_backward_color || !prog_composite) {
         fprintf(stderr, "FATAL: shader compilation failed\n");
         return;
     }
@@ -953,6 +1005,7 @@ void SynthWindow::initializeGL()
     uloc_bc_colour    = glGetUniformLocation(prog_backward_color, "u_colour");
     uloc_bc_size      = glGetUniformLocation(prog_backward_color, "u_output_size");
     uloc_bc_shift     = glGetUniformLocation(prog_backward_color, "u_shift");
+    uloc_comp_size    = glGetUniformLocation(prog_composite,      "u_output_size");
     printf("GPU pipeline initialised\n");
 
     /* Kick off the self-sustaining render loop (no fixed-interval cap) */
@@ -1188,6 +1241,11 @@ void SynthWindow::paintGL()
         cv::cuda::cvtColor(gpu_proc_l, gpu_rgba_l, cv::COLOR_BGR2RGBA);
         gpu_rgba_l.download(left_rgba);
 
+        /* Also download right rectified frame as RGBA for two-view DIBR */
+        cv::cuda::GpuMat gpu_rgba_r;
+        cv::cuda::cvtColor(gpu_proc_r, gpu_rgba_r, cv::COLOR_BGR2RGBA);
+        gpu_rgba_r.download(m_right_rgba);
+
     } else {
         /* ---- CPU path ---- */
         /* 2. Rectify at full resolution */
@@ -1229,8 +1287,9 @@ void SynthWindow::paintGL()
         disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
         cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
-        /* 9. Convert left BGR → RGBA for GPU upload */
+        /* 9. Convert left/right BGR → RGBA for GPU upload */
         cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
+        cv::cvtColor(proc_r_bgr, m_right_rgba, cv::COLOR_BGR2RGBA);
     }
 
     /* IIR temporal disparity filter — smooths frame-to-frame flicker */
@@ -1254,6 +1313,31 @@ void SynthWindow::paintGL()
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
+
+    /* Compute approximate right-camera disparity by inverting left disparity */
+    cv::Mat disp_r_host = cv::Mat::zeros(disp_l_float.size(), CV_32F);
+    {
+        for (int y = 0; y < disp_l_float.rows; y++) {
+            const float *src = disp_l_float.ptr<float>(y);
+            float       *dst = disp_r_host.ptr<float>(y);
+            for (int x = 0; x < disp_l_float.cols; x++) {
+                float d = src[x];
+                if (d < 0.5f) continue;
+                int rx = x - static_cast<int>(std::round(d));
+                if (rx >= 0 && rx < disp_l_float.cols && d > dst[rx])
+                    dst[rx] = d;
+            }
+        }
+    }
+
+    /* Upload right rectified colour and right disparity to GL */
+    glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+                    GL_RGBA, GL_UNSIGNED_BYTE, m_right_rgba.data);
+
+    glBindTexture(GL_TEXTURE_2D, tex_right_disp_gl);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+                    GL_RED, GL_FLOAT, disp_r_host.data);
 
     /* 11. Clear depth buffer and output */
     clearGPUBuffers();
@@ -1292,20 +1376,73 @@ void SynthWindow::paintGL()
 
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
+    /* ---- Right-camera DIBR passes ---- */
+    const float right_shift = -(1.0f - u_shift);
+
+    /* Clear right depth SSBO */
+    glUseProgram(prog_clear);
+    glUniform1i(uloc_clear_total, proc_w * proc_h);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
+    glDispatchCompute((proc_w * proc_h + 63) / 64, 1, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    /* Clear right output texture to black */
+    glBindTexture(GL_TEXTURE_2D, tex_output_r);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+                    GL_RGBA, GL_UNSIGNED_BYTE, clear_black.data());
+
+    /* Right depth splat */
+    glUseProgram(prog_depth_splat);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_right_disp_gl);
+    glUniform1i(uloc_ds_disparity, 0);
+    glUniform1f(uloc_ds_shift, right_shift);
+    glUniform2i(uloc_ds_size, proc_w, proc_h);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
+    glDispatchCompute(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    /* Right backward colour warp */
+    glUseProgram(prog_backward_color);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
+    glUniform1i(uloc_bc_colour, 0);
+    glUniform2i(uloc_bc_size, proc_w, proc_h);
+    glUniform1f(uloc_bc_shift, right_shift);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth_r);
+    glBindImageTexture(1, tex_output_r, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    /* Composite: merge left + right into tex_filled, update left SSBO with composite depth.
+     * We write to tex_filled here (not tex_output) to avoid same-texture read-write hazard.
+     * After this pass: tex_filled holds the composite colour; ssbo_depth holds composite depth. */
+    glUseProgram(prog_composite);
+    glUniform2i(uloc_comp_size, proc_w, proc_h);
+    glBindImageTexture(0, tex_output,   0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
+    glBindImageTexture(1, tex_output_r, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
+    glBindImageTexture(2, tex_filled,   0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_depth_r);
+    glDispatchCompute(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+
     /* ---- Pass 3: Hole fill ---- */
+    /* After composite: tex_filled = composite colour, ssbo_depth = composite depth.
+     * Hole fill reads from tex_filled and writes to tex_output. Display from tex_output. */
     GLuint display_tex;
     if (use_hole_fill) {
         glUseProgram(prog_hole_fill);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
-        glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
-        glBindImageTexture(2, tex_filled, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        glBindImageTexture(1, tex_filled, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
+        glBindImageTexture(2, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
         glUniform1i(uloc_hf_maxsearch, HOLE_FILL_MAX_SEARCH);
         glUniform2i(uloc_hf_size, proc_w, proc_h);
         glDispatchCompute(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-        display_tex = tex_filled;
-    } else {
         display_tex = tex_output;
+    } else {
+        display_tex = tex_filled;
     }
 
     /* ---- Render fullscreen quad ---- */
