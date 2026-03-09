@@ -524,7 +524,7 @@ private:
     cv::Ptr<cv::cuda::StereoBM> cuda_bm;
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
     cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
-    cv::cuda::GpuMat              gpu_disp_float; // CV_32F, for GPU blur
+    cv::cuda::GpuMat              gpu_disp_float;
 
     /* Cached GL uniform locations (set once in initializeGL) */
     GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1};
@@ -1105,9 +1105,6 @@ void SynthWindow::paintGL()
             cv::Mat invalid_mask = (disp_u16 == invalid_val);
             disp_u16.convertTo(disp_l_float, CV_32F);  // scale 1.0 — already in pixels
             disp_l_float.setTo(0.0f, invalid_mask);
-            gpu_disp_float.upload(disp_l_float);
-            { cv::cuda::GpuMat tmp; cv::cuda::bilateralFilter(gpu_disp_float, tmp, 5, 15.0f, 15.0f); gpu_disp_float = tmp; }
-            gpu_disp_float.download(disp_l_float);
             // (WLS unavailable — libSGM does internal L-R consistency checking instead)
         } else {
             /* --- cuda_bm path --- */
@@ -1118,9 +1115,6 @@ void SynthWindow::paintGL()
             // Convert disparity to float, clamp negatives
             disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
             cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
-            gpu_disp_float.upload(disp_l_float);
-            { cv::cuda::GpuMat tmp; cv::cuda::bilateralFilter(gpu_disp_float, tmp, 5, 15.0f, 15.0f); gpu_disp_float = tmp; }
-            gpu_disp_float.download(disp_l_float);
         }
 
         if (!diag_disp_logged) {
