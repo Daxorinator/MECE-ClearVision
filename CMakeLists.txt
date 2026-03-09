@@ -7,7 +7,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
-    add_compile_options(-march=armv8-a -mcpu=cortex-a57 -ffast-math)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-march=armv8-a> $<$<COMPILE_LANGUAGE:CXX>:-mcpu=cortex-a57> $<$<COMPILE_LANGUAGE:CXX>:-ffast-math>)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
