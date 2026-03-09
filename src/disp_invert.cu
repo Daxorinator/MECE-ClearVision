@@ -24,8 +24,7 @@ __global__ void invert_disparity_kernel(const float *src, int src_step_floats,
     atomicMax(&dst[y * dst_step_uints + rx], __float_as_uint(d));
 }
 
-void invert_disparity_cuda(const cv::cuda::GpuMat &src, cv::cuda::GpuMat &dst,
-                           cudaStream_t stream)
+void invert_disparity_cuda(const cv::cuda::GpuMat &src, cv::cuda::GpuMat &dst)
 {
     dst.create(src.size(), CV_32F);
     dst.setTo(cv::Scalar(0.0f));
@@ -33,14 +32,13 @@ void invert_disparity_cuda(const cv::cuda::GpuMat &src, cv::cuda::GpuMat &dst,
     const int cols = src.cols;
     const int rows = src.rows;
 
-    // step is in bytes; divide by sizeof(float) / sizeof(uint) to get element stride
     const int src_step_floats = static_cast<int>(src.step  / sizeof(float));
     const int dst_step_uints  = static_cast<int>(dst.step  / sizeof(unsigned int));
 
     dim3 block(16, 16);
     dim3 grid((cols + 15) / 16, (rows + 15) / 16);
 
-    invert_disparity_kernel<<<grid, block, 0, stream>>>(
+    invert_disparity_kernel<<<grid, block>>>(
         src.ptr<float>(),
         src_step_floats,
         reinterpret_cast<unsigned int *>(dst.data),
