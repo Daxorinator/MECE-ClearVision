@@ -343,6 +343,37 @@ void main() {
 }
 )";
 
+static const char *BACKWARD_COLOR_CS = R"(#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform sampler2D u_colour;
+uniform ivec2 u_output_size;
+uniform float u_shift;
+
+layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
+layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (dst.x >= u_output_size.x || dst.y >= u_output_size.y) return;
+
+    uint stored = depth[dst.y * u_output_size.x + dst.x];
+    if (stored == 0u) return;
+
+    float warped_disp = uintBitsToFloat(stored);
+    float src_xf = float(dst.x) - warped_disp * u_shift;
+    float src_yf = float(dst.y);
+
+    if (src_xf < 0.0 || src_xf >= float(u_output_size.x) - 1.0) return;
+
+    vec2 uv = vec2((src_xf + 0.5) / float(u_output_size.x),
+                   (src_yf + 0.5) / float(u_output_size.y));
+
+    vec4 col = texture(u_colour, uv);
+    imageStore(u_output, dst, col);
+}
+)";
+
 /* Zero the depth SSBO entirely on the GPU — avoids uploading a 4 MB
  * CPU zero-vector every frame via glBufferSubData. */
 static const char *CLEAR_CS = R"(#version 310 es
@@ -498,6 +529,7 @@ private:
     /* GPU resources */
     GLuint prog_depth_splat, prog_color_splat, prog_hole_fill, prog_display;
     GLuint prog_clear{0};
+    GLuint prog_backward_color{0};
     GLint  uloc_clear_total{-1};
     GLuint tex_left_color, tex_right_color;
     GLuint tex_left_disp, tex_right_disp;
@@ -546,6 +578,7 @@ private:
     GLint uloc_cs_color{-1}, uloc_cs_disp{-1}, uloc_cs_shift{-1}, uloc_cs_size{-1};
     GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
     GLint uloc_disp_texture{-1};
+    GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
 
     void shutdownCameras();
     void rebuildStereo();
@@ -560,7 +593,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
       num_disparities(64), block_size(9),
       use_sgbm(true), use_wls(false), use_hole_fill(true),
       proc_scale(0.5),
-      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0),
+      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0),
       tex_left_color(0), tex_right_color(0),
       tex_left_disp(0), tex_right_disp(0),
       tex_output(0), tex_filled(0), ssbo_depth(0),
@@ -689,11 +722,12 @@ SynthWindow::~SynthWindow()
     }
     shutdownCameras();
     makeCurrent();
-    if (prog_depth_splat) glDeleteProgram(prog_depth_splat);
-    if (prog_color_splat) glDeleteProgram(prog_color_splat);
-    if (prog_hole_fill)   glDeleteProgram(prog_hole_fill);
-    if (prog_display)     glDeleteProgram(prog_display);
-    if (prog_clear)       glDeleteProgram(prog_clear);
+    if (prog_depth_splat)    glDeleteProgram(prog_depth_splat);
+    if (prog_color_splat)    glDeleteProgram(prog_color_splat);
+    if (prog_hole_fill)      glDeleteProgram(prog_hole_fill);
+    if (prog_display)        glDeleteProgram(prog_display);
+    if (prog_clear)          glDeleteProgram(prog_clear);
+    if (prog_backward_color) glDeleteProgram(prog_backward_color);
     GLuint textures[] = { tex_left_color, tex_right_color,
                           tex_left_disp, tex_right_disp,
                           tex_output, tex_filled };
@@ -867,13 +901,14 @@ void SynthWindow::initializeGL()
     printf("Renderer:       %s\n", glGetString(GL_RENDERER));
 
     /* Compile compute programs */
-    prog_depth_splat = create_compute_program(DEPTH_SPLAT_CS);
-    prog_color_splat = create_compute_program(COLOR_SPLAT_CS);
-    prog_hole_fill   = create_compute_program(HOLE_FILL_CS);
-    prog_display     = create_render_program(DISPLAY_VS, DISPLAY_FS);
-    prog_clear       = create_compute_program(CLEAR_CS);
+    prog_depth_splat    = create_compute_program(DEPTH_SPLAT_CS);
+    prog_color_splat    = create_compute_program(COLOR_SPLAT_CS);
+    prog_hole_fill      = create_compute_program(HOLE_FILL_CS);
+    prog_display        = create_render_program(DISPLAY_VS, DISPLAY_FS);
+    prog_clear          = create_compute_program(CLEAR_CS);
+    prog_backward_color = create_compute_program(BACKWARD_COLOR_CS);
 
-    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear) {
+    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear || !prog_backward_color) {
         fprintf(stderr, "FATAL: shader compilation failed\n");
         return;
     }
@@ -911,8 +946,11 @@ void SynthWindow::initializeGL()
     uloc_cs_size      = glGetUniformLocation(prog_color_splat, "u_output_size");
     uloc_hf_maxsearch = glGetUniformLocation(prog_hole_fill,   "u_max_search");
     uloc_hf_size      = glGetUniformLocation(prog_hole_fill,   "u_output_size");
-    uloc_disp_texture = glGetUniformLocation(prog_display,     "u_texture");
-    uloc_clear_total  = glGetUniformLocation(prog_clear,       "u_total");
+    uloc_disp_texture = glGetUniformLocation(prog_display,        "u_texture");
+    uloc_clear_total  = glGetUniformLocation(prog_clear,          "u_total");
+    uloc_bc_colour    = glGetUniformLocation(prog_backward_color, "u_colour");
+    uloc_bc_size      = glGetUniformLocation(prog_backward_color, "u_output_size");
+    uloc_bc_shift     = glGetUniformLocation(prog_backward_color, "u_shift");
     printf("GPU pipeline initialised\n");
 
     /* Kick off the self-sustaining render loop (no fixed-interval cap) */
@@ -1226,16 +1264,13 @@ void SynthWindow::paintGL()
 
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    /* ---- Pass 2: Color splat (left view, z-tested) ---- */
-    glUseProgram(prog_color_splat);
+    /* ---- Pass 2: Backward colour warp (destination-driven, bilinear source) ---- */
+    glUseProgram(prog_backward_color);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
-    glUniform1i(uloc_cs_color, 0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(uloc_cs_disp, 1);
-    glUniform1f(uloc_cs_shift, u_shift);
-    glUniform2i(uloc_cs_size, proc_w, proc_h);
+    glUniform1i(uloc_bc_colour, 0);
+    glUniform2i(uloc_bc_size, proc_w, proc_h);
+    glUniform1f(uloc_bc_shift, u_shift);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
