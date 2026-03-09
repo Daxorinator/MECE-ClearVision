@@ -230,7 +230,7 @@ void main() {
     if (disp < 0.5) return;
     int dst_x = int(round(float(src.x) + disp * u_shift));
     if (dst_x < 0 || dst_x >= u_output_size.x) return;
-    uint depth_val = uint(disp * 256.0);
+    uint depth_val = floatBitsToUint(disp);
     atomicMax(depth[src.y * u_output_size.x + dst_x], depth_val);
 }
 )";
@@ -252,7 +252,7 @@ void main() {
     if (disp < 0.5) return;
     int dst_x = int(round(float(src.x) + disp * u_shift));
     if (dst_x < 0 || dst_x >= u_output_size.x) return;
-    uint my_depth = uint(disp * 256.0);
+    uint my_depth = floatBitsToUint(disp);
     uint stored = depth[src.y * u_output_size.x + dst_x];
     if (my_depth >= stored) {
         vec4 col = texelFetch(u_color, src, 0);
