@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(stereo_calibration CXX)
+project(stereo_calibration CXX CUDA)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -52,7 +52,7 @@ target_link_libraries(depth_pipeline
     Threads::Threads
 )
 
-add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
+add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp src/disp_invert.cu)
 target_include_directories(view_synthesis PRIVATE ${CMAKE_SOURCE_DIR}/extern/libSGM/include)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}

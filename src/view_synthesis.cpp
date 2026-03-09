@@ -49,6 +49,7 @@
 #include <libsgm.h>
 
 #include "face_tracker.h"
+#include "disp_invert.h"
 
 #include <QApplication>
 #include <QOpenGLWidget>
@@ -611,6 +612,7 @@ private:
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
     cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
     cv::cuda::GpuMat              gpu_disp_float;
+    cv::cuda::GpuMat              gpu_disp_r_inv;   // right disparity inverted from left, CV_32F
     cv::cuda::GpuMat              disp_filtered_gpu;
     bool                          disp_filtered_init{false};
 
@@ -1314,21 +1316,11 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
 
-    /* Compute approximate right-camera disparity by inverting left disparity */
-    cv::Mat disp_r_host = cv::Mat::zeros(disp_l_float.size(), CV_32F);
-    {
-        for (int y = 0; y < disp_l_float.rows; y++) {
-            const float *src = disp_l_float.ptr<float>(y);
-            float       *dst = disp_r_host.ptr<float>(y);
-            for (int x = 0; x < disp_l_float.cols; x++) {
-                float d = src[x];
-                if (d < 0.5f) continue;
-                int rx = x - static_cast<int>(std::round(d));
-                if (rx >= 0 && rx < disp_l_float.cols && d > dst[rx])
-                    dst[rx] = d;
-            }
-        }
-    }
+    /* Compute approximate right-camera disparity by inverting left disparity on GPU */
+    gpu_disp_float.upload(disp_l_float);
+    invert_disparity_cuda(gpu_disp_float, gpu_disp_r_inv);
+    cv::Mat disp_r_host;
+    gpu_disp_r_inv.download(disp_r_host);
 
     /* Upload right rectified colour and right disparity to GL */
     glBindTexture(GL_TEXTURE_2D, tex_right_col_rect);
