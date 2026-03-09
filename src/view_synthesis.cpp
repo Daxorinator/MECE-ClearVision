@@ -1231,7 +1231,7 @@ void SynthWindow::paintGL()
             gpu_gray_r.download(gray_r_host);
             cv::Mat disp_raw_r;
             right_stereo->compute(gray_r_host, gray_l_host, disp_raw_r);
-            disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
+            disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
             cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
         } else {
             /* --- cuda_bm path --- */
@@ -1248,7 +1248,7 @@ void SynthWindow::paintGL()
             gpu_gray_r.download(gray_r_host);
             cv::Mat disp_raw_r;
             right_stereo->compute(gray_r_host, gray_l_host, disp_raw_r);
-            disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
+            disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
             cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
         }
 
@@ -1314,7 +1314,7 @@ void SynthWindow::paintGL()
         disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
         cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
-        disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
+        disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
         cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
         /* 9. Convert left/right BGR → RGBA for GPU upload */
