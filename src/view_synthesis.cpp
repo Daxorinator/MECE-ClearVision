@@ -1065,7 +1065,7 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
         changed = true;
     }
     else if (e->key() == Qt::Key_BracketLeft) {
-        block_size = std::max(block_size - 2, 3);
+        block_size = std::max(block_size - 2, 5);
         changed = true;
     }
     else if (e->key() == Qt::Key_1) {

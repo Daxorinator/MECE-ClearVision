@@ -196,7 +196,7 @@ void FaceTracker::threadLoop()
          * Negate FT_SENSITIVITY if the parallax direction feels inverted.
          */
         const float yaw = static_cast<float>(
-            std::atan2(R.at<double>(2, 0), R.at<double>(0, 0)));
+            std::atan2(R.at<double>(1, 0), R.at<double>(0, 0)));
 
         /* ---- EMA smoothing + u_shift update (single lock) ---- */
         {
