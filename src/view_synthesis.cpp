@@ -229,7 +229,7 @@ void main() {
     float disp = texelFetch(u_disparity, src, 0).r;
     if (disp < 0.5) return;
 
-    float dst_xf = float(src.x) + disp * u_shift;
+    float dst_xf = float(src.x) - disp * u_shift;
     int dst_x0 = int(floor(dst_xf));
     int dst_x1 = dst_x0 + 1;
 
@@ -265,7 +265,7 @@ void main() {
     if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
     float disp = texelFetch(u_disparity, src, 0).r;
     if (disp < 0.5) return;
-    int dst_x = int(round(float(src.x) + disp * u_shift));
+    int dst_x = int(round(float(src.x) - disp * u_shift));
     if (dst_x < 0 || dst_x >= u_output_size.x) return;
     uint my_depth = floatBitsToUint(disp);
     uint stored = depth[src.y * u_output_size.x + dst_x];
@@ -361,7 +361,7 @@ void main() {
     if (stored == 0u) return;
 
     float warped_disp = uintBitsToFloat(stored);
-    float src_xf = float(dst.x) - warped_disp * u_shift;
+    float src_xf = float(dst.x) + warped_disp * u_shift;
     float src_yf = float(dst.y);
 
     if (src_xf < 0.0 || src_xf >= float(u_output_size.x) - 1.0) return;
