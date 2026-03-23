@@ -86,7 +86,7 @@ static std::string csi_pipeline(int sensor_id, int width, int height,
           + ", height="    + std::to_string(height)
           + ", framerate=" + std::to_string(fps) + "/1"
           + ", format=NV12"
-            " ! nvvidconv flip-method=" + std::to_string(flip_method);
+            " ! nvvidconv flip-method=0";
 
     if (do_scale) {
         /* Scale inside NVMM, then a second nvvidconv converts to system BGRx */
@@ -97,9 +97,13 @@ static std::string csi_pipeline(int sensor_id, int width, int height,
              " ! nvvidconv";
     }
 
+    /* videoflip rotates in system memory after the NVMM→BGRx conversion;
+     * more reliable than nvvidconv flip-method which can be silently ignored
+     * depending on GStreamer/L4T version. */
     s += " ! video/x-raw, format=BGRx"
-         " ! videoconvert"
-         " ! appsink drop=true max-buffers=1";
+         " ! videoflip method=" + std::to_string(flip_method)
+         + " ! videoconvert"
+         + " ! appsink drop=true max-buffers=1";
     return s;
 }
 #endif  /* CAMERA_BACKEND_CSI */
