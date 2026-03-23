@@ -220,13 +220,14 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform sampler2D u_disparity;
 uniform float u_shift;
+uniform float u_disp_scale;
 uniform ivec2 u_output_size;
 layout(std430, binding = 0) buffer DepthBuffer { uint depth[]; };
 
 void main() {
     ivec2 src = ivec2(gl_GlobalInvocationID.xy);
     if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
-    float disp = texelFetch(u_disparity, src, 0).r;
+    float disp = texelFetch(u_disparity, src, 0).r * u_disp_scale;
     if (disp < 0.5) return;
 
     float dst_xf = float(src.x) - disp * u_shift;
@@ -576,11 +577,13 @@ private:
     bool                          disp_filtered_init{false};
 
     /* Cached GL uniform locations (set once in initializeGL) */
-    GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1};
+    GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1}, uloc_ds_scale{-1};
     GLint uloc_cs_color{-1}, uloc_cs_disp{-1}, uloc_cs_shift{-1}, uloc_cs_size{-1};
     GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
     GLint uloc_disp_texture{-1};
     GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
+
+    float disp_amplify{15.0f};   // multiplier applied to disparity before DIBR shift
 
     void shutdownCameras();
     void rebuildStereo();
@@ -669,6 +672,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     printf("  1/2/3 - Scale: 1.0x / 0.5x / 0.25x\n");
     printf("  F     - Toggle face-tracking shift\n");
     printf("  C     - Recalibrate face tracker (look straight ahead first)\n");
+    printf("  ,/.   - Disparity amplify x0.5 / x2  (default 15)\n");
     printf("============================================================\n\n");
 
     /* ---- Face tracker (USB webcam, background thread) ---- */
@@ -942,6 +946,7 @@ void SynthWindow::initializeGL()
     uloc_ds_disparity = glGetUniformLocation(prog_depth_splat, "u_disparity");
     uloc_ds_shift     = glGetUniformLocation(prog_depth_splat, "u_shift");
     uloc_ds_size      = glGetUniformLocation(prog_depth_splat, "u_output_size");
+    uloc_ds_scale     = glGetUniformLocation(prog_depth_splat, "u_disp_scale");
     uloc_cs_color     = glGetUniformLocation(prog_color_splat, "u_color");
     uloc_cs_disp      = glGetUniformLocation(prog_color_splat, "u_disparity");
     uloc_cs_shift     = glGetUniformLocation(prog_color_splat, "u_shift");
@@ -1051,6 +1056,14 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
         } else {
             printf("Face tracking not active — cannot calibrate\n");
         }
+    }
+    else if (e->key() == Qt::Key_Period) {
+        disp_amplify = std::min(disp_amplify * 2.0f, 512.0f);
+        printf("Disparity amplify: %.1f\n", disp_amplify);
+    }
+    else if (e->key() == Qt::Key_Comma) {
+        disp_amplify = std::max(disp_amplify * 0.5f, 1.0f);
+        printf("Disparity amplify: %.1f\n", disp_amplify);
     }
 
     if (changed) {
@@ -1273,6 +1286,7 @@ void SynthWindow::paintGL()
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glUniform1i(uloc_ds_disparity, 0);
     glUniform1f(uloc_ds_shift, u_shift);
+    glUniform1f(uloc_ds_scale, disp_amplify);
     glUniform2i(uloc_ds_size, proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -1339,7 +1353,7 @@ void SynthWindow::paintGL()
 
     char info[320];
     snprintf(info, sizeof(info),
-             "FPS: %.1f | %s nDisp=%d blk=%d WLS=%s Hole=%s | %dx%d | Track:%s shift=%.2f",
+             "FPS: %.1f | %s nDisp=%d blk=%d WLS=%s Hole=%s | %dx%d | Track:%s shift=%.2f amp=%.0f",
              current_fps,
              use_sgbm ? "SGBM" : "BM",
              num_disparities, block_size,
@@ -1348,7 +1362,7 @@ void SynthWindow::paintGL()
              proc_w, proc_h,
              (face_tracking_enabled && face_tracker && face_tracker->isActive())
                  ? "ON" : "OFF",
-             u_shift);
+             u_shift, disp_amplify);
 
     /* Draw text shadow for readability */
     painter.setPen(Qt::black);
@@ -1361,7 +1375,7 @@ void SynthWindow::paintGL()
     double since_print = std::chrono::duration<double>(
         now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
-        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d  track=%s  shift=%.2f\n",
+        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d  track=%s  shift=%.2f  amp=%.0f\n",
                current_fps,
                use_sgbm ? "SGBM" : "BM",
                num_disparities, block_size,
@@ -1370,7 +1384,7 @@ void SynthWindow::paintGL()
                proc_w, proc_h,
                (face_tracking_enabled && face_tracker && face_tracker->isActive())
                    ? "ON" : "OFF",
-               u_shift);
+               u_shift, disp_amplify);
         last_fps_print = now;
     }
 
