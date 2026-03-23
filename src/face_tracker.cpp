@@ -86,17 +86,22 @@ bool FaceTracker::isActive() const
 
 void FaceTracker::threadLoop()
 {
-    /* ---- Open webcam ---- */
-    cv::VideoCapture cap(camera_index_);
+    /* ---- Open webcam via GStreamer (videoflip corrects upside-down mounting) ---- */
+    const std::string pipeline =
+        std::string("v4l2src device=/dev/video") + std::to_string(camera_index_)
+        + " ! image/jpeg, width=640, height=480"
+        + " ! jpegdec"
+        + " ! videoflip method=2"
+        + " ! videoconvert"
+        + " ! video/x-raw, format=BGR"
+        + " ! appsink drop=true max-buffers=1";
+    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
     if (!cap.isOpened()) {
-        fprintf(stderr, "[FaceTracker] Failed to open camera %d\n", camera_index_);
+        fprintf(stderr, "[FaceTracker] Failed to open camera %d\n  %s\n",
+                camera_index_, pipeline.c_str());
         running = false;
         return;
     }
-
-    /* Cap resolution to 640×480 — YuNet on Cortex-A57 at full HD is too slow */
-    cap.set(cv::CAP_PROP_FRAME_WIDTH,  640);
-    cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
 
     /* Grab one frame to learn the negotiated resolution */
     cv::Mat frame;

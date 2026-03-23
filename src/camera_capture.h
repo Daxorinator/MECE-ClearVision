@@ -104,6 +104,31 @@ static std::string csi_pipeline(int sensor_id, int width, int height,
 }
 #endif  /* CAMERA_BACKEND_CSI */
 
+#ifndef CAMERA_BACKEND_CSI
+/*
+ * Build a GStreamer pipeline string for a V4L2 (USB) camera.
+ *
+ * Assumes the camera supports MJPG at the requested resolution, which
+ * is required for 30 fps at 1080p on most USB cameras.
+ *
+ * flip-method values match GStreamer videoflip:
+ *   0=none  1=cw90  2=180  3=ccw90  4=horiz  5=ul-diag  6=vert  7=ur-diag
+ */
+static std::string v4l2_pipeline(int device_idx, int width, int height,
+                                  int flip_method = 2)
+{
+    return std::string("v4l2src device=/dev/video") + std::to_string(device_idx)
+           + " ! image/jpeg"
+           + ", width="  + std::to_string(width)
+           + ", height=" + std::to_string(height)
+           + " ! jpegdec"
+           + " ! videoflip method=" + std::to_string(flip_method)
+           + " ! videoconvert"
+           + " ! video/x-raw, format=BGR"
+           + " ! appsink drop=true max-buffers=1";
+}
+#endif  /* !CAMERA_BACKEND_CSI */
+
 static void capture_thread_fn(CameraCapture *cap)
 {
     while (cap->running.load()) {
@@ -149,17 +174,15 @@ static bool init_camera(CameraCapture *cap,
         return false;
     }
 #else
-    cap->cap.open(camera_idx, cv::CAP_V4L2);
+    const std::string pipeline = v4l2_pipeline(camera_idx, width, height);
+    printf("[Camera %d] Opening pipeline:\n  %s\n", camera_idx, pipeline.c_str());
+    cap->cap.open(pipeline, cv::CAP_GSTREAMER);
     if (!cap->cap.isOpened()) {
-        fprintf(stderr, "[Camera %d] Failed to open V4L2 device\n", camera_idx);
+        printf("[Camera %d] FAILED to open V4L2 GStreamer pipeline\n", camera_idx);
+        fprintf(stderr, "[Camera %d] FAILED to open V4L2 pipeline:\n  %s\n",
+                camera_idx, pipeline.c_str());
         return false;
     }
-    /* Request resolution and MJPG (enables 30fps at 1080p on most USB cameras;
-     * if the camera does not support MJPG, omit the FOURCC line) */
-    cap->cap.set(cv::CAP_PROP_FRAME_WIDTH,  width);
-    cap->cap.set(cv::CAP_PROP_FRAME_HEIGHT, height);
-    cap->cap.set(cv::CAP_PROP_FOURCC,
-                 cv::VideoWriter::fourcc('M', 'J', 'P', 'G'));
 #endif
 
     /* Read back the actual negotiated resolution */
@@ -174,7 +197,7 @@ static bool init_camera(CameraCapture *cap,
 #ifdef CAMERA_BACKEND_CSI
            "CSI/GStreamer (nvarguscamerasrc)"
 #else
-           "V4L2"
+           "V4L2/GStreamer (videoflip)"
 #endif
            );
     return true;
