@@ -1225,14 +1225,24 @@ void SynthWindow::paintGL()
             disp_u16.convertTo(disp_l_float, CV_32F);
             disp_l_float.setTo(0.0f, invalid_mask);
 
-            /* Right disparity via CPU right matcher (correct search direction) */
-            cv::Mat gray_l_host, gray_r_host;
-            gpu_gray_l.download(gray_l_host);
-            gpu_gray_r.download(gray_r_host);
-            cv::Mat disp_raw_r;
-            right_stereo->compute(gray_r_host, gray_l_host, disp_raw_r);
-            disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
-            cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            /* Right disparity via GPU libSGM with horizontally-flipped inputs.
+             * Flipping reverses the search direction so the matcher finds
+             * matches correctly; flipping the output maps values back to
+             * right-camera pixel coordinates. */
+            {
+                cv::cuda::GpuMat flip_l, flip_r;
+                cv::cuda::flip(gpu_gray_l, flip_l, 1);
+                cv::cuda::flip(gpu_gray_r, flip_r, 1);
+                /* Reuse gpu_disp_sgm for right output — left result already downloaded */
+                sgm_cuda->execute(flip_r.data, flip_l.data, gpu_disp_sgm.data);
+                cv::Mat disp_r_u16;
+                gpu_disp_sgm.download(disp_r_u16);
+                cv::Mat invalid_mask_r = (disp_r_u16 == invalid_val);
+                disp_r_u16.convertTo(m_disp_r_float, CV_32F);
+                m_disp_r_float.setTo(0.0f, invalid_mask_r);
+                cv::flip(m_disp_r_float, m_disp_r_float, 1);
+                cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            }
         } else {
             /* --- cuda_bm path --- */
             cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
@@ -1242,14 +1252,18 @@ void SynthWindow::paintGL()
             disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
             cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
 
-            /* Right disparity via CPU right matcher (correct search direction) */
-            cv::Mat gray_l_host, gray_r_host;
-            gpu_gray_l.download(gray_l_host);
-            gpu_gray_r.download(gray_r_host);
-            cv::Mat disp_raw_r;
-            right_stereo->compute(gray_r_host, gray_l_host, disp_raw_r);
-            disp_raw_r.convertTo(m_disp_r_float, CV_32F, -1.0 / 16.0);
-            cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            /* Right disparity via GPU CUDA BM with horizontally-flipped inputs */
+            {
+                cv::cuda::GpuMat flip_l, flip_r, flip_disp, gpu_disp_r;
+                cv::cuda::flip(gpu_gray_l, flip_l, 1);
+                cv::cuda::flip(gpu_gray_r, flip_r, 1);
+                cuda_bm->compute(flip_r, flip_l, flip_disp, cv::cuda::Stream::Null());
+                cv::cuda::flip(flip_disp, gpu_disp_r, 1);
+                cv::Mat disp_raw_r;
+                gpu_disp_r.download(disp_raw_r);
+                disp_raw_r.convertTo(m_disp_r_float, CV_32F, 1.0 / 16.0);
+                cv::threshold(m_disp_r_float, m_disp_r_float, 0.0, 0.0, cv::THRESH_TOZERO);
+            }
         }
 
         if (!diag_disp_logged) {
