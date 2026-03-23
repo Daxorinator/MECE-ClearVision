@@ -539,7 +539,7 @@ private:
     GLuint quad_vao, quad_vbo;
     bool gl_ready;
     bool diag_frames_logged{false};   // one-shot: first frame received
-    bool diag_disp_logged{false};     // one-shot: first non-zero disparity
+
 
     /* Timer — singleShot chain drives the render loop (no fixed-interval cap) */
     bool render_running{false};
@@ -1185,18 +1185,6 @@ void SynthWindow::paintGL()
             cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
         }
 
-        if (!diag_disp_logged) {
-            double dmin, dmax;
-            cv::minMaxLoc(disp_l_float, &dmin, &dmax);
-            cv::Mat mask = disp_l_float > 0.5f;
-            int nonzero = cv::countNonZero(mask);
-            printf("[DIAG] Disparity: min=%.2f max=%.2f nonzero=%d/%d  "
-                   "gray_l=%dx%d\n",
-                   dmin, dmax, nonzero, proc_w * proc_h,
-                   gpu_gray_l.cols, gpu_gray_l.rows);
-            diag_disp_logged = true;
-        }
-
         /* 9. BGR→RGBA on GPU, download directly (avoids CPU cvtColor round-trip) */
         cv::cuda::cvtColor(gpu_proc_l, gpu_rgba_l, cv::COLOR_BGR2RGBA);
         gpu_rgba_l.download(left_rgba);
@@ -1375,7 +1363,10 @@ void SynthWindow::paintGL()
     double since_print = std::chrono::duration<double>(
         now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
-        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d  track=%s  shift=%.2f  amp=%.0f\n",
+        double dmin, dmax;
+        cv::minMaxLoc(disp_l_float, &dmin, &dmax);
+        int nonzero = cv::countNonZero(disp_l_float > 0.5f);
+        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d  track=%s  shift=%.2f  amp=%.0f  disp=[%.1f..%.1f] valid=%d/%d\n",
                current_fps,
                use_sgbm ? "SGBM" : "BM",
                num_disparities, block_size,
@@ -1384,7 +1375,8 @@ void SynthWindow::paintGL()
                proc_w, proc_h,
                (face_tracking_enabled && face_tracker && face_tracker->isActive())
                    ? "ON" : "OFF",
-               u_shift, disp_amplify);
+               u_shift, disp_amplify,
+               dmin, dmax, nonzero, proc_w * proc_h);
         last_fps_print = now;
     }
 
