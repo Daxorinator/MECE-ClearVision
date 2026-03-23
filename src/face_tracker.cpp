@@ -4,7 +4,8 @@
 #include <cmath>
 #include <cstdio>
 
-#include <opencv2/calib3d.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/video/tracking.hpp>   // calcOpticalFlowPyrLK, goodFeaturesToTrack
 #include <opencv2/videoio.hpp>
 
 static inline float ft_clamp(float v, float lo, float hi)
@@ -13,72 +14,39 @@ static inline float ft_clamp(float v, float lo, float hi)
 }
 
 /* ========================================================================
- * Construction / destruction
- * ======================================================================== */
-
-FaceTracker::FaceTracker()
-{
-    /*
-     * Canonical 3-D face model (mm), origin at nose tip.
-     * Positive X = viewer's left, positive Y = up, positive Z = towards camera.
-     * Z-values encode the physical relief of the face (eyes ~26mm behind nose
-     * tip, mouth corners ~24mm behind) — this is what makes solvePnP
-     * geometrically unbiased without any manual correction factors.
-     *
-     * Point order matches YuNet keypoint output columns 4-13:
-     *   right_eye, left_eye, nose_tip, right_mouth, left_mouth
-     */
-    model_points = {
-        cv::Point3f(-43.3f,  32.7f, -26.0f),   // right eye centre
-        cv::Point3f( 43.3f,  32.7f, -26.0f),   // left eye centre
-        cv::Point3f(  0.0f,   0.0f,   0.0f),   // nose tip (origin)
-        cv::Point3f(-28.9f, -28.9f, -24.1f),   // right mouth corner
-        cv::Point3f( 28.9f, -28.9f, -24.1f),   // left mouth corner
-    };
-}
-
-FaceTracker::~FaceTracker()
-{
-    stop();
-}
-
-/* ========================================================================
  * Public API
  * ======================================================================== */
 
-bool FaceTracker::start(int camera_index, const std::string &yunet_model)
+bool FaceTracker::start(int camera_index, const std::string &cascade_path)
 {
     camera_index_ = camera_index;
-    yunet_model_  = yunet_model;
-    running       = true;
-    worker        = std::thread(&FaceTracker::threadLoop, this);
+    cascade_path_ = cascade_path;
+    running_      = true;
+    worker_       = std::thread(&FaceTracker::threadLoop, this);
     return true;
 }
 
 void FaceTracker::stop()
 {
-    running = false;
-    if (worker.joinable())
-        worker.join();
+    running_ = false;
+    if (worker_.joinable())
+        worker_.join();
 }
 
 void FaceTracker::calibrate()
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    ref_yaw = ema_yaw;
-    printf("[FaceTracker] Calibrated: ref_yaw = %.3f rad\n", ref_yaw);
+    std::lock_guard<std::mutex> lock(mtx_);
+    ref_x_ = ema_x_;
+    printf("[FaceTracker] Calibrated: ref_x = %.3f\n", ref_x_);
 }
 
 float FaceTracker::shift() const
 {
-    std::lock_guard<std::mutex> lock(mtx);
-    return u_shift_val;
+    std::lock_guard<std::mutex> lock(mtx_);
+    return u_shift_val_;
 }
 
-bool FaceTracker::isActive() const
-{
-    return running.load();
-}
+bool FaceTracker::isActive() const { return running_.load(); }
 
 /* ========================================================================
  * Background thread
@@ -86,138 +54,203 @@ bool FaceTracker::isActive() const
 
 void FaceTracker::threadLoop()
 {
-    /* ---- Open webcam via GStreamer ---- */
-    const std::string pipeline =
-        std::string("v4l2src device=/dev/video") + std::to_string(camera_index_)
-        + " ! image/jpeg, width=640, height=480"
-        + " ! jpegdec"
-        + " ! videoflip method=0"
-        + " ! videoconvert"
-        + " ! video/x-raw, format=BGR"
-        + " ! appsink drop=true max-buffers=1";
-    cv::VideoCapture cap(pipeline, cv::CAP_GSTREAMER);
-    if (!cap.isOpened()) {
-        fprintf(stderr, "[FaceTracker] Failed to open camera %d\n", camera_index_);
-        running = false;
+    if (!cascade_.load(cascade_path_)) {
+        fprintf(stderr, "[FaceTracker] Failed to load cascade: %s\n",
+                cascade_path_.c_str());
+        running_ = false;
         return;
     }
-
-    /* Grab one frame to learn the negotiated resolution */
-    cv::Mat frame;
-    cap >> frame;
-    if (frame.empty()) {
-        fprintf(stderr, "[FaceTracker] Empty first frame from camera %d\n",
-                camera_index_);
-        running = false;
-        return;
-    }
-
-    const int fw = frame.cols;
-    const int fh = frame.rows;
-    printf("[FaceTracker] Camera %d opened: %dx%d\n", camera_index_, fw, fh);
 
     /*
-     * Estimated pinhole intrinsics.
-     * A typical webcam focal length is close to one image-width in pixels,
-     * and the principal point is at the image centre.  This approximation
-     * is adequate for coarse yaw extraction.
+     * Request 320×240 GRAY8 from GStreamer — smallest MJPEG payload to decode,
+     * no further colour conversion needed.  Fall back to 640×480 if the camera
+     * does not support 320×240.
      */
-    const double fx = static_cast<double>(fw);
-    cam_matrix = (cv::Mat_<double>(3, 3) <<
-                  fx,  0.0, fw / 2.0,
-                  0.0, fx,  fh / 2.0,
-                  0.0, 0.0,       1.0);
-    dist_coeffs = cv::Mat::zeros(4, 1, CV_64F);
+    const char *pipeline_fmt =
+        "v4l2src device=/dev/video%d"
+        " ! image/jpeg, width=%d, height=%d"
+        " ! jpegdec ! videoconvert"
+        " ! video/x-raw, format=GRAY8"
+        " ! appsink drop=true max-buffers=1";
 
-    /* ---- Create YuNet detector ---- */
-    try {
-        detector = cv::FaceDetectorYN::create(
-            yunet_model_,
-            "",                     // config: empty for ONNX
-            cv::Size(fw, fh),
-            0.6f,                   // score threshold
-            0.3f,                   // NMS threshold
-            5000,                   // top-K candidates
-            FT_BACKEND,
-            FT_TARGET);
-    } catch (const cv::Exception &ex) {
-        fprintf(stderr, "[FaceTracker] YuNet init failed: %s\n", ex.what());
-        running = false;
+    cv::VideoCapture cap;
+    int fw = 0, fh = 0;
+    for (auto [w, h] : std::initializer_list<std::pair<int,int>>{{320,240},{640,480}}) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), pipeline_fmt, camera_index_, w, h);
+        cap.open(buf, cv::CAP_GSTREAMER);
+        if (cap.isOpened()) { fw = w; fh = h; break; }
+    }
+    if (!cap.isOpened()) {
+        fprintf(stderr, "[FaceTracker] Failed to open camera %d\n", camera_index_);
+        running_ = false;
         return;
     }
 
-    printf("[FaceTracker] Ready — model: %s\n", yunet_model_.c_str());
+    cv::Mat cur_gray;
+    cap >> cur_gray;
+    if (cur_gray.empty()) {
+        fprintf(stderr, "[FaceTracker] Empty first frame from camera %d\n", camera_index_);
+        running_ = false;
+        return;
+    }
+    fw = cur_gray.cols;
+    fh = cur_gray.rows;
+    const float half_w = fw * 0.5f;
 
-    /* ---- Main capture loop ---- */
-    while (running.load()) {
-        cap >> frame;
-        if (frame.empty())
+    /*
+     * Haar detection runs on a 320×240 image.
+     * If the camera already delivers 320×240 no resize is needed.
+     */
+    const int   det_w       = 320;
+    const int   det_h       = 240;
+    const bool  need_resize = (fw != det_w || fh != det_h);
+    const float scale_x     = static_cast<float>(det_w) / fw;
+    const float scale_y     = static_cast<float>(det_h) / fh;
+    const float inv_scale_x = 1.0f / scale_x;
+    const float inv_scale_y = 1.0f / scale_y;
+
+    printf("[FaceTracker] Camera %d: %dx%d (GRAY), det %dx%d, cascade: %s\n",
+           camera_index_, fw, fh, det_w, det_h, cascade_path_.c_str());
+
+    cv::Mat prev_gray, small_gray;
+    std::vector<cv::Point2f> tracked_pts;
+    cv::Rect  last_bbox;          // in full-resolution pixel coords
+    bool      tracker_valid = false;
+    bool      force_detect  = true;
+    int       frame_count   = 0;
+
+    while (running_.load()) {
+        cap >> cur_gray;
+        if (cur_gray.empty())
             continue;
 
-        /*
-         * Detect faces.
-         * Output Mat shape: [N, 15], type CV_32F
-         * Columns per face:
-         *   0-3:   bounding box (x, y, w, h)
-         *   4-5:   right eye (x, y)
-         *   6-7:   left eye  (x, y)
-         *   8-9:   nose tip  (x, y)
-         *   10-11: right mouth corner (x, y)
-         *   12-13: left mouth corner  (x, y)
-         *   14:    confidence score
-         */
-        cv::Mat faces;
-        detector->detect(frame, faces);
-        if (faces.rows == 0)
-            continue;   // no face — hold last u_shift value
+        /* Ensure single-channel (camera might return BGR on fallback) */
+        if (cur_gray.channels() != 1)
+            cv::cvtColor(cur_gray, cur_gray, cv::COLOR_BGR2GRAY);
 
-        /* Extract 5 image-plane keypoints from the highest-confidence face */
-        std::vector<cv::Point2f> image_points;
-        image_points.reserve(5);
-        for (int i = 0; i < 5; i++) {
-            float px = faces.at<float>(0, 4 + i * 2);
-            float py = faces.at<float>(0, 5 + i * 2);
-            image_points.emplace_back(px, py);
-        }
+        const bool do_detect = force_detect || (frame_count % FT_DETECT_EVERY == 0);
+        force_detect = false;
 
-        /* ---- solvePnP: 3-D model → 2-D landmarks ---- */
-        cv::Mat rvec, tvec;
-        /* SOLVEPNP_ITERATIVE needs ≥6 points on OpenCV 4.5.x (DLT init);
-         * SOLVEPNP_EPNP handles 4+ non-coplanar points correctly. */
-        if (!cv::solvePnP(model_points, image_points,
-                          cam_matrix, dist_coeffs,
-                          rvec, tvec,
-                          false, cv::SOLVEPNP_EPNP))
-            continue;
+        float face_x = -1.f;   // sentinel: no update this frame
 
-        /* ---- Extract yaw from rotation matrix ---- */
-        cv::Mat R;
-        cv::Rodrigues(rvec, R);
+        /* ----------------------------------------------------------------
+         * DETECTION FRAME — run Haar cascade on downscaled image,
+         * optionally restricted to an expanded ROI of the last known bbox.
+         * ---------------------------------------------------------------- */
+        if (do_detect) {
+            if (need_resize)
+                cv::resize(cur_gray, small_gray, cv::Size(det_w, det_h),
+                           0, 0, cv::INTER_NEAREST);
+            else
+                small_gray = cur_gray;  // shallow alias — we never write to it
 
-        /*
-         * Yaw angle (rotation around vertical/Y axis).
-         * Using atan2(R[2][0], R[0][0]) as specified in the plan.
-         * Negate FT_SENSITIVITY if the parallax direction feels inverted.
-         */
-        const float yaw = static_cast<float>(
-            std::atan2(R.at<double>(1, 0), R.at<double>(0, 0)));
+            /* Build detection ROI in small_gray coordinates */
+            cv::Mat   det_input;
+            cv::Point det_offset(0, 0);
 
-        /* ---- EMA smoothing + u_shift update (single lock) ---- */
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-
-            if (first_detection) {
-                /* Seed EMA with first measurement to avoid startup transient */
-                ema_yaw         = yaw;
-                first_detection = false;
+            if (tracker_valid) {
+                /* Expand last bbox by 50% each side to give the face room to
+                 * move between detection frames. */
+                const int mx = static_cast<int>(last_bbox.width  * scale_x * 0.5f);
+                const int my = static_cast<int>(last_bbox.height * scale_y * 0.5f);
+                cv::Rect roi;
+                roi.x      = std::max(0, static_cast<int>(last_bbox.x * scale_x) - mx);
+                roi.y      = std::max(0, static_cast<int>(last_bbox.y * scale_y) - my);
+                roi.width  = std::min(det_w - roi.x,
+                                      static_cast<int>(last_bbox.width  * scale_x) + 2*mx);
+                roi.height = std::min(det_h - roi.y,
+                                      static_cast<int>(last_bbox.height * scale_y) + 2*my);
+                det_input  = small_gray(roi);
+                det_offset = roi.tl();
             } else {
-                ema_yaw = FT_SMOOTH * yaw + (1.0f - FT_SMOOTH) * ema_yaw;
+                det_input = small_gray;
             }
 
-            const float rel_yaw = ema_yaw - ref_yaw;
-            u_shift_val = ft_clamp(0.5f + rel_yaw * FT_SENSITIVITY,
-                                   FT_SHIFT_MIN, FT_SHIFT_MAX);
+            std::vector<cv::Rect> faces;
+            cascade_.detectMultiScale(det_input, faces,
+                1.1, 3, 0, cv::Size(30, 30));
+
+            if (!faces.empty()) {
+                /* Largest face wins */
+                const cv::Rect &best = *std::max_element(
+                    faces.begin(), faces.end(),
+                    [](const cv::Rect &a, const cv::Rect &b)
+                    { return a.area() < b.area(); });
+
+                /* Translate: det_input-local → small_gray → full-res */
+                const int sx = best.x + det_offset.x;
+                const int sy = best.y + det_offset.y;
+                last_bbox = cv::Rect(
+                    static_cast<int>(sx          * inv_scale_x),
+                    static_cast<int>(sy          * inv_scale_y),
+                    static_cast<int>(best.width  * inv_scale_x),
+                    static_cast<int>(best.height * inv_scale_y))
+                    & cv::Rect(0, 0, fw, fh);
+
+                /* Re-seed LK with good features inside the fresh bbox */
+                cv::goodFeaturesToTrack(cur_gray(last_bbox), tracked_pts,
+                    FT_MAX_POINTS, 0.01, 5.0);
+                for (auto &pt : tracked_pts) {
+                    pt.x += static_cast<float>(last_bbox.x);
+                    pt.y += static_cast<float>(last_bbox.y);
+                }
+                tracker_valid = !tracked_pts.empty();
+                face_x = static_cast<float>(last_bbox.x) + last_bbox.width  * 0.5f;
+            } else {
+                tracker_valid = false;   // hold last u_shift
+            }
+
+        /* ----------------------------------------------------------------
+         * TRACKING FRAME — propagate points with Lucas-Kanade
+         * ---------------------------------------------------------------- */
+        } else if (tracker_valid && !prev_gray.empty()) {
+            std::vector<cv::Point2f> next_pts;
+            std::vector<uchar>       status;
+            std::vector<float>       err;
+
+            cv::calcOpticalFlowPyrLK(
+                prev_gray, cur_gray, tracked_pts, next_pts,
+                status, err,
+                cv::Size(15, 15),   // search window
+                2);                 // pyramid levels
+
+            std::vector<cv::Point2f> good;
+            good.reserve(tracked_pts.size());
+            for (size_t i = 0; i < status.size(); i++)
+                if (status[i]) good.push_back(next_pts[i]);
+
+            if (static_cast<int>(good.size()) < FT_MIN_POINTS) {
+                /* Too many points dropped — force Haar on next frame */
+                tracker_valid = false;
+                force_detect  = true;
+            } else {
+                tracked_pts = good;
+                float sum_x = 0.f;
+                for (const auto &pt : good) sum_x += pt.x;
+                face_x = sum_x / static_cast<float>(good.size());
+            }
         }
+
+        /* ----------------------------------------------------------------
+         * Update EMA and u_shift whenever we have a valid face position.
+         * ---------------------------------------------------------------- */
+        if (face_x >= 0.f) {
+            const float rel_x = (face_x - half_w) / half_w;   // [-1, 1]
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (first_detection_) {
+                ema_x_           = rel_x;
+                first_detection_ = false;
+            } else {
+                ema_x_ = FT_SMOOTH * rel_x + (1.f - FT_SMOOTH) * ema_x_;
+            }
+            u_shift_val_ = ft_clamp(
+                0.5f + (ema_x_ - ref_x_) * FT_SENSITIVITY,
+                FT_SHIFT_MIN, FT_SHIFT_MAX);
+        }
+
+        cv::swap(cur_gray, prev_gray);   // O(1) — no pixel copy
+        ++frame_count;
     }
 
     cap.release();

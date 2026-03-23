@@ -673,34 +673,33 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
 
     /* ---- Face tracker (USB webcam, background thread) ---- */
     {
-        // Look for the YuNet ONNX model alongside the binary or in the
-        // source tree; fall back gracefully if it is not present.
-        // 2021sep is the original model from when FaceDetectorYN was added (OpenCV 4.5.4).
-        // 2022mar/2023mar use newer ONNX opsets that crash OpenCV 4.5.x (Jetson L4T).
-        const char *candidates[] = {
-            "face_detection_yunet_2021sep.onnx",
-            "models/face_detection_yunet_2021sep.onnx",
-            "src/models/face_detection_yunet_2021sep.onnx",
+        // Look for the Haar frontal-face cascade alongside the binary or in
+        // standard OpenCV system data directories.
+        const char *cascade_candidates[] = {
+            "haarcascade_frontalface_alt2.xml",
+            "/usr/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
+            "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
+            "/usr/share/opencv/haarcascades/haarcascade_frontalface_alt2.xml",
         };
-        std::string yunet_path;
-        for (const char *c : candidates) {
+        std::string cascade_path;
+        for (const char *c : cascade_candidates) {
             if (FILE *f = std::fopen(c, "rb")) {
                 std::fclose(f);
-                yunet_path = c;
+                cascade_path = c;
                 break;
             }
         }
 
-        if (yunet_path.empty()) {
-            printf("[FaceTracker] Model not found — face tracking disabled.\n");
-            printf("  Download: face_detection_yunet_2021sep.onnx\n");
-            printf("  (see: opencv_zoo/models/face_detection_yunet)\n");
+        if (cascade_path.empty()) {
+            printf("[FaceTracker] Haar cascade not found — face tracking disabled.\n");
+            printf("  Expected: haarcascade_frontalface_alt2.xml\n");
+            printf("  Install: sudo apt-get install opencv-data\n");
         } else {
             face_tracker = new FaceTracker();
-            if (face_tracker->start(FACE_CAM_INDEX, yunet_path)) {
+            if (face_tracker->start(FACE_CAM_INDEX, cascade_path)) {
                 face_tracking_enabled = true;
-                printf("[FaceTracker] Started on camera %d  model: %s\n",
-                       FACE_CAM_INDEX, yunet_path.c_str());
+                printf("[FaceTracker] Started on camera %d  cascade: %s\n",
+                       FACE_CAM_INDEX, cascade_path.c_str());
                 printf("[FaceTracker] Press C to calibrate, F to toggle\n");
             } else {
                 printf("[FaceTracker] Failed to start\n");
@@ -708,6 +707,7 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
                 face_tracker = nullptr;
             }
         }
+
     }
 
     last_fps_print = std::chrono::steady_clock::now();
