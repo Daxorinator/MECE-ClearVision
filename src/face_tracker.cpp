@@ -86,12 +86,12 @@ bool FaceTracker::isActive() const
 
 void FaceTracker::threadLoop()
 {
-    /* ---- Open webcam via GStreamer (videoflip corrects upside-down mounting) ---- */
+    /* ---- Open webcam via GStreamer ---- */
     const std::string pipeline =
         std::string("v4l2src device=/dev/video") + std::to_string(camera_index_)
         + " ! image/jpeg, width=640, height=480"
         + " ! jpegdec"
-        + " ! videoflip method=2"
+        + " ! videoflip method=0"
         + " ! videoconvert"
         + " ! video/x-raw, format=BGR"
         + " ! appsink drop=true max-buffers=1";
