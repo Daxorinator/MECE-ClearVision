@@ -74,7 +74,7 @@ struct CameraCapture {
  */
 static std::string csi_pipeline(int sensor_id, int width, int height,
                                  int out_w = 0, int out_h = 0,
-                                 int fps = 30, int flip_method = 2)
+                                 int fps = 30, int flip_method = 0)
 {
     const bool do_scale = (out_w > 0 && out_h > 0
                            && (out_w != width || out_h != height));
@@ -119,7 +119,7 @@ static std::string csi_pipeline(int sensor_id, int width, int height,
  *   0=none  1=cw90  2=180  3=ccw90  4=horiz  5=ul-diag  6=vert  7=ur-diag
  */
 static std::string v4l2_pipeline(int device_idx, int width, int height,
-                                  int flip_method = 2)
+                                  int flip_method = 0)
 {
     return std::string("v4l2src device=/dev/video") + std::to_string(device_idx)
            + " ! image/jpeg"
