@@ -228,10 +228,25 @@ void main() {
     if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
     float disp = texelFetch(u_disparity, src, 0).r;
     if (disp < 0.5) return;
-    int dst_x = int(round(float(src.x) + disp * u_shift));
-    if (dst_x < 0 || dst_x >= u_output_size.x) return;
-    uint depth_val = uint(disp * 256.0);
-    atomicMax(depth[src.y * u_output_size.x + dst_x], depth_val);
+
+    float dst_xf = float(src.x) - disp * u_shift;
+    int dst_x0 = int(floor(dst_xf));
+    int dst_x1 = dst_x0 + 1;
+
+    uint depth_val = floatBitsToUint(disp);
+
+    if (dst_x0 >= 0 && dst_x0 < u_output_size.x)
+        atomicMax(depth[src.y * u_output_size.x + dst_x0], depth_val);
+
+    bool write_second = true;
+    if (src.x + 1 < u_output_size.x) {
+        float disp_neighbour = texelFetch(u_disparity, ivec2(src.x + 1, src.y), 0).r;
+        if (abs(disp - disp_neighbour) > 2.0)
+            write_second = false;
+    }
+
+    if (write_second && dst_x1 >= 0 && dst_x1 < u_output_size.x)
+        atomicMax(depth[src.y * u_output_size.x + dst_x1], depth_val);
 }
 )";
 
@@ -250,9 +265,9 @@ void main() {
     if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
     float disp = texelFetch(u_disparity, src, 0).r;
     if (disp < 0.5) return;
-    int dst_x = int(round(float(src.x) + disp * u_shift));
+    int dst_x = int(round(float(src.x) - disp * u_shift));
     if (dst_x < 0 || dst_x >= u_output_size.x) return;
-    uint my_depth = uint(disp * 256.0);
+    uint my_depth = floatBitsToUint(disp);
     uint stored = depth[src.y * u_output_size.x + dst_x];
     if (my_depth >= stored) {
         vec4 col = texelFetch(u_color, src, 0);
@@ -325,6 +340,37 @@ out vec4 frag_color;
 uniform sampler2D u_texture;
 void main() {
     frag_color = texture(u_texture, v_uv);
+}
+)";
+
+static const char *BACKWARD_COLOR_CS = R"(#version 310 es
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform sampler2D u_colour;
+uniform ivec2 u_output_size;
+uniform float u_shift;
+
+layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
+layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
+
+void main() {
+    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
+    if (dst.x >= u_output_size.x || dst.y >= u_output_size.y) return;
+
+    uint stored = depth[dst.y * u_output_size.x + dst.x];
+    if (stored == 0u) return;
+
+    float warped_disp = uintBitsToFloat(stored);
+    float src_xf = float(dst.x) + warped_disp * u_shift;
+    float src_yf = float(dst.y);
+
+    if (src_xf < 0.0 || src_xf >= float(u_output_size.x) - 1.0) return;
+
+    vec2 uv = vec2((src_xf + 0.5) / float(u_output_size.x),
+                   (src_yf + 0.5) / float(u_output_size.y));
+
+    vec4 col = texture(u_colour, uv);
+    imageStore(u_output, dst, col);
 }
 )";
 
@@ -483,6 +529,7 @@ private:
     /* GPU resources */
     GLuint prog_depth_splat, prog_color_splat, prog_hole_fill, prog_display;
     GLuint prog_clear{0};
+    GLuint prog_backward_color{0};
     GLint  uloc_clear_total{-1};
     GLuint tex_left_color, tex_right_color;
     GLuint tex_left_disp, tex_right_disp;
@@ -525,12 +572,15 @@ private:
     std::unique_ptr<sgm::StereoSGM> sgm_cuda;
     cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
     cv::cuda::GpuMat              gpu_disp_float;
+    cv::cuda::GpuMat              disp_filtered_gpu;
+    bool                          disp_filtered_init{false};
 
     /* Cached GL uniform locations (set once in initializeGL) */
     GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1};
     GLint uloc_cs_color{-1}, uloc_cs_disp{-1}, uloc_cs_shift{-1}, uloc_cs_size{-1};
     GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
     GLint uloc_disp_texture{-1};
+    GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
 
     void shutdownCameras();
     void rebuildStereo();
@@ -542,10 +592,10 @@ private:
 
 SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     : QOpenGLWidget(parent), calib(calib_in), cameras_ok(false),
-      num_disparities(64), block_size(9),
-      use_sgbm(true), use_wls(false), use_hole_fill(true),
+      num_disparities(64), block_size(5),
+      use_sgbm(false), use_wls(false), use_hole_fill(true),
       proc_scale(0.5),
-      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0),
+      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0),
       tex_left_color(0), tex_right_color(0),
       tex_left_disp(0), tex_right_disp(0),
       tex_output(0), tex_filled(0), ssbo_depth(0),
@@ -677,7 +727,8 @@ SynthWindow::~SynthWindow()
     if (prog_depth_splat) glDeleteProgram(prog_depth_splat);
     if (prog_color_splat) glDeleteProgram(prog_color_splat);
     if (prog_hole_fill)   glDeleteProgram(prog_hole_fill);
-    if (prog_display)     glDeleteProgram(prog_display);
+    if (prog_display)        glDeleteProgram(prog_display);
+    if (prog_backward_color) glDeleteProgram(prog_backward_color);
     if (prog_clear)       glDeleteProgram(prog_clear);
     GLuint textures[] = { tex_left_color, tex_right_color,
                           tex_left_disp, tex_right_disp,
@@ -852,13 +903,14 @@ void SynthWindow::initializeGL()
     printf("Renderer:       %s\n", glGetString(GL_RENDERER));
 
     /* Compile compute programs */
-    prog_depth_splat = create_compute_program(DEPTH_SPLAT_CS);
-    prog_color_splat = create_compute_program(COLOR_SPLAT_CS);
-    prog_hole_fill   = create_compute_program(HOLE_FILL_CS);
-    prog_display     = create_render_program(DISPLAY_VS, DISPLAY_FS);
-    prog_clear       = create_compute_program(CLEAR_CS);
+    prog_depth_splat    = create_compute_program(DEPTH_SPLAT_CS);
+    prog_color_splat    = create_compute_program(COLOR_SPLAT_CS);
+    prog_hole_fill      = create_compute_program(HOLE_FILL_CS);
+    prog_display        = create_render_program(DISPLAY_VS, DISPLAY_FS);
+    prog_clear          = create_compute_program(CLEAR_CS);
+    prog_backward_color = create_compute_program(BACKWARD_COLOR_CS);
 
-    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear) {
+    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear || !prog_backward_color) {
         fprintf(stderr, "FATAL: shader compilation failed\n");
         return;
     }
@@ -896,8 +948,11 @@ void SynthWindow::initializeGL()
     uloc_cs_size      = glGetUniformLocation(prog_color_splat, "u_output_size");
     uloc_hf_maxsearch = glGetUniformLocation(prog_hole_fill,   "u_max_search");
     uloc_hf_size      = glGetUniformLocation(prog_hole_fill,   "u_output_size");
-    uloc_disp_texture = glGetUniformLocation(prog_display,     "u_texture");
-    uloc_clear_total  = glGetUniformLocation(prog_clear,       "u_total");
+    uloc_disp_texture = glGetUniformLocation(prog_display,        "u_texture");
+    uloc_clear_total  = glGetUniformLocation(prog_clear,          "u_total");
+    uloc_bc_colour    = glGetUniformLocation(prog_backward_color, "u_colour");
+    uloc_bc_size      = glGetUniformLocation(prog_backward_color, "u_output_size");
+    uloc_bc_shift     = glGetUniformLocation(prog_backward_color, "u_shift");
     printf("GPU pipeline initialised\n");
 
     /* Kick off the self-sustaining render loop (no fixed-interval cap) */
@@ -1178,6 +1233,19 @@ void SynthWindow::paintGL()
         cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
     }
 
+    /* IIR temporal disparity filter — smooths frame-to-frame flicker */
+    {
+        const float alpha = 0.2f;
+        gpu_disp_float.upload(disp_l_float);
+        if (!disp_filtered_init || disp_filtered_gpu.size() != gpu_disp_float.size()) {
+            gpu_disp_float.copyTo(disp_filtered_gpu);
+            disp_filtered_init = true;
+        } else {
+            cv::cuda::addWeighted(gpu_disp_float, alpha, disp_filtered_gpu, 1.0 - alpha, 0.0, disp_filtered_gpu);
+        }
+        disp_filtered_gpu.download(disp_l_float);
+    }
+
     /* 10. Upload left color + disparity to GL */
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
@@ -1211,16 +1279,13 @@ void SynthWindow::paintGL()
 
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    /* ---- Pass 2: Color splat (left view, z-tested) ---- */
-    glUseProgram(prog_color_splat);
+    /* ---- Pass 2: Backward colour warp (destination-driven, bilinear source) ---- */
+    glUseProgram(prog_backward_color);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
-    glUniform1i(uloc_cs_color, 0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(uloc_cs_disp, 1);
-    glUniform1f(uloc_cs_shift, u_shift);
-    glUniform2i(uloc_cs_size, proc_w, proc_h);
+    glUniform1i(uloc_bc_colour, 0);
+    glUniform2i(uloc_bc_size, proc_w, proc_h);
+    glUniform1f(uloc_bc_shift, u_shift);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
