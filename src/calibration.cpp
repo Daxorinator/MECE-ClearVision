@@ -21,6 +21,7 @@
 #include <cmath>
 #include <ctime>
 #include <chrono>
+#include <future>
 #include <mutex>
 #include <vector>
 #include <map>
@@ -129,14 +130,19 @@ static bool calibrate_stereo(
     cv::Mat K_l, dist_l, K_r, dist_r;
     std::vector<cv::Mat> rvecs_l, tvecs_l, rvecs_r, tvecs_r;
 
-    printf("\n1. Calibrating left camera (initial)...\n");
-    double rms_l = cv::calibrateCamera(obj_points, img_left, image_size,
-                                       K_l, dist_l, rvecs_l, tvecs_l);
-    printf("   Left RMS reprojection error: %.4f px\n", rms_l);
+    /* Run left and right calibration in parallel — they are fully independent */
+    const int CAL_FLAGS = cv::CALIB_FIX_K4 | cv::CALIB_FIX_K5 | cv::CALIB_FIX_K6;
 
-    printf("\n2. Calibrating right camera (initial)...\n");
-    double rms_r = cv::calibrateCamera(obj_points, img_right, image_size,
-                                       K_r, dist_r, rvecs_r, tvecs_r);
+    printf("\n1+2. Calibrating left and right cameras in parallel...\n");
+    double rms_l = 0.0, rms_r = 0.0;
+    auto fut_l = std::async(std::launch::async, [&]() {
+        return cv::calibrateCamera(obj_points, img_left, image_size,
+                                   K_l, dist_l, rvecs_l, tvecs_l, CAL_FLAGS);
+    });
+    rms_r = cv::calibrateCamera(obj_points, img_right, image_size,
+                                K_r, dist_r, rvecs_r, tvecs_r, CAL_FLAGS);
+    rms_l = fut_l.get();
+    printf("   Left  RMS reprojection error: %.4f px\n", rms_l);
     printf("   Right RMS reprojection error: %.4f px\n", rms_r);
 
     /* --- Filter outlier image pairs by per-image reprojection error --- */
@@ -192,8 +198,7 @@ static bool calibrate_stereo(
         }
     }
 
-    printf("\n3. Stereo calibration (joint optimisation)...\n");
-    printf("   Using SAME_FOCAL_LENGTH constraint (identical cameras)\n");
+    printf("\n3. Stereo calibration (extrinsics only — intrinsics fixed)...\n");
     cv::Mat R, T, E, F;
     cv::TermCriteria crit(cv::TermCriteria::EPS | cv::TermCriteria::MAX_ITER,
                           100, 1e-5);
@@ -201,7 +206,7 @@ static bool calibrate_stereo(
         obj_points, img_left, img_right,
         K_l, dist_l, K_r, dist_r,
         image_size, R, T, E, F,
-        cv::CALIB_SAME_FOCAL_LENGTH, crit);
+        cv::CALIB_FIX_INTRINSIC, crit);
     printf("   Stereo RMS error: %.4f px\n", rms_s);
 
     /* --- Sanity checks --- */
