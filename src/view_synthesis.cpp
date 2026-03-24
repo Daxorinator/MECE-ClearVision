@@ -70,8 +70,8 @@
  * Configuration
  * ======================================================================== */
 
-#define LEFT_CAMERA_ID      1
-#define RIGHT_CAMERA_ID     0
+#define LEFT_CAMERA_ID      0
+#define RIGHT_CAMERA_ID     1
 #define CAMERA_WIDTH        1920
 #define CAMERA_HEIGHT       1080
 #define FPS_WINDOW          30
@@ -595,7 +595,7 @@ private:
 
 SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     : QOpenGLWidget(parent), calib(calib_in), cameras_ok(false),
-      num_disparities(64), block_size(5),
+      num_disparities(256), block_size(5),
       use_sgbm(false), use_wls(false), use_hole_fill(true),
       proc_scale(0.5),
       prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0),
