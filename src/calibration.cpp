@@ -50,8 +50,8 @@
 #define SQUARE_SIZE_MM      25.0
 #define LEFT_CAMERA_ID      1
 #define RIGHT_CAMERA_ID     0
-#define CAMERA_WIDTH        1280
-#define CAMERA_HEIGHT        720
+#define CAMERA_WIDTH        1920
+#define CAMERA_HEIGHT       1080
 #define MIN_CALIB_IMAGES    15
 #define DISPLAY_SCALE       0.5
 #define DETECT_EVERY_N      4
@@ -141,7 +141,7 @@ static bool calibrate_stereo(
 
     /* --- Filter outlier image pairs by per-image reprojection error --- */
     printf("\n   Per-image reprojection errors:\n");
-    const double MAX_PER_IMAGE_ERR = 1.0;
+    const double MAX_PER_IMAGE_ERR = 3.0;
     int n = (int)obj_points.size();
     std::vector<bool> keep(n, true);
     int removed = 0;
