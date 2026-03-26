@@ -72,9 +72,9 @@
 
 #define LEFT_CAMERA_ID      0
 #define RIGHT_CAMERA_ID     1
-#define CAMERA_WIDTH        1920
-#define CAMERA_HEIGHT       1080
-#define FPS_WINDOW          30
+#define CAMERA_WIDTH        1366
+#define CAMERA_HEIGHT       768
+#define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
 #define HOLE_FILL_MAX_SEARCH 16
 #define FACE_CAM_INDEX      2   // V4L2 index of the USB viewer-facing webcam

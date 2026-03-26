@@ -48,11 +48,11 @@
 
 #define CHECKERBOARD_W      9
 #define CHECKERBOARD_H      6
-#define SQUARE_SIZE_MM      28.25
+#define SQUARE_SIZE_MM      25
 #define LEFT_CAMERA_ID      0
 #define RIGHT_CAMERA_ID     1
-#define CAMERA_WIDTH        1920
-#define CAMERA_HEIGHT       1080
+#define CAMERA_WIDTH        1366
+#define CAMERA_HEIGHT       768
 #define MIN_CALIB_IMAGES    15
 #define DISPLAY_SCALE       0.5
 #define DETECT_EVERY_N      4
