@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)  # depthai-core requires 3.20
+cmake_minimum_required(VERSION 3.10)
 project(stereo_calibration CXX)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -28,11 +28,11 @@ find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(Threads REQUIRED)
 
 # ---- depthai-core 2.x (OAK-D Lite) ----
-# Must be 2.x — depthai 3.x is not supported on JetPack 4.x / L4T R32.
-# Added as a git submodule, pinned to v2.32.0.
-# Requires CMake 3.20 — install via Kitware APT repo on Jetson (Ubuntu 18.04/bionic ARM64).
-# To initialise after cloning: git submodule update --init --recursive extern/depthai-core
-add_subdirectory(extern/depthai-core)
+# Uses the depthai pip package's bundled C++ library and CMake config.
+# With your venv activated, find the path with:
+#   python3 -c "import depthai, os; print(os.path.join(os.path.dirname(depthai.__file__), 'cmake', 'depthai'))"
+# Then pass it to cmake: cmake -Ddepthai_DIR=<path> ..
+find_package(depthai CONFIG REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Targets
