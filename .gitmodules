@@ -1,3 +1,6 @@
 [submodule "extern/libSGM"]
 	path = extern/libSGM
 	url = https://github.com/fixstars/libSGM.git
+[submodule "extern/depthai-core"]
+	path = extern/depthai-core
+	url = https://github.com/luxonis/depthai-core

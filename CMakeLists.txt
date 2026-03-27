@@ -14,7 +14,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
 # ---------------------------------------------------------------------------
-# Camera backend
+# Camera backend — no longer used by view_synthesis (OAK-D via USB).
+# Retained for depth_pipeline which still uses CSI/V4L2 cameras.
 #   ON  (default) — nvarguscamerasrc GStreamer pipeline  (Jetson CSI cameras)
 #   OFF           — V4L2 device index                    (USB cameras)
 # ---------------------------------------------------------------------------
@@ -26,24 +27,15 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui ximgproc ob
 find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(Threads REQUIRED)
 
-# ---- libSGM (CUDA semi-global matching) ----
-set(LIBSGM_SHARED        OFF CACHE BOOL "" FORCE)
-set(ENABLE_SAMPLES       OFF CACHE BOOL "" FORCE)
-set(ENABLE_TESTS         OFF CACHE BOOL "" FORCE)
-set(BUILD_OPENCV_WRAPPER OFF CACHE BOOL "" FORCE)
-# AUTO_DETECT_ARCH (ON by default in libSGM) will detect sm_53 on Jetson Nano
-add_subdirectory(extern/libSGM)
+# ---- depthai-core 2.x (OAK-D Lite) ----
+# Must be 2.x — depthai 3.x is not supported on JetPack 4.x / L4T R32.
+# Added as a git submodule (same pattern as libSGM) to stay compatible with CMake 3.10.
+# Pinned to v2.32.0. To initialise after cloning: git submodule update --init --recursive extern/depthai-core
+add_subdirectory(extern/depthai-core)
 
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------
-
-add_executable(calibration src/calibration.cpp)
-target_link_libraries(calibration
-    ${OpenCV_LIBS}
-    Qt5::Widgets
-    Threads::Threads
-)
 
 add_executable(depth_pipeline src/depth_pipeline.cpp)
 target_link_libraries(depth_pipeline
@@ -52,11 +44,14 @@ target_link_libraries(depth_pipeline
     Threads::Threads
 )
 
-add_executable(view_synthesis src/view_synthesis.cpp src/face_tracker.cpp)
-target_include_directories(view_synthesis PRIVATE ${CMAKE_SOURCE_DIR}/extern/libSGM/include)
+add_executable(view_synthesis
+    src/view_synthesis.cpp
+    src/face_tracker.cpp
+    src/oak_receiver.cpp
+)
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
-    sgm
+    depthai::core
     Qt5::Widgets
     Qt5::OpenGL
     GLESv2
@@ -64,10 +59,13 @@ target_link_libraries(view_synthesis
     Threads::Threads
 )
 
+add_executable(oak_test src/oak_test.cpp)
+target_link_libraries(oak_test depthai::core Threads::Threads)
+
 add_executable(yunet_test demos/yunet_test.cpp)
 target_link_libraries(yunet_test ${OpenCV_LIBS} Threads::Threads)
 
-# Copy the YuNet model next to yunet_test (demo only — view_synthesis uses Haar + LK).
+# Copy the YuNet model next to yunet_test
 set(YUNET_MODEL "${CMAKE_SOURCE_DIR}/src/models/face_detection_yunet_2021sep.onnx")
 if(EXISTS "${YUNET_MODEL}")
     add_custom_command(TARGET yunet_test POST_BUILD
@@ -79,13 +77,11 @@ if(EXISTS "${YUNET_MODEL}")
 endif()
 
 # ---------------------------------------------------------------------------
-# Propagate backend choice to all targets
+# Propagate backend choice to depth_pipeline
 # ---------------------------------------------------------------------------
 if(CAMERA_BACKEND_CSI)
     message(STATUS "Camera backend: CSI (nvarguscamerasrc)")
-    target_compile_definitions(calibration   PRIVATE CAMERA_BACKEND_CSI)
     target_compile_definitions(depth_pipeline PRIVATE CAMERA_BACKEND_CSI)
-    target_compile_definitions(view_synthesis PRIVATE CAMERA_BACKEND_CSI)
 else()
     message(STATUS "Camera backend: V4L2")
 endif()
