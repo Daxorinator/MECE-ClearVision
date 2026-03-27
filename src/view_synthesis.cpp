@@ -717,28 +717,30 @@ void SynthWindow::paintGL()
     /* 1. Grab frame from OAK-D Lite */
     OAKFrame oak_frame;
     if (!oak_receiver.getFrame(oak_frame)) { update(); return; }
-    cv::Mat &frame_l = oak_frame.color;
     // Convert disparity from CV_16U subpixel (divide by 32) to CV_32F
     cv::Mat disp_l_float;
     oak_frame.disparity.convertTo(disp_l_float, CV_32F, 1.0f / 32.0f);
 
     if (!diag_frames_logged) {
-        printf("[DIAG] First frame: color=%dx%d type=%d  disp=%dx%d type=%d  proc=%dx%d\n",
-               frame_l.cols, frame_l.rows, frame_l.type(),
+        printf("[DIAG] First frame: color(NV12) mat=%dx%d image=%dx%d  disp=%dx%d type=%d  proc=%dx%d\n",
+               oak_frame.color.cols, oak_frame.color.rows,
+               oak_frame.color.cols, oak_frame.color.rows * 2 / 3,
                oak_frame.disparity.cols, oak_frame.disparity.rows, oak_frame.disparity.type(),
                proc_w, proc_h);
         printf("[DIAG] use_cuda=%d\n", use_cuda);
         diag_frames_logged = true;
     }
 
-    /* Downscale OAK-D frames (1920×1080) to processing resolution */
-    cv::Mat frame_proc;
-    cv::resize(frame_l, frame_proc, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_LINEAR);
+    /* Convert NV12 → RGBA at full resolution, then resize to processing resolution.
+     * A single cvtColor call is cheaper than NV12→BGR→RGBA (two conversions).
+     * TODO: upload Y and UV planes as GL_R8 + GL_RG8 textures and perform
+     *       BT.601 YUV→RGB in the compute shader to eliminate this CPU step. */
+    {
+        cv::Mat rgba_full;
+        cv::cvtColor(oak_frame.color, rgba_full, cv::COLOR_YUV2RGBA_NV12);
+        cv::resize(rgba_full, m_left_rgba, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_LINEAR);
+    }
     cv::resize(disp_l_float, disp_l_float, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
-
-    /* 2. Convert left BGR → RGBA for GPU upload */
-    cv::Mat &left_rgba = m_left_rgba;
-    cv::cvtColor(frame_proc, left_rgba, cv::COLOR_BGR2RGBA);
 
     /* IIR temporal disparity filter — smooths frame-to-frame flicker */
     if (use_cuda) {
@@ -756,7 +758,7 @@ void SynthWindow::paintGL()
     /* 3. Upload left color + disparity to GL */
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
-                    GL_RGBA, GL_UNSIGNED_BYTE, left_rgba.data);
+                    GL_RGBA, GL_UNSIGNED_BYTE, m_left_rgba.data);
 
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,

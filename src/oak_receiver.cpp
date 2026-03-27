@@ -106,13 +106,12 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
             f.disparity = tmp.clone();
         }
         {
-            // ColorCamera::isp always outputs NV12 (Y plane + interleaved UV plane).
-            // setColorOrder/setInterleaved only affect the video encoder output.
+            // Store NV12 as-is — consumers convert to their required format.
             auto &d = colorFrame->getData();
             int w = (int)colorFrame->getWidth();
             int h = (int)colorFrame->getHeight();
             cv::Mat nv12(h * 3 / 2, w, CV_8UC1, const_cast<uint8_t*>(d.data()));
-            cv::cvtColor(nv12, f.color, cv::COLOR_YUV2BGR_NV12);
+            f.color = nv12.clone();
         }
         if (confFrame) {
             auto &d = confFrame->getData();

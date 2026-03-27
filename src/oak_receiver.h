@@ -7,8 +7,13 @@
 #include <depthai/depthai.hpp>
 
 // Frames received from the OAK-D Lite over USB.
-// disparity: CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity
-// color:     CV_8UC3 BGR, RGB-aligned to disparity resolution
+// disparity:  CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity
+// color:      CV_8UC1, NV12 layout — rows = height * 3/2, cols = width.
+//             Y plane occupies rows [0, height), interleaved UV plane rows [height, height*3/2).
+//             ColorCamera::isp always outputs NV12 regardless of setColorOrder/setInterleaved.
+//             Convert with e.g. cv::cvtColor(color, out, cv::COLOR_YUV2RGBA_NV12).
+//             TODO: upload Y and UV planes as separate GL_R8 / GL_RG8 textures and perform
+//                   BT.601 YUV→RGB in the compute shader to avoid this CPU conversion entirely.
 // confidence: CV_8U, 0 = maximum confidence (optional, may be empty)
 struct OAKFrame {
     cv::Mat disparity;
