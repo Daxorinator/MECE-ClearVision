@@ -9,15 +9,10 @@
  *   cd build && cmake .. && make view_synthesis
  *
  * Usage:
- *   ./view_synthesis <path-to-calibration.json>
- *   ./view_synthesis   (auto-finds newest JSON in src/calibration_output/)
+ *   ./view_synthesis
  *
  * Controls:
  *   ESC   - Exit
- *   +/-   - Increase/decrease numDisparities (steps of 16 for BM; 64/128/256 for SGBM)
- *   [/]   - Decrease/increase blockSize (by 2, must be odd)
- *   S     - Toggle StereoBM / StereoSGBM (libSGM CUDA when available)
- *   W     - Toggle WLS disparity filter
  *   1/2/3 - Processing scale: 1.0x, 0.5x, 0.25x
  *   H     - Toggle hole filling
  *   F     - Toggle face-tracking shift
@@ -39,16 +34,12 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/ximgproc/disparity_filter.hpp>
 #include <opencv2/cudaarithm.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudawarping.hpp>
-#include <opencv2/cudastereo.hpp>
-
-#include <libsgm.h>
 
 #include "face_tracker.h"
+#include "oak_receiver.h"
 
 #include <QApplication>
 #include <QOpenGLWidget>
@@ -56,12 +47,6 @@
 #include <QTimer>
 #include <QKeyEvent>
 #include <QPainter>
-#include <QFile>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QDir>
-#include <QFileInfoList>
 #include <QSurfaceFormat>
 
 #include <GLES3/gl31.h>
@@ -70,146 +55,12 @@
  * Configuration
  * ======================================================================== */
 
-#define LEFT_CAMERA_ID      0
-#define RIGHT_CAMERA_ID     1
 #define CAMERA_WIDTH        1366
 #define CAMERA_HEIGHT       768
 #define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
 #define HOLE_FILL_MAX_SEARCH 16
 #define FACE_CAM_INDEX      2   // V4L2 index of the USB viewer-facing webcam
-                                // CSI stereo cameras occupy /dev/video0 and /dev/video1
-                                // on Jetson Nano; USB webcam is typically /dev/video2
-
-/* ========================================================================
- * Camera capture
- * ======================================================================== */
-
-#include "camera_capture.h"
-
-/* ========================================================================
- * JSON calibration loader (identical to depth_pipeline.cpp)
- * ======================================================================== */
-
-static cv::Mat json_array_to_mat(const QJsonArray &arr)
-{
-    if (arr.isEmpty())
-        return cv::Mat();
-
-    if (arr[0].isArray()) {
-        int rows = arr.size();
-        int cols = arr[0].toArray().size();
-        cv::Mat m(rows, cols, CV_64F);
-        for (int r = 0; r < rows; r++) {
-            QJsonArray row = arr[r].toArray();
-            for (int c = 0; c < cols; c++)
-                m.at<double>(r, c) = row[c].toDouble();
-        }
-        return m;
-    }
-
-    int cols = arr.size();
-    cv::Mat m(1, cols, CV_64F);
-    for (int c = 0; c < cols; c++)
-        m.at<double>(0, c) = arr[c].toDouble();
-    return m;
-}
-
-struct CalibData {
-    cv::Mat K_left, K_right;
-    cv::Mat dist_left, dist_right;
-    cv::Mat R, T;
-    cv::Mat R1, R2, P1, P2, Q;
-    cv::Size image_size;
-    double baseline;
-    double rms_error;
-};
-
-static bool load_calibration(const char *path, CalibData *out)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        fprintf(stderr, "Cannot open calibration file: %s\n", path);
-        return false;
-    }
-
-    QJsonParseError err;
-    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-    f.close();
-
-    if (doc.isNull()) {
-        fprintf(stderr, "JSON parse error: %s\n",
-                err.errorString().toUtf8().constData());
-        return false;
-    }
-
-    QJsonObject obj = doc.object();
-
-    out->K_left     = json_array_to_mat(obj["K_left"].toArray());
-    out->K_right    = json_array_to_mat(obj["K_right"].toArray());
-    out->dist_left  = json_array_to_mat(obj["dist_left"].toArray());
-    out->dist_right = json_array_to_mat(obj["dist_right"].toArray());
-    out->R          = json_array_to_mat(obj["R"].toArray());
-    out->T          = json_array_to_mat(obj["T"].toArray());
-
-    QJsonArray sz = obj["image_size"].toArray();
-    out->image_size = cv::Size(sz[0].toInt(), sz[1].toInt());
-    out->baseline   = obj["baseline"].toDouble();
-    out->rms_error  = obj["rms_error"].toDouble();
-
-    if (out->K_left.empty() || out->K_right.empty() ||
-        out->dist_left.empty() || out->dist_right.empty() ||
-        out->R.empty() || out->T.empty()) {
-        fprintf(stderr, "Calibration file missing required matrices\n");
-        return false;
-    }
-
-    out->R1 = json_array_to_mat(obj["R1"].toArray());
-    out->R2 = json_array_to_mat(obj["R2"].toArray());
-    out->P1 = json_array_to_mat(obj["P1"].toArray());
-    out->P2 = json_array_to_mat(obj["P2"].toArray());
-    out->Q  = json_array_to_mat(obj["Q"].toArray());
-
-    if (out->R1.empty() || out->R2.empty() ||
-        out->P1.empty() || out->P2.empty() || out->Q.empty()) {
-        printf("Rectification matrices not in JSON, recomputing from R/T...\n");
-        cv::Rect roi_l, roi_r;
-        cv::stereoRectify(out->K_left, out->dist_left,
-                          out->K_right, out->dist_right,
-                          out->image_size, out->R, out->T,
-                          out->R1, out->R2, out->P1, out->P2, out->Q,
-                          cv::CALIB_ZERO_DISPARITY, 0,
-                          out->image_size, &roi_l, &roi_r);
-    } else {
-        printf("Rectification matrices loaded from calibration JSON\n");
-    }
-
-    printf("  T vector: [%.1f, %.1f, %.1f]\n",
-           out->T.at<double>(0), out->T.at<double>(1), out->T.at<double>(2));
-    printf("  P1 focal=%.1f  cx=%.1f  cy=%.1f\n",
-           out->P1.at<double>(0,0), out->P1.at<double>(0,2),
-           out->P1.at<double>(1,2));
-    printf("  P2 focal=%.1f  cx=%.1f  cy=%.1f\n",
-           out->P2.at<double>(0,0), out->P2.at<double>(0,2),
-           out->P2.at<double>(1,2));
-
-    return true;
-}
-
-static std::string find_newest_calibration(const char *dir)
-{
-    QDir d(dir);
-    if (!d.exists())
-        return "";
-
-    QStringList filters;
-    filters << "*.json";
-    QFileInfoList list = d.entryInfoList(filters, QDir::Files, QDir::Name);
-    if (list.isEmpty())
-        return "";
-
-    return list.last().absoluteFilePath().toStdString();
-}
 
 /* ========================================================================
  * GLSL Compute Shaders (OpenGL ES 3.1)
@@ -496,7 +347,7 @@ class SynthWindow : public QOpenGLWidget {
     Q_OBJECT
 
 public:
-    SynthWindow(const CalibData &calib, QWidget *parent = nullptr);
+    SynthWindow(QWidget *parent = nullptr);
     ~SynthWindow();
 
 protected:
@@ -506,21 +357,8 @@ protected:
     void keyPressEvent(QKeyEvent *e) override;
 
 private:
-    CalibData calib;
-    CameraCapture left_cap, right_cap;
-    bool cameras_ok;
+    OAKReceiver oak_receiver;
 
-    /* Rectification maps */
-    cv::Mat map_lx, map_ly, map_rx, map_ry;
-
-    /* Stereo matcher */
-    cv::Ptr<cv::StereoMatcher> stereo;
-    cv::Ptr<cv::StereoMatcher> right_stereo;
-    cv::Ptr<cv::ximgproc::DisparityWLSFilter> wls_filter;
-    int num_disparities;
-    int block_size;
-    bool use_sgbm;
-    bool use_wls;
     bool use_hole_fill;
 
     /* Processing scale */
@@ -561,20 +399,9 @@ private:
 
     /* CUDA acceleration */
     bool use_cuda{false};
-    cv::cuda::GpuMat gpu_map_lx,   gpu_map_ly,   gpu_map_rx,   gpu_map_ry;   // full-res maps
-    cv::cuda::GpuMat gpu_map_lx_s, gpu_map_ly_s, gpu_map_rx_s, gpu_map_ry_s; // proc_scale maps (full-res source)
-    cv::cuda::GpuMat gpu_map_lx_c, gpu_map_ly_c, gpu_map_rx_c, gpu_map_ry_c; // camera-space maps (proc_scale source)
-    cv::cuda::GpuMat gpu_frame_l,  gpu_frame_r;
-    cv::cuda::GpuMat gpu_proc_l,   gpu_proc_r;
-    cv::cuda::GpuMat gpu_gray_l,   gpu_gray_r;
-    cv::cuda::GpuMat gpu_disp_l;
-    cv::cuda::GpuMat gpu_rgba_l;
-    cv::Ptr<cv::cuda::StereoBM> cuda_bm;
-    std::unique_ptr<sgm::StereoSGM> sgm_cuda;
-    cv::cuda::GpuMat              gpu_disp_sgm;   // CV_16U, libSGM output
-    cv::cuda::GpuMat              gpu_disp_float;
-    cv::cuda::GpuMat              disp_filtered_gpu;
-    bool                          disp_filtered_init{false};
+    cv::cuda::GpuMat gpu_disp_float;
+    cv::cuda::GpuMat disp_filtered_gpu;
+    bool             disp_filtered_init{false};
 
     /* Cached GL uniform locations (set once in initializeGL) */
     GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1}, uloc_ds_scale{-1};
@@ -583,20 +410,15 @@ private:
     GLint uloc_disp_texture{-1};
     GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
 
-    float disp_amplify{15.0f};   // multiplier applied to disparity before DIBR shift
-
-    void shutdownCameras();
-    void rebuildStereo();
     void recreateTextures();
     void clearGPUBuffers();
 };
 
 /* ---- constructor ---- */
 
-SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
-    : QOpenGLWidget(parent), calib(calib_in), cameras_ok(false),
-      num_disparities(256), block_size(5),
-      use_sgbm(false), use_wls(false), use_hole_fill(true),
+SynthWindow::SynthWindow(QWidget *parent)
+    : QOpenGLWidget(parent),
+      use_hole_fill(true),
       proc_scale(0.5),
       prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0),
       tex_left_color(0), tex_right_color(0),
@@ -610,69 +432,28 @@ SynthWindow::SynthWindow(const CalibData &calib_in, QWidget *parent)
     proc_w = (int)(CAMERA_WIDTH  * proc_scale);
     proc_h = (int)(CAMERA_HEIGHT * proc_scale);
 
-    /* Precompute rectification maps */
-    cv::initUndistortRectifyMap(
-        calib.K_left, calib.dist_left, calib.R1, calib.P1,
-        calib.image_size, CV_32FC1, map_lx, map_ly);
-    cv::initUndistortRectifyMap(
-        calib.K_right, calib.dist_right, calib.R2, calib.P2,
-        calib.image_size, CV_32FC1, map_rx, map_ry);
-    printf("Rectification maps precomputed (%dx%d)\n",
-           calib.image_size.width, calib.image_size.height);
-
     if (cv::cuda::getCudaEnabledDeviceCount() > 0) {
         use_cuda = true;
-        gpu_map_lx.upload(map_lx);  gpu_map_ly.upload(map_ly);
-        gpu_map_rx.upload(map_rx);  gpu_map_ry.upload(map_ry);
-        printf("CUDA available — GPU preprocessing enabled\n");
+        printf("CUDA available — GPU temporal filter enabled\n");
     } else {
-        printf("No CUDA — CPU preprocessing fallback\n");
+        printf("No CUDA — CPU temporal filter fallback\n");
     }
 
-    rebuildStereo();
-
-    /* Initialise cameras — request hardware downscale to proc resolution via
-     * a second nvvidconv stage inside the GStreamer pipeline (CSI backend only).
-     * This reduces the per-frame CPU/bus payload from ~12 MB to ~3 MB. */
-    bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
-    bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT, proc_w, proc_h);
-    cameras_ok = ok_l && ok_r;
-
-    if (!cameras_ok) {
-        printf("[DIAG] CAMERA INIT FAILED  ok_l=%d ok_r=%d\n", ok_l, ok_r);
-        fprintf(stderr, "[DIAG] CAMERA INIT FAILED  ok_l=%d ok_r=%d\n", ok_l, ok_r);
-        return;
-    }
-    printf("[DIAG] Cameras OK  L:%dx%d  R:%dx%d\n",
-           left_cap.width, left_cap.height,
-           right_cap.width, right_cap.height);
+    oak_receiver.start();
 
     printf("\n============================================================\n");
     printf("VIEW SYNTHESIS (DIBR)\n");
     printf("============================================================\n");
     printf("Resolution:      %dx%d\n", CAMERA_WIDTH, CAMERA_HEIGHT);
     printf("Processing:      %dx%d (%.0f%%)\n", proc_w, proc_h, proc_scale * 100.0);
-    printf("Baseline:        %.2f mm\n", calib.baseline);
-    printf("Calib RMS error: %.4f px\n", calib.rms_error);
-    printf("numDisparities:  %d\n", num_disparities);
-    printf("blockSize:       %d\n", block_size);
-    printf("Matcher:         %s\n", use_sgbm ? "SGBM (libSGM CUDA / CPU fallback)" : "StereoBM");
-    printf("WLS filter:      %s\n", use_wls ? "ON" : "OFF");
     printf("Hole filling:    %s\n", use_hole_fill ? "ON" : "OFF");
     printf("============================================================\n");
     printf("\nControls:\n");
     printf("  ESC   - Exit\n");
-    printf("  +/-   - numDisparities +/- 16\n");
-    printf("  [/]   - blockSize -/+ 2\n");
-    printf("  S     - Toggle StereoBM / StereoSGBM\n");
-    printf("  W     - Toggle WLS disparity filter\n");
     printf("  H     - Toggle hole filling\n");
     printf("  1/2/3 - Scale: 1.0x / 0.5x / 0.25x\n");
     printf("  F     - Toggle face-tracking shift\n");
     printf("  C     - Recalibrate face tracker (look straight ahead first)\n");
-    printf("  ,/.   - Disparity amplify x0.5 / x2  (default 15)\n");
     printf("============================================================\n\n");
 
     /* ---- Face tracker (USB webcam, background thread) ---- */
@@ -726,7 +507,7 @@ SynthWindow::~SynthWindow()
         delete face_tracker;
         face_tracker = nullptr;
     }
-    shutdownCameras();
+    oak_receiver.stop();
     makeCurrent();
     if (prog_depth_splat) glDeleteProgram(prog_depth_splat);
     if (prog_color_splat) glDeleteProgram(prog_color_splat);
@@ -743,95 +524,6 @@ SynthWindow::~SynthWindow()
     if (quad_vbo) glDeleteBuffers(1, &quad_vbo);
     if (quad_vao) glDeleteVertexArrays(1, &quad_vao);
     doneCurrent();
-}
-
-void SynthWindow::shutdownCameras()
-{
-    if (!cameras_ok)
-        return;
-    cameras_ok = false;
-    render_running = false;
-    cleanup_camera(&left_cap);
-    cleanup_camera(&right_cap);
-}
-
-/* ---- rebuild stereo matcher ---- */
-
-void SynthWindow::rebuildStereo()
-{
-    cuda_bm.reset();
-    sgm_cuda.reset();
-    if (use_sgbm) {
-        int P1 = 8 * block_size * block_size;
-        int P2 = 32 * block_size * block_size;
-        stereo = cv::StereoSGBM::create(
-            0, num_disparities, block_size,
-            P1, P2, -1, 31, 10, 100, 32,
-            cv::StereoSGBM::MODE_SGBM_3WAY);
-    } else {
-        auto bm = cv::StereoBM::create(num_disparities, block_size);
-        bm->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
-        bm->setPreFilterCap(31);
-        bm->setUniquenessRatio(15);
-        bm->setSpeckleWindowSize(100);
-        bm->setSpeckleRange(32);
-        bm->setTextureThreshold(0);
-        bm->setMinDisparity(0);
-        if (use_cuda) {
-            int cuda_ndisp = std::min(num_disparities, 256);
-            cuda_bm = cv::cuda::createStereoBM(cuda_ndisp, block_size);
-            cuda_bm->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
-            cuda_bm->setPreFilterCap(31);
-            cuda_bm->setUniquenessRatio(15);
-            cuda_bm->setTextureThreshold(0);
-            cuda_bm->setMinDisparity(0);
-        }
-        stereo = bm;
-    }
-
-    right_stereo = cv::ximgproc::createRightMatcher(stereo);
-    wls_filter = cv::ximgproc::createDisparityWLSFilter(stereo);
-    wls_filter->setLambda(8000.0);
-    wls_filter->setSigmaColor(1.5);
-
-    // libSGM CUDA SGM — replaces CPU SGBM when CUDA is available
-    if (use_sgbm && use_cuda) {
-        // libSGM disparity_size must be 64, 128, or 256
-        const int disp_size = (num_disparities <= 64)  ? 64  :
-                              (num_disparities <= 128) ? 128 : 256;
-
-        // Pre-allocate grayscale + output buffers so pitches are stable
-        gpu_gray_l.create(proc_h, proc_w, CV_8U);
-        gpu_gray_r.create(proc_h, proc_w, CV_8U);
-        gpu_disp_sgm.create(proc_h, proc_w, CV_16U);
-
-        // P1/P2 must be calibrated to Census Transform cost scale, NOT the
-        // SSD/SAD scale used by OpenCV StereoSGBM.  libSGM uses a 9×7 Census
-        // window whose Hamming distance maxes out at 63.  The SGBM formula
-        // (8/32 × block_size²) gives P1=648, P2=2592 with block_size=9 —
-        // ~10× above max census cost — which locks disparity constant along
-        // each scanline and causes severe horizontal streaking.
-        // libSGM defaults (P1=10, P2=120) are appropriate for census costs.
-        const int P1 = 10;
-        const int P2 = 120;
-        // SCAN_4PATH (H + V + 2 diagonal) halves aggregation work vs 8-path,
-        // recovering FPS on Maxwell while still suppressing most streaking.
-        sgm::StereoSGM::Parameters sgm_params(P1, P2);
-        sgm_params.path_type = sgm::PathType::SCAN_4PATH;
-
-        // src_pitch: gpu_gray step in pixels (CV_8U → step == bytes == pixels)
-        // dst_pitch: gpu_disp_sgm step in uint16_t units
-        sgm_cuda = std::make_unique<sgm::StereoSGM>(
-            proc_w, proc_h, disp_size,
-            8, 16,
-            static_cast<int>(gpu_gray_l.step),
-            static_cast<int>(gpu_disp_sgm.step / sizeof(uint16_t)),
-            sgm::EXECUTE_INOUT_CUDA2CUDA,
-            sgm_params);
-
-        printf("[SynthWindow] libSGM CUDA: disp_size=%d P1=%d P2=%d 4-path (%dx%d)\n",
-               disp_size, P1, P2, proc_w, proc_h);
-    }
 }
 
 /* ---- recreate GPU textures at current proc resolution ---- */
@@ -856,26 +548,6 @@ void SynthWindow::recreateTextures()
     clear_black.assign(proc_w * proc_h * 4, 0);
     m_disp_l_float.create(proc_h, proc_w, CV_32F);
     m_left_rgba.create(proc_h, proc_w, CV_8UC4);
-
-    /* Pre-scale rectification maps to proc_scale so remap outputs directly
-     * at processing resolution without a separate GPU resize pass */
-    if (use_cuda) {
-        cv::Mat slx, sly, srx, sry;
-        cv::resize(map_lx, slx, cv::Size(proc_w, proc_h));
-        cv::resize(map_ly, sly, cv::Size(proc_w, proc_h));
-        cv::resize(map_rx, srx, cv::Size(proc_w, proc_h));
-        cv::resize(map_ry, sry, cv::Size(proc_w, proc_h));
-        gpu_map_lx_s.upload(slx);  gpu_map_ly_s.upload(sly);
-        gpu_map_rx_s.upload(srx);  gpu_map_ry_s.upload(sry);
-
-        /* Camera-space maps: same proc_scale output but source coords
-         * are in proc_scale space (when camera hardware-downscales to proc_w×proc_h).
-         * Multiply pre-scaled map values by proc_scale to address the smaller source. */
-        gpu_map_lx_c.upload(slx * proc_scale);
-        gpu_map_ly_c.upload(sly * proc_scale);
-        gpu_map_rx_c.upload(srx * proc_scale);
-        gpu_map_ry_c.upload(sry * proc_scale);
-    }
 
     printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
 }
@@ -976,39 +648,7 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
 
     bool changed = false;
 
-    // Valid libSGM disparity sizes in order
-    static constexpr int SGM_DISP_SIZES[] = {64, 128, 256};
-
-    if (e->key() == Qt::Key_Plus || e->key() == Qt::Key_Equal) {
-        if (use_sgbm) {
-            // Step up through {64, 128, 256}
-            for (int d : SGM_DISP_SIZES)
-                if (d > num_disparities) { num_disparities = d; break; }
-        } else {
-            num_disparities = std::min(num_disparities + 16,
-                                       use_cuda ? 256 : 512);
-        }
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_Minus) {
-        if (use_sgbm) {
-            // Step down through {256, 128, 64}
-            for (int i = 2; i >= 0; --i)
-                if (SGM_DISP_SIZES[i] < num_disparities) { num_disparities = SGM_DISP_SIZES[i]; break; }
-        } else {
-            num_disparities = std::max(num_disparities - 16, 16);
-        }
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_BracketRight) {
-        block_size = std::min(block_size + 2, 51);
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_BracketLeft) {
-        block_size = std::max(block_size - 2, 3);
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_1) {
+    if (e->key() == Qt::Key_1) {
         proc_scale = 1.0;
         changed = true;
     }
@@ -1019,23 +659,6 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
     else if (e->key() == Qt::Key_3) {
         proc_scale = 0.25;
         changed = true;
-    }
-    else if (e->key() == Qt::Key_S) {
-        use_sgbm = !use_sgbm;
-        if (use_sgbm) {
-            // Snap num_disparities to nearest of {64, 128, 256}
-            int best = 64;
-            for (int d : SGM_DISP_SIZES)
-                if (std::abs(d - num_disparities) < std::abs(best - num_disparities))
-                    best = d;
-            num_disparities = best;
-        }
-        changed = true;
-        printf("Matcher: %s\n", use_sgbm ? "SGBM (libSGM CUDA / CPU fallback)" : "StereoBM");
-    }
-    else if (e->key() == Qt::Key_W) {
-        use_wls = !use_wls;
-        printf("WLS filter: %s\n", use_wls ? "ON" : "OFF");
     }
     else if (e->key() == Qt::Key_H) {
         use_hole_fill = !use_hole_fill;
@@ -1057,14 +680,6 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
             printf("Face tracking not active — cannot calibrate\n");
         }
     }
-    else if (e->key() == Qt::Key_Period) {
-        disp_amplify = std::min(disp_amplify * 2.0f, 512.0f);
-        printf("Disparity amplify: %.1f\n", disp_amplify);
-    }
-    else if (e->key() == Qt::Key_Comma) {
-        disp_amplify = std::max(disp_amplify * 0.5f, 1.0f);
-        printf("Disparity amplify: %.1f\n", disp_amplify);
-    }
 
     if (changed) {
         int new_w = (int)(CAMERA_WIDTH  * proc_scale);
@@ -1078,11 +693,8 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
                 doneCurrent();
             }
         }
-        rebuildStereo();
-        printf("%s  numDisp=%d  block=%d  scale=%.2f  WLS=%s  hole=%s\n",
-               use_sgbm ? "SGBM" : "BM",
-               num_disparities, block_size, proc_scale,
-               use_wls ? "ON" : "OFF",
+        printf("scale=%.2f  hole=%s\n",
+               proc_scale,
                use_hole_fill ? "ON" : "OFF");
     }
 
@@ -1101,138 +713,27 @@ void SynthWindow::resizeGL(int w, int h)
 void SynthWindow::paintGL()
 {
     if (!gl_ready) { printf("[DIAG] paintGL: gl_ready=false\n"); return; }
-    if (!cameras_ok) { printf("[DIAG] paintGL: cameras_ok=false\n"); return; }
 
-    /* 1. Grab L/R frames — cv::swap avoids clone() memcpy */
-    cv::Mat frame_l, frame_r;
-    {
-        std::lock_guard<std::mutex> lock(left_cap.frame_mutex);
-        if (left_cap.new_frame) {
-            cv::swap(frame_l, left_cap.frame);
-            left_cap.new_frame = false;
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(right_cap.frame_mutex);
-        if (right_cap.new_frame) {
-            cv::swap(frame_r, right_cap.frame);
-            right_cap.new_frame = false;
-        }
-    }
-
-    if (frame_l.empty() || frame_r.empty())
-        return;
+    /* 1. Grab frame from OAK-D Lite */
+    OAKFrame oak_frame;
+    if (!oak_receiver.getFrame(oak_frame)) { update(); return; }
+    cv::Mat &frame_l = oak_frame.color;
+    // Convert disparity from CV_16U subpixel (divide by 32) to CV_32F
+    cv::Mat disp_l_float;
+    oak_frame.disparity.convertTo(disp_l_float, CV_32F, 1.0f / 32.0f);
 
     if (!diag_frames_logged) {
-        printf("[DIAG] First frames: L=%dx%d type=%d  R=%dx%d type=%d  proc=%dx%d\n",
+        printf("[DIAG] First frame: color=%dx%d type=%d  disp=%dx%d type=%d  proc=%dx%d\n",
                frame_l.cols, frame_l.rows, frame_l.type(),
-               frame_r.cols, frame_r.rows, frame_r.type(),
+               oak_frame.disparity.cols, oak_frame.disparity.rows, oak_frame.disparity.type(),
                proc_w, proc_h);
-        printf("[DIAG] use_cuda=%d  cuda_bm=%s  sgm_cuda=%s  use_sgbm=%d\n",
-               use_cuda, cuda_bm ? "valid" : "null",
-               sgm_cuda ? "valid" : "null", use_sgbm);
+        printf("[DIAG] use_cuda=%d\n", use_cuda);
         diag_frames_logged = true;
     }
 
-    /* Preprocessing — CUDA path when GPU BM or libSGM is available;
-     * CPU SGBM fallback only when use_cuda=false */
-    cv::Mat &disp_l_float = m_disp_l_float;
-    cv::Mat &left_rgba    = m_left_rgba;
-    if (use_cuda && (cuda_bm || sgm_cuda)) {
-        /* 2. Upload frames to GPU.
-         * If camera hardware-downscaled to proc_w×proc_h, the upload is 4× smaller
-         * and we use camera-space maps (source coords in proc_scale space).
-         * If camera still outputs full-res (e.g. after runtime scale change),
-         * fall back to pre-scaled maps (source coords in full-res space). */
-        bool cam_at_proc = (frame_l.cols == proc_w && frame_l.rows == proc_h);
-        gpu_frame_l.upload(frame_l);
-        gpu_frame_r.upload(frame_r);
-
-        /* 3. Remap + rectify directly to proc_scale in one pass */
-        const cv::cuda::GpuMat &map_lx_use = cam_at_proc ? gpu_map_lx_c : gpu_map_lx_s;
-        const cv::cuda::GpuMat &map_ly_use = cam_at_proc ? gpu_map_ly_c : gpu_map_ly_s;
-        const cv::cuda::GpuMat &map_rx_use = cam_at_proc ? gpu_map_rx_c : gpu_map_rx_s;
-        const cv::cuda::GpuMat &map_ry_use = cam_at_proc ? gpu_map_ry_c : gpu_map_ry_s;
-        cv::cuda::remap(gpu_frame_l, gpu_proc_l, map_lx_use, map_ly_use, cv::INTER_LINEAR);
-        cv::cuda::remap(gpu_frame_r, gpu_proc_r, map_rx_use, map_ry_use, cv::INTER_LINEAR);
-
-        /* 4. BGR→Gray */
-        cv::cuda::cvtColor(gpu_proc_l, gpu_gray_l, cv::COLOR_BGR2GRAY);
-        cv::cuda::cvtColor(gpu_proc_r, gpu_gray_r, cv::COLOR_BGR2GRAY);
-
-        /* 5. Stereo match */
-        if (sgm_cuda) {
-            /* --- libSGM CUDA path --- */
-            sgm_cuda->execute(gpu_gray_l.data, gpu_gray_r.data, gpu_disp_sgm.data);
-
-            cv::Mat disp_u16;
-            gpu_disp_sgm.download(disp_u16);  // CV_16U, integer pixel disparities
-
-            // Mask libSGM's sentinel value for invalid pixels
-            const auto invalid_val = static_cast<uint16_t>(sgm_cuda->get_invalid_disparity());
-            cv::Mat invalid_mask = (disp_u16 == invalid_val);
-            disp_u16.convertTo(disp_l_float, CV_32F);  // scale 1.0 — already in pixels
-            disp_l_float.setTo(0.0f, invalid_mask);
-            // (WLS unavailable — libSGM does internal L-R consistency checking instead)
-        } else {
-            /* --- cuda_bm path --- */
-            cuda_bm->compute(gpu_gray_l, gpu_gray_r, gpu_disp_l, cv::cuda::Stream::Null());
-            cv::Mat disp_raw_l;
-            gpu_disp_l.download(disp_raw_l);
-
-            // Convert disparity to float, clamp negatives
-            disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
-            cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
-        }
-
-        /* 9. BGR→RGBA on GPU, download directly (avoids CPU cvtColor round-trip) */
-        cv::cuda::cvtColor(gpu_proc_l, gpu_rgba_l, cv::COLOR_BGR2RGBA);
-        gpu_rgba_l.download(left_rgba);
-
-    } else {
-        /* ---- CPU path ---- */
-        /* 2. Rectify at full resolution */
-        cv::Mat rect_l_bgr, rect_r_bgr;
-        cv::remap(frame_l, rect_l_bgr, map_lx, map_ly, cv::INTER_LINEAR);
-        cv::remap(frame_r, rect_r_bgr, map_rx, map_ry, cv::INTER_LINEAR);
-
-        /* 3. Resize for processing */
-        cv::Mat proc_l_bgr, proc_r_bgr;
-        if (proc_scale < 1.0) {
-            cv::resize(rect_l_bgr, proc_l_bgr, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
-            cv::resize(rect_r_bgr, proc_r_bgr, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
-        } else {
-            proc_l_bgr = rect_l_bgr;
-            proc_r_bgr = rect_r_bgr;
-        }
-
-        /* 4. Grayscale for stereo matching */
-        cv::Mat gray_l, gray_r;
-        cv::cvtColor(proc_l_bgr, gray_l, cv::COLOR_BGR2GRAY);
-        cv::cvtColor(proc_r_bgr, gray_r, cv::COLOR_BGR2GRAY);
-
-        /* 5. Stereo match — left disparity */
-        cv::Mat disp_raw_l;
-        stereo->compute(gray_l, gray_r, disp_raw_l);
-
-        /* 6. Right disparity (for WLS) */
-        cv::Mat disp_raw_r;
-        right_stereo->compute(gray_r, gray_l, disp_raw_r);
-
-        /* 7. WLS filter */
-        if (use_wls && wls_filter) {
-            cv::Mat disp_filtered;
-            wls_filter->filter(disp_raw_l, gray_l, disp_filtered, disp_raw_r);
-            disp_raw_l = disp_filtered;
-        }
-
-        /* 8. Convert left disparity to float */
-        disp_raw_l.convertTo(disp_l_float, CV_32F, 1.0 / 16.0);
-        cv::threshold(disp_l_float, disp_l_float, 0.0, 0.0, cv::THRESH_TOZERO);
-
-        /* 9. Convert left BGR → RGBA for GPU upload */
-        cv::cvtColor(proc_l_bgr, left_rgba, cv::COLOR_BGR2RGBA);
-    }
+    /* 2. Convert left BGR → RGBA for GPU upload */
+    cv::Mat &left_rgba = m_left_rgba;
+    cv::cvtColor(frame_l, left_rgba, cv::COLOR_BGR2RGBA);
 
     /* IIR temporal disparity filter — smooths frame-to-frame flicker */
     {
@@ -1247,7 +748,7 @@ void SynthWindow::paintGL()
         disp_filtered_gpu.download(disp_l_float);
     }
 
-    /* 10. Upload left color + disparity to GL */
+    /* 3. Upload left color + disparity to GL */
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, left_rgba.data);
@@ -1256,7 +757,7 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
 
-    /* 11. Clear depth buffer and output */
+    /* 4. Clear depth buffer and output */
     clearGPUBuffers();
 
     GLuint groups_x = (proc_w + 15) / 16;
@@ -1274,7 +775,7 @@ void SynthWindow::paintGL()
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
     glUniform1i(uloc_ds_disparity, 0);
     glUniform1f(uloc_ds_shift, u_shift);
-    glUniform1f(uloc_ds_scale, disp_amplify);
+    glUniform1f(uloc_ds_scale, 1.0f);
     glUniform2i(uloc_ds_size, proc_w, proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glDispatchCompute(groups_x, groups_y, 1);
@@ -1341,16 +842,13 @@ void SynthWindow::paintGL()
 
     char info[320];
     snprintf(info, sizeof(info),
-             "FPS: %.1f | %s nDisp=%d blk=%d WLS=%s Hole=%s | %dx%d | Track:%s shift=%.2f amp=%.0f",
+             "FPS: %.1f | Hole=%s | %dx%d | Track:%s shift=%.2f",
              current_fps,
-             use_sgbm ? "SGBM" : "BM",
-             num_disparities, block_size,
-             use_wls ? "ON" : "OFF",
              use_hole_fill ? "ON" : "OFF",
              proc_w, proc_h,
              (face_tracking_enabled && face_tracker && face_tracker->isActive())
                  ? "ON" : "OFF",
-             u_shift, disp_amplify);
+             u_shift);
 
     /* Draw text shadow for readability */
     painter.setPen(Qt::black);
@@ -1366,16 +864,13 @@ void SynthWindow::paintGL()
         double dmin, dmax;
         cv::minMaxLoc(disp_l_float, &dmin, &dmax);
         int nonzero = cv::countNonZero(disp_l_float > 0.5f);
-        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  hole=%s  proc=%dx%d  track=%s  shift=%.2f  amp=%.0f  disp=[%.1f..%.1f] valid=%d/%d\n",
+        printf("FPS: %.1f  |  hole=%s  proc=%dx%d  track=%s  shift=%.2f  disp=[%.1f..%.1f] valid=%d/%d\n",
                current_fps,
-               use_sgbm ? "SGBM" : "BM",
-               num_disparities, block_size,
-               use_wls ? "ON" : "OFF",
                use_hole_fill ? "ON" : "OFF",
                proc_w, proc_h,
                (face_tracking_enabled && face_tracker && face_tracker->isActive())
                    ? "ON" : "OFF",
-               u_shift, disp_amplify,
+               u_shift,
                dmin, dmax, nonzero, proc_w * proc_h);
         last_fps_print = now;
     }
@@ -1401,39 +896,7 @@ int main(int argc, char *argv[])
 
     QApplication app(argc, argv);
 
-    /* Determine calibration file path */
-    std::string calib_path;
-    if (argc >= 2) {
-        calib_path = argv[1];
-    } else {
-        calib_path = find_newest_calibration("src/calibration_output");
-        if (calib_path.empty())
-            calib_path = find_newest_calibration("calibration_output");
-        if (calib_path.empty())
-            calib_path = find_newest_calibration("calibration");
-
-        if (calib_path.empty()) {
-            fprintf(stderr,
-                    "Usage: %s <calibration.json>\n"
-                    "No calibration file found in default locations.\n",
-                    argv[0]);
-            return 1;
-        }
-        printf("Auto-selected calibration: %s\n", calib_path.c_str());
-    }
-
-    CalibData calib;
-    if (!load_calibration(calib_path.c_str(), &calib)) {
-        fprintf(stderr, "Failed to load calibration from: %s\n",
-                calib_path.c_str());
-        return 1;
-    }
-
-    printf("Calibration loaded: %dx%d  baseline=%.2f mm  rms=%.4f px\n",
-           calib.image_size.width, calib.image_size.height,
-           calib.baseline, calib.rms_error);
-
-    SynthWindow win(calib);
+    SynthWindow win;
     win.resize(960, 540);
     win.show();
     return app.exec();
