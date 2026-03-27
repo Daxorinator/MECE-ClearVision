@@ -28,14 +28,11 @@ find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(Threads REQUIRED)
 
 # ---- depthai-core 2.x (OAK-D Lite) ----
-# Resolves CMake config from the depthai pip package in the project venv.
-execute_process(
-    COMMAND /home/user/depthai-python/bin/python3 -c
-        "import depthai, os; print(os.path.join(os.path.dirname(depthai.__file__), 'cmake', 'depthai'))"
-    OUTPUT_VARIABLE DEPTHAI_CMAKE_DIR
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
-find_package(depthai CONFIG REQUIRED HINTS ${DEPTHAI_CMAKE_DIR})
+# Built from source as a git submodule, pinned to v2.26.0 (matches pip package).
+# cmake/lz4Config.cmake wraps system liblz4-dev, which on Ubuntu 18.04 does not
+# ship a CMake config file — this unblocks Hunter's dependency resolution.
+list(APPEND CMAKE_PREFIX_PATH "${CMAKE_SOURCE_DIR}/cmake")
+add_subdirectory(extern/depthai-core)
 
 # ---------------------------------------------------------------------------
 # Targets
