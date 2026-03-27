@@ -52,9 +52,13 @@ add_subdirectory(extern/depthai-core)
 # Targets
 # ---------------------------------------------------------------------------
 
-add_executable(depth_pipeline src/depth_pipeline.cpp)
+add_executable(depth_pipeline
+    src/depth_pipeline.cpp
+    src/oak_receiver.cpp
+)
 target_link_libraries(depth_pipeline
     ${OpenCV_LIBS}
+    depthai::core
     Qt5::Widgets
     Threads::Threads
 )

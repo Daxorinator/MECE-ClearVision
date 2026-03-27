@@ -1,48 +1,29 @@
 /*
- * Depth Pipeline: Real-time Stereo Disparity Map
+ * Depth Pipeline: OAK-D Lite live disparity visualiser
  *
- * Consumes calibration JSON from calibration.cpp to produce a live
- * colormapped disparity map using StereoBM.  Uses cv::Mat with NEON
- * auto-vectorization.
+ * Opens the OAK-D Lite via USB, receives hardware-computed disparity
+ * (subpixel 5-bit, divide by 32 for pixel units) and renders a
+ * colormapped depth image in a Qt window.
  *
- * Build:
- *   cd build && cmake .. && make depth_pipeline
- *
- * Usage:
- *   ./depth_pipeline <path-to-calibration.json>
- *   ./depth_pipeline   (auto-finds newest JSON in src/calibration_output/)
+ * Build:  cd build && cmake .. && make -j4 depth_pipeline
+ * Run:    ./depth_pipeline
  *
  * Controls:
  *   ESC   - Exit
- *   +/-   - Increase/decrease numDisparities (by 16)
- *   [/]   - Decrease/increase blockSize (by 2, must be odd)
- *   S     - Toggle StereoBM / StereoSGBM
- *   W     - Toggle WLS disparity filter
- *   1/2/3 - Processing scale: 1.0x, 0.5x, 0.25x
+ *   1/2/3 - Display scale: 1.0x, 0.5x, 0.25x
  */
 
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
-#include <ctime>
 #include <chrono>
 #include <deque>
-#include <mutex>
-#include <vector>
-#include <map>
 #include <string>
-#include <memory>
-#include <algorithm>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/calib3d.hpp>
-#include <opencv2/ximgproc/disparity_filter.hpp>
-#include <opencv2/core/cuda.hpp>
-#include <opencv2/cudaarithm.hpp>
-#include <opencv2/cudaimgproc.hpp>
-#include <opencv2/cudawarping.hpp>
-#include <opencv2/cudastereo.hpp>
+
+#include "oak_receiver.h"
 
 #include <QApplication>
 #include <QWidget>
@@ -50,31 +31,14 @@
 #include <QTimer>
 #include <QKeyEvent>
 #include <QVBoxLayout>
-#include <QFile>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QJsonArray>
-#include <QDir>
-#include <QFileInfoList>
 
 /* ========================================================================
  * Configuration
  * ======================================================================== */
 
-#define LEFT_CAMERA_ID      0
-#define RIGHT_CAMERA_ID     1
-#define CAMERA_WIDTH        1920
-#define CAMERA_HEIGHT       1080
-#define DISPLAY_SCALE       0.5
 #define TIMER_INTERVAL_MS   33
 #define FPS_WINDOW          30
 #define FPS_PRINT_INTERVAL  2.0
-
-/* ========================================================================
- * Camera capture
- * ======================================================================== */
-
-#include "camera_capture.h"
 
 /* ========================================================================
  * Qt5 helpers
@@ -90,137 +54,6 @@ static QPixmap mat_to_pixmap(const cv::Mat &bgr)
 }
 
 /* ========================================================================
- * JSON calibration loader
- * ======================================================================== */
-
-static cv::Mat json_array_to_mat(const QJsonArray &arr)
-{
-    /* Handle 2D array: [[...], [...], ...] */
-    if (arr.isEmpty())
-        return cv::Mat();
-
-    if (arr[0].isArray()) {
-        int rows = arr.size();
-        int cols = arr[0].toArray().size();
-        cv::Mat m(rows, cols, CV_64F);
-        for (int r = 0; r < rows; r++) {
-            QJsonArray row = arr[r].toArray();
-            for (int c = 0; c < cols; c++)
-                m.at<double>(r, c) = row[c].toDouble();
-        }
-        return m;
-    }
-
-    /* Handle 1D array: [x, y, z, w] — treat as single-row matrix */
-    int cols = arr.size();
-    cv::Mat m(1, cols, CV_64F);
-    for (int c = 0; c < cols; c++)
-        m.at<double>(0, c) = arr[c].toDouble();
-    return m;
-}
-
-struct CalibData {
-    cv::Mat K_left, K_right;
-    cv::Mat dist_left, dist_right;
-    cv::Mat R, T;
-    cv::Mat R1, R2, P1, P2, Q;
-    cv::Size image_size;
-    double baseline;
-    double rms_error;
-};
-
-static bool load_calibration(const char *path, CalibData *out)
-{
-    QFile f(path);
-    if (!f.open(QIODevice::ReadOnly)) {
-        fprintf(stderr, "Cannot open calibration file: %s\n", path);
-        return false;
-    }
-
-    QJsonParseError err;
-    QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
-    f.close();
-
-    if (doc.isNull()) {
-        fprintf(stderr, "JSON parse error: %s\n",
-                err.errorString().toUtf8().constData());
-        return false;
-    }
-
-    QJsonObject obj = doc.object();
-
-    out->K_left     = json_array_to_mat(obj["K_left"].toArray());
-    out->K_right    = json_array_to_mat(obj["K_right"].toArray());
-    out->dist_left  = json_array_to_mat(obj["dist_left"].toArray());
-    out->dist_right = json_array_to_mat(obj["dist_right"].toArray());
-    out->R          = json_array_to_mat(obj["R"].toArray());
-    out->T          = json_array_to_mat(obj["T"].toArray());
-
-    QJsonArray sz = obj["image_size"].toArray();
-    out->image_size = cv::Size(sz[0].toInt(), sz[1].toInt());
-    out->baseline   = obj["baseline"].toDouble();
-    out->rms_error  = obj["rms_error"].toDouble();
-
-    /* Validate essential matrices */
-    if (out->K_left.empty() || out->K_right.empty() ||
-        out->dist_left.empty() || out->dist_right.empty() ||
-        out->R.empty() || out->T.empty()) {
-        fprintf(stderr, "Calibration file missing required matrices\n");
-        return false;
-    }
-
-    /* Load pre-saved rectification matrices from calibration.
-     * Fall back to recomputing from R/T if not present in the JSON. */
-    out->R1 = json_array_to_mat(obj["R1"].toArray());
-    out->R2 = json_array_to_mat(obj["R2"].toArray());
-    out->P1 = json_array_to_mat(obj["P1"].toArray());
-    out->P2 = json_array_to_mat(obj["P2"].toArray());
-    out->Q  = json_array_to_mat(obj["Q"].toArray());
-
-    if (out->R1.empty() || out->R2.empty() ||
-        out->P1.empty() || out->P2.empty() || out->Q.empty()) {
-        printf("Rectification matrices not in JSON, recomputing from R/T...\n");
-        cv::Rect roi_l, roi_r;
-        cv::stereoRectify(out->K_left, out->dist_left,
-                          out->K_right, out->dist_right,
-                          out->image_size, out->R, out->T,
-                          out->R1, out->R2, out->P1, out->P2, out->Q,
-                          cv::CALIB_ZERO_DISPARITY, 0,
-                          out->image_size, &roi_l, &roi_r);
-    } else {
-        printf("Rectification matrices loaded from calibration JSON\n");
-    }
-
-    printf("  T vector: [%.1f, %.1f, %.1f]\n",
-           out->T.at<double>(0), out->T.at<double>(1), out->T.at<double>(2));
-    printf("  P1 focal=%.1f  cx=%.1f  cy=%.1f\n",
-           out->P1.at<double>(0,0), out->P1.at<double>(0,2),
-           out->P1.at<double>(1,2));
-    printf("  P2 focal=%.1f  cx=%.1f  cy=%.1f\n",
-           out->P2.at<double>(0,0), out->P2.at<double>(0,2),
-           out->P2.at<double>(1,2));
-
-    return true;
-}
-
-/* Auto-find the newest calibration JSON in src/calibration_output/ */
-static std::string find_newest_calibration(const char *dir)
-{
-    QDir d(dir);
-    if (!d.exists())
-        return "";
-
-    QStringList filters;
-    filters << "*.json";
-    QFileInfoList list = d.entryInfoList(filters, QDir::Files, QDir::Name);
-    if (list.isEmpty())
-        return "";
-
-    /* Filenames are timestamped, so last alphabetically = newest */
-    return list.last().absoluteFilePath().toStdString();
-}
-
-/* ========================================================================
  * Main window
  * ======================================================================== */
 
@@ -228,7 +61,7 @@ class DepthWindow : public QWidget {
     Q_OBJECT
 
 public:
-    DepthWindow(const CalibData &calib, QWidget *parent = nullptr);
+    DepthWindow(QWidget *parent = nullptr);
     ~DepthWindow();
 
 protected:
@@ -241,152 +74,57 @@ private:
     QLabel *view, *status_lbl;
     QTimer *timer;
 
-    CameraCapture left_cap, right_cap;
-    bool cameras_ok;
+    OAKReceiver oak;
 
-    /* Rectification maps (CPU) */
-    cv::Mat map_lx, map_ly, map_rx, map_ry;
-
-    /* CUDA resources */
-    bool use_cuda{false};
-    cv::cuda::GpuMat gpu_map_lx, gpu_map_ly, gpu_map_rx, gpu_map_ry;
-    cv::Ptr<cv::cuda::StereoBM> cuda_bm;    /* GPU BM — null when use_sgbm=true */
-
-    /* CPU stereo matcher (used for WLS right-disparity and non-CUDA fallback) */
-    cv::Ptr<cv::StereoMatcher> stereo;
-    cv::Ptr<cv::StereoMatcher> right_stereo;
-    cv::Ptr<cv::ximgproc::DisparityWLSFilter> wls_filter;
-    int num_disparities;
-    int block_size;
-    bool use_sgbm;
-    bool use_wls;
-
-    /* Processing scale */
-    double proc_scale;
+    double disp_scale{0.5};   // display scale relative to 1920×1080
 
     /* FPS tracking */
     std::deque<std::chrono::steady_clock::time_point> frame_times;
     std::chrono::steady_clock::time_point last_fps_print;
-    double current_fps;
+    double current_fps{0.0};
 
-    /* Backend status string */
-    std::string backend_status;
-
-    /* Debug: show rectified views instead of disparity */
-    bool show_rectified;
-
-    void shutdownCameras();
-    void rebuildStereo();
     void updateStatus();
 };
 
 /* ---- constructor ---- */
 
-DepthWindow::DepthWindow(const CalibData &calib, QWidget *parent)
-    : QWidget(parent), cameras_ok(false),
-      num_disparities(64), block_size(9),
-      use_sgbm(false), use_wls(false),
-      proc_scale(0.5), current_fps(0.0),
-      show_rectified(false)
+DepthWindow::DepthWindow(QWidget *parent)
+    : QWidget(parent)
 {
-    setWindowTitle("Depth Pipeline");
+    setWindowTitle("Depth Pipeline (OAK-D Lite)");
 
-    int dw = (int)(CAMERA_WIDTH  * DISPLAY_SCALE);
-    int dh = (int)(CAMERA_HEIGHT * DISPLAY_SCALE);
+    int dw = (int)(1920 * disp_scale);
+    int dh = (int)(1080 * disp_scale);
     resize(dw + 20, dh + 80);
 
     auto *vbox = new QVBoxLayout(this);
 
-    view = new QLabel("Initialising...");
+    view = new QLabel("Waiting for OAK-D Lite...");
     view->setFixedSize(dw, dh);
     view->setAlignment(Qt::AlignCenter);
     view->setStyleSheet("background: black; color: white;");
     vbox->addWidget(view);
 
-    status_lbl = new QLabel("Initialising cameras...");
+    status_lbl = new QLabel("Initialising...");
     status_lbl->setAlignment(Qt::AlignCenter);
     QFont font = status_lbl->font();
     font.setPointSize(12);
     status_lbl->setFont(font);
     vbox->addWidget(status_lbl);
 
-    /* Report compute backend */
-    use_cuda = cv::cuda::getCudaEnabledDeviceCount() > 0;
-    if (use_cuda) {
-        cv::cuda::DeviceInfo info(0);
-        backend_status = std::string("CUDA: ") + info.name();
-        printf("CUDA enabled: %s\n", info.name());
-    } else {
-        backend_status = "CPU (NEON)";
-        printf("No CUDA device — using CPU+NEON\n");
-    }
-
-    /* Precompute rectification maps as CV_32FC1 (compatible with cuda::remap) */
-    cv::initUndistortRectifyMap(
-        calib.K_left, calib.dist_left, calib.R1, calib.P1,
-        calib.image_size, CV_32FC1, map_lx, map_ly);
-    cv::initUndistortRectifyMap(
-        calib.K_right, calib.dist_right, calib.R2, calib.P2,
-        calib.image_size, CV_32FC1, map_rx, map_ry);
-    printf("Rectification maps precomputed (%dx%d)\n",
-           calib.image_size.width, calib.image_size.height);
-
-    /* Diagnostic: check map coordinate ranges */
-    {
-        double mn, mx;
-        cv::minMaxLoc(map_lx, &mn, &mx);
-        printf("  Left map X range:  [%.0f, %.0f]  (image width=%d)\n",
-               mn, mx, calib.image_size.width);
-        cv::minMaxLoc(map_ly, &mn, &mx);
-        printf("  Left map Y range:  [%.0f, %.0f]  (image height=%d)\n",
-               mn, mx, calib.image_size.height);
-    }
-
-    /* Upload rectification maps to GPU */
-    if (use_cuda) {
-        gpu_map_lx.upload(map_lx);
-        gpu_map_ly.upload(map_ly);
-        gpu_map_rx.upload(map_rx);
-        gpu_map_ry.upload(map_ry);
-        printf("Rectification maps uploaded to GPU\n");
-    }
-
-    /* Create stereo matcher with tuned defaults */
-    rebuildStereo();
-
-    /* Initialise cameras */
-    bool ok_l = init_camera(&left_cap, LEFT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT);
-    bool ok_r = init_camera(&right_cap, RIGHT_CAMERA_ID,
-                            CAMERA_WIDTH, CAMERA_HEIGHT);
-    cameras_ok = ok_l && ok_r;
-
-    if (!cameras_ok) {
-        status_lbl->setText("Camera init failed - check terminal");
+    if (!oak.start()) {
+        status_lbl->setText("Failed to open OAK-D Lite — check USB connection");
+        fprintf(stderr, "Failed to open OAK-D Lite\n");
         return;
     }
 
     printf("\n============================================================\n");
-    printf("DEPTH PIPELINE\n");
+    printf("DEPTH PIPELINE (OAK-D Lite)\n");
     printf("============================================================\n");
-    printf("Resolution:      %dx%d\n", CAMERA_WIDTH, CAMERA_HEIGHT);
-    printf("Baseline:        %.2f mm\n", calib.baseline);
-    printf("Calib RMS error: %.4f px\n", calib.rms_error);
-    printf("numDisparities:  %d\n", num_disparities);
-    printf("blockSize:       %d\n", block_size);
-    printf("Matcher:         %s\n", use_sgbm ? "StereoSGBM" : "StereoBM");
-    printf("WLS filter:      %s\n", use_wls ? "ON" : "OFF");
-    printf("Processing scale: %.2fx\n", proc_scale);
-    printf("Backend:         %s\n", backend_status.c_str());
-    printf("============================================================\n");
-    printf("\nControls:\n");
-    printf("  ESC   - Exit\n");
-    printf("  +/-   - numDisparities +/- 16\n");
-    printf("  [/]   - blockSize -/+ 2\n");
-    printf("  S     - Toggle StereoBM / StereoSGBM\n");
-    printf("  W     - Toggle WLS disparity filter\n");
-    printf("  1/2/3 - Scale: 1.0x / 0.5x / 0.25x\n");
-    printf("  D     - Toggle debug view (rectified L/R)\n");
+    printf("fx=%.1f  fy=%.1f  cx=%.1f  cy=%.1f  baseline=%.1f mm\n",
+           oak.fx, oak.fy, oak.cx, oak.cy, oak.baseline_m * 1000.0f);
+    printf("Display scale: %.2fx\n", disp_scale);
+    printf("Controls: ESC=exit  1/2/3=scale\n");
     printf("============================================================\n\n");
 
     last_fps_print = std::chrono::steady_clock::now();
@@ -397,80 +135,22 @@ DepthWindow::DepthWindow(const CalibData &calib, QWidget *parent)
     timer->start(TIMER_INTERVAL_MS);
 }
 
-/* ---- destructor ---- */
-
 DepthWindow::~DepthWindow()
 {
-    shutdownCameras();
-}
-
-void DepthWindow::shutdownCameras()
-{
-    if (!cameras_ok)
-        return;
-    cameras_ok = false;
     if (timer) timer->stop();
-    cleanup_camera(&left_cap);
-    cleanup_camera(&right_cap);
+    oak.stop();
 }
-
-/* ---- rebuild stereo matcher after parameter changes ---- */
-
-void DepthWindow::rebuildStereo()
-{
-    /* CUDA BM matcher — SGBM has no reliable CUDA equivalent across builds,
-     * so that mode falls through to the CPU path automatically (cuda_bm=null). */
-    cuda_bm.release();
-    if (use_cuda && !use_sgbm)
-        cuda_bm = cv::cuda::createStereoBM(num_disparities, block_size);
-
-    /* CPU matchers — used for WLS right-disparity and non-CUDA fallback */
-    if (use_sgbm) {
-        int P1 = 8 * block_size * block_size;
-        int P2 = 32 * block_size * block_size;
-        stereo = cv::StereoSGBM::create(
-            0, num_disparities, block_size,
-            P1, P2, -1, 31, 10, 100, 32,
-            cv::StereoSGBM::MODE_SGBM_3WAY);
-    } else {
-        auto bm = cv::StereoBM::create(num_disparities, block_size);
-        bm->setPreFilterType(cv::StereoBM::PREFILTER_XSOBEL);
-        bm->setPreFilterCap(31);
-        bm->setUniquenessRatio(15);
-        bm->setSpeckleWindowSize(100);
-        bm->setSpeckleRange(32);
-        bm->setTextureThreshold(0);
-        bm->setMinDisparity(0);
-        stereo = bm;
-    }
-
-    right_stereo = cv::ximgproc::createRightMatcher(stereo);
-    wls_filter = cv::ximgproc::createDisparityWLSFilter(stereo);
-    wls_filter->setLambda(8000.0);
-    wls_filter->setSigmaColor(1.5);
-}
-
-/* ---- status bar ---- */
 
 void DepthWindow::updateStatus()
 {
-    int proc_w = (int)(CAMERA_WIDTH  * proc_scale);
-    int proc_h = (int)(CAMERA_HEIGHT * proc_scale);
-
+    int dw = (int)(1920 * disp_scale);
+    int dh = (int)(1080 * disp_scale);
     char buf[256];
     snprintf(buf, sizeof(buf),
-             "FPS: %.1f  |  %s  numDisp: %d  block: %d  WLS: %s  |  "
-             "proc: %dx%d (%.0f%%)  |  %s",
-             current_fps,
-             use_sgbm ? "SGBM" : "BM",
-             num_disparities, block_size,
-             use_wls ? "ON" : "OFF",
-             proc_w, proc_h, proc_scale * 100.0,
-             backend_status.c_str());
+             "FPS: %.1f  |  display: %dx%d (%.0f%%)",
+             current_fps, dw, dh, disp_scale * 100.0);
     status_lbl->setText(buf);
 }
-
-/* ---- key handling ---- */
 
 void DepthWindow::keyPressEvent(QKeyEvent *e)
 {
@@ -480,283 +160,72 @@ void DepthWindow::keyPressEvent(QKeyEvent *e)
     }
 
     bool changed = false;
-
-    if (e->key() == Qt::Key_Plus || e->key() == Qt::Key_Equal) {
-        num_disparities = std::min(num_disparities + 16, 512);
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_Minus) {
-        num_disparities = std::max(num_disparities - 16, 16);
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_BracketRight) {
-        block_size = std::min(block_size + 2, 51);
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_BracketLeft) {
-        block_size = std::max(block_size - 2, 5);
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_1) {
-        proc_scale = 1.0;
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_2) {
-        proc_scale = 0.5;
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_3) {
-        proc_scale = 0.25;
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_S) {
-        use_sgbm = !use_sgbm;
-        changed = true;
-        printf("Matcher: %s\n", use_sgbm ? "StereoSGBM" : "StereoBM");
-    }
-    else if (e->key() == Qt::Key_W) {
-        use_wls = !use_wls;
-        printf("WLS filter: %s\n", use_wls ? "ON" : "OFF");
-        updateStatus();
-    }
-    else if (e->key() == Qt::Key_D) {
-        show_rectified = !show_rectified;
-        printf("Debug view: %s\n", show_rectified ? "rectified L/R" : "disparity");
-    }
+    if (e->key() == Qt::Key_1) { disp_scale = 1.0; changed = true; }
+    else if (e->key() == Qt::Key_2) { disp_scale = 0.5;  changed = true; }
+    else if (e->key() == Qt::Key_3) { disp_scale = 0.25; changed = true; }
 
     if (changed) {
-        rebuildStereo();
-        printf("%s  numDisp=%d  block=%d  scale=%.2f  WLS=%s\n",
-               use_sgbm ? "SGBM" : "BM",
-               num_disparities, block_size, proc_scale,
-               use_wls ? "ON" : "OFF");
+        int dw = (int)(1920 * disp_scale);
+        int dh = (int)(1080 * disp_scale);
+        view->setFixedSize(dw, dh);
+        resize(dw + 20, dh + 80);
+        printf("Display scale: %.2fx  (%dx%d)\n", disp_scale, dw, dh);
         updateStatus();
     }
 
     QWidget::keyPressEvent(e);
 }
 
-/* ---- periodic frame update ---- */
-
 void DepthWindow::onTimer()
 {
-    if (!cameras_ok)
+    OAKFrame f;
+    if (!oak.getFrame(f))
         return;
 
-    /* 1. Grab L/R frames under mutex */
-    cv::Mat frame_l, frame_r;
-    {
-        std::lock_guard<std::mutex> lock(left_cap.frame_mutex);
-        if (left_cap.new_frame) {
-            cv::swap(frame_l, left_cap.frame);
-            left_cap.new_frame = false;
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lock(right_cap.frame_mutex);
-        if (right_cap.new_frame) {
-            cv::swap(frame_r, right_cap.frame);
-            right_cap.new_frame = false;
-        }
-    }
+    /* Convert CV_16U subpixel disparity (0–3040) → CV_32F pixel units
+     * OAK-D subpixel = 5-bit, divide by 32.0 for actual pixel disparity */
+    cv::Mat disp_float;
+    f.disparity.convertTo(disp_float, CV_32F, 1.0f / 32.0f);
 
-    if (frame_l.empty() || frame_r.empty())
-        return;
+    /* Colourmap: normalise to [0, max_disp], apply JET, mask invalid pixels */
+    const float max_disp = 95.0f;  // OAK-D stereo max ~95 px at 480P/75mm baseline
+    cv::Mat disp8;
+    disp_float.convertTo(disp8, CV_8U, 255.0f / max_disp);
+    cv::Mat color;
+    cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
+    color.setTo(cv::Scalar(0, 0, 0), (f.disparity == 0));
 
-    cv::Mat output;
+    /* Scale for display */
+    int dw = (int)(color.cols * disp_scale);
+    int dh = (int)(color.rows * disp_scale);
+    if (disp_scale != 1.0)
+        cv::resize(color, color, cv::Size(dw, dh), 0, 0, cv::INTER_LINEAR);
 
-    if (use_cuda && cuda_bm) {
-        /* ---- GPU path (BM only — SGBM falls through to CPU) ---- */
-        cv::cuda::GpuMat d_l, d_r;
-        d_l.upload(frame_l);
-        d_r.upload(frame_r);
-
-        cv::cuda::GpuMat d_gray_l, d_gray_r;
-        cv::cuda::cvtColor(d_l, d_gray_l, cv::COLOR_BGR2GRAY);
-        cv::cuda::cvtColor(d_r, d_gray_r, cv::COLOR_BGR2GRAY);
-
-        cv::cuda::GpuMat d_rect_l, d_rect_r;
-        cv::cuda::remap(d_gray_l, d_rect_l, gpu_map_lx, gpu_map_ly, cv::INTER_LINEAR);
-        cv::cuda::remap(d_gray_r, d_rect_r, gpu_map_rx, gpu_map_ry, cv::INTER_LINEAR);
-
-        if (show_rectified) {
-            cv::Mat rect_l, rect_r;
-            d_rect_l.download(rect_l);
-            d_rect_r.download(rect_r);
-
-            cv::Mat rect_l_color, rect_r_color;
-            cv::cvtColor(rect_l, rect_l_color, cv::COLOR_GRAY2BGR);
-            cv::cvtColor(rect_r, rect_r_color, cv::COLOR_GRAY2BGR);
-
-            for (int y = 0; y < rect_l_color.rows; y += 40) {
-                cv::line(rect_l_color, cv::Point(0, y),
-                         cv::Point(rect_l_color.cols, y),
-                         cv::Scalar(0, 255, 0), 1);
-                cv::line(rect_r_color, cv::Point(0, y),
-                         cv::Point(rect_r_color.cols, y),
-                         cv::Scalar(0, 255, 0), 1);
-            }
-            cv::putText(rect_l_color, "LEFT (rectified)",
-                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
-                        1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(rect_r_color, "RIGHT (rectified)",
-                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
-                        1.0, cv::Scalar(0, 255, 0), 2);
-            cv::hconcat(rect_l_color, rect_r_color, output);
-            double side_scale = DISPLAY_SCALE * 0.5;
-            cv::resize(output, output, cv::Size(), side_scale, side_scale,
-                       cv::INTER_LINEAR);
-        } else {
-            cv::cuda::GpuMat d_proc_l, d_proc_r;
-            if (proc_scale < 1.0) {
-                cv::cuda::resize(d_rect_l, d_proc_l, cv::Size(),
-                                 proc_scale, proc_scale, cv::INTER_AREA);
-                cv::cuda::resize(d_rect_r, d_proc_r, cv::Size(),
-                                 proc_scale, proc_scale, cv::INTER_AREA);
-            } else {
-                d_proc_l = d_rect_l;
-                d_proc_r = d_rect_r;
-            }
-
-            cv::cuda::GpuMat d_disp;
-            cuda_bm->compute(d_proc_l, d_proc_r, d_disp,
-                             cv::cuda::Stream::Null());
-
-            cv::Mat disp_raw;
-            d_disp.download(disp_raw);
-
-            /* WLS requires a right-disparity map; compute it on CPU */
-            if (use_wls && wls_filter) {
-                cv::Mat proc_l_cpu, proc_r_cpu;
-                d_proc_l.download(proc_l_cpu);
-                d_proc_r.download(proc_r_cpu);
-                cv::Mat disp_right;
-                right_stereo->compute(proc_r_cpu, proc_l_cpu, disp_right);
-                cv::Mat disp_filtered;
-                wls_filter->filter(disp_raw, proc_l_cpu, disp_filtered, disp_right);
-                disp_raw = disp_filtered;
-            }
-
-            cv::Mat disp_float;
-            disp_raw.convertTo(disp_float, CV_32F, 1.0 / 16.0);
-            cv::threshold(disp_float, disp_float, 0.0, 0.0, cv::THRESH_TOZERO);
-            cv::Mat disp8;
-            disp_float.convertTo(disp8, CV_8U, 255.0 / (double)num_disparities);
-            cv::Mat color;
-            cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
-            color.setTo(cv::Scalar(0, 0, 0), (disp_raw <= 0));
-            output = color;
-            cv::resize(output, output, cv::Size(),
-                       DISPLAY_SCALE / proc_scale, DISPLAY_SCALE / proc_scale,
-                       cv::INTER_LINEAR);
-        }
-    } else {
-        /* ---- CPU path ---- */
-        cv::Mat gray_l, gray_r;
-        cv::cvtColor(frame_l, gray_l, cv::COLOR_BGR2GRAY);
-        cv::cvtColor(frame_r, gray_r, cv::COLOR_BGR2GRAY);
-
-        cv::Mat rect_l, rect_r;
-        cv::remap(gray_l, rect_l, map_lx, map_ly, cv::INTER_LINEAR);
-        cv::remap(gray_r, rect_r, map_rx, map_ry, cv::INTER_LINEAR);
-
-        if (show_rectified) {
-            cv::Mat rect_l_color, rect_r_color;
-            cv::cvtColor(rect_l, rect_l_color, cv::COLOR_GRAY2BGR);
-            cv::cvtColor(rect_r, rect_r_color, cv::COLOR_GRAY2BGR);
-
-            for (int y = 0; y < rect_l_color.rows; y += 40) {
-                cv::line(rect_l_color, cv::Point(0, y),
-                         cv::Point(rect_l_color.cols, y),
-                         cv::Scalar(0, 255, 0), 1);
-                cv::line(rect_r_color, cv::Point(0, y),
-                         cv::Point(rect_r_color.cols, y),
-                         cv::Scalar(0, 255, 0), 1);
-            }
-            cv::putText(rect_l_color, "LEFT (rectified)",
-                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
-                        1.0, cv::Scalar(0, 255, 0), 2);
-            cv::putText(rect_r_color, "RIGHT (rectified)",
-                        cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
-                        1.0, cv::Scalar(0, 255, 0), 2);
-            cv::hconcat(rect_l_color, rect_r_color, output);
-            double side_scale = DISPLAY_SCALE * 0.5;
-            cv::resize(output, output, cv::Size(), side_scale, side_scale,
-                       cv::INTER_LINEAR);
-        } else {
-            cv::Mat proc_l, proc_r;
-            if (proc_scale < 1.0) {
-                cv::resize(rect_l, proc_l, cv::Size(), proc_scale, proc_scale,
-                           cv::INTER_AREA);
-                cv::resize(rect_r, proc_r, cv::Size(), proc_scale, proc_scale,
-                           cv::INTER_AREA);
-            } else {
-                proc_l = rect_l;
-                proc_r = rect_r;
-            }
-
-            cv::Mat disp_raw;
-            stereo->compute(proc_l, proc_r, disp_raw);
-
-            if (use_wls && wls_filter) {
-                cv::Mat disp_right;
-                right_stereo->compute(proc_r, proc_l, disp_right);
-                cv::Mat disp_filtered;
-                wls_filter->filter(disp_raw, proc_l, disp_filtered, disp_right);
-                disp_raw = disp_filtered;
-            }
-
-            cv::Mat disp_float;
-            disp_raw.convertTo(disp_float, CV_32F, 1.0 / 16.0);
-            cv::threshold(disp_float, disp_float, 0.0, 0.0, cv::THRESH_TOZERO);
-            cv::Mat disp8;
-            disp_float.convertTo(disp8, CV_8U, 255.0 / (double)num_disparities);
-            cv::Mat color;
-            cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
-            color.setTo(cv::Scalar(0, 0, 0), (disp_raw <= 0));
-            output = color;
-            cv::resize(output, output, cv::Size(),
-                       DISPLAY_SCALE / proc_scale, DISPLAY_SCALE / proc_scale,
-                       cv::INTER_LINEAR);
-        }
-    }
-
-    /* FPS calculation */
+    /* FPS */
     auto now = std::chrono::steady_clock::now();
     frame_times.push_back(now);
-    while ((int)frame_times.size() > FPS_WINDOW)
-        frame_times.pop_front();
-
+    while ((int)frame_times.size() > FPS_WINDOW) frame_times.pop_front();
     if (frame_times.size() >= 2) {
         double elapsed = std::chrono::duration<double>(
             frame_times.back() - frame_times.front()).count();
         current_fps = (double)(frame_times.size() - 1) / elapsed;
     }
 
-    /* Overlay FPS text */
+    /* FPS overlay */
     char fps_text[64];
     snprintf(fps_text, sizeof(fps_text), "FPS: %.1f", current_fps);
-    cv::putText(output, fps_text, cv::Point(10, 30),
-                cv::FONT_HERSHEY_SIMPLEX, 0.7,
-                cv::Scalar(255, 255, 255), 2);
+    cv::putText(color, fps_text, cv::Point(10, 30),
+                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
 
-    /* Print FPS to terminal periodically */
-    double since_print = std::chrono::duration<double>(
-        now - last_fps_print).count();
+    double since_print = std::chrono::duration<double>(now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
-        int proc_w = (int)(CAMERA_WIDTH  * proc_scale);
-        int proc_h = (int)(CAMERA_HEIGHT * proc_scale);
-        printf("FPS: %.1f  |  %s  numDisp=%d  block=%d  WLS=%s  proc=%dx%d\n",
-               current_fps,
-               use_sgbm ? "SGBM" : "BM",
-               num_disparities, block_size,
-               use_wls ? "ON" : "OFF",
-               proc_w, proc_h);
+        double dmin, dmax;
+        cv::minMaxLoc(disp_float, &dmin, &dmax);
+        printf("FPS: %.1f  disp=[%.1f..%.1f] px\n", current_fps, dmin, dmax);
         last_fps_print = now;
     }
 
-    view->setPixmap(mat_to_pixmap(output));
-
+    view->setPixmap(mat_to_pixmap(color));
     updateStatus();
 }
 
@@ -768,41 +237,7 @@ int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
 
-    /* Determine calibration file path */
-    std::string calib_path;
-    if (argc >= 2) {
-        calib_path = argv[1];
-    } else {
-        /* Try to auto-find newest JSON */
-        calib_path = find_newest_calibration("src/calibration_output");
-        if (calib_path.empty())
-            calib_path = find_newest_calibration("calibration_output");
-        if (calib_path.empty())
-            calib_path = find_newest_calibration("calibration");
-
-        if (calib_path.empty()) {
-            fprintf(stderr,
-                    "Usage: %s <calibration.json>\n"
-                    "No calibration file found in default locations.\n",
-                    argv[0]);
-            return 1;
-        }
-        printf("Auto-selected calibration: %s\n", calib_path.c_str());
-    }
-
-    /* Load calibration */
-    CalibData calib;
-    if (!load_calibration(calib_path.c_str(), &calib)) {
-        fprintf(stderr, "Failed to load calibration from: %s\n",
-                calib_path.c_str());
-        return 1;
-    }
-
-    printf("Calibration loaded: %dx%d  baseline=%.2f mm  rms=%.4f px\n",
-           calib.image_size.width, calib.image_size.height,
-           calib.baseline, calib.rms_error);
-
-    DepthWindow win(calib);
+    DepthWindow win;
     win.show();
     return app.exec();
 }

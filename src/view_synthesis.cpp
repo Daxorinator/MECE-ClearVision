@@ -55,8 +55,8 @@
  * Configuration
  * ======================================================================== */
 
-#define CAMERA_WIDTH        1366
-#define CAMERA_HEIGHT       768
+#define CAMERA_WIDTH        1920
+#define CAMERA_HEIGHT       1080
 #define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
 #define HOLE_FILL_MAX_SEARCH 16
@@ -731,12 +731,17 @@ void SynthWindow::paintGL()
         diag_frames_logged = true;
     }
 
+    /* Downscale OAK-D frames (1920×1080) to processing resolution */
+    cv::Mat frame_proc;
+    cv::resize(frame_l, frame_proc, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_LINEAR);
+    cv::resize(disp_l_float, disp_l_float, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
+
     /* 2. Convert left BGR → RGBA for GPU upload */
     cv::Mat &left_rgba = m_left_rgba;
-    cv::cvtColor(frame_l, left_rgba, cv::COLOR_BGR2RGBA);
+    cv::cvtColor(frame_proc, left_rgba, cv::COLOR_BGR2RGBA);
 
     /* IIR temporal disparity filter — smooths frame-to-frame flicker */
-    {
+    if (use_cuda) {
         const float alpha = 0.2f;
         gpu_disp_float.upload(disp_l_float);
         if (!disp_filtered_init || disp_filtered_gpu.size() != gpu_disp_float.size()) {
