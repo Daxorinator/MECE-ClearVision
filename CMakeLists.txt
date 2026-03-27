@@ -1,4 +1,15 @@
 cmake_minimum_required(VERSION 3.10)
+
+# HunterGate must be called before any project() command — including ours.
+# These values must match exactly what extern/depthai-core/CMakeLists.txt uses.
+set(HUNTER_CONFIGURATION_TYPES "Release" CACHE STRING "Hunter dependencies list of build configurations")
+include("${CMAKE_CURRENT_SOURCE_DIR}/extern/depthai-core/cmake/HunterGate.cmake")
+HunterGate(
+    URL  "https://github.com/cpp-pm/hunter/archive/v0.23.322.tar.gz"
+    SHA1 "cb0ea1f74f4a2c49a807de34885743495fccccbe"
+    LOCAL
+)
+
 project(stereo_calibration CXX)
 
 if(NOT CMAKE_BUILD_TYPE)
