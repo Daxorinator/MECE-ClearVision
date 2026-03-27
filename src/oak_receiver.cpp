@@ -97,11 +97,27 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
 
         if (!dispFrame || !colorFrame) continue;
 
+        // Construct cv::Mat from raw frame data — avoids requiring depthai-core
+        // to be built with OpenCV support (DEPTHAI_OPENCV_SUPPORT).
         OAKFrame f;
-        f.disparity  = dispFrame->getCvFrame().clone();   // CV_16U
-        f.color      = colorFrame->getCvFrame().clone();  // CV_8UC3 BGR
-        if (confFrame)
-            f.confidence = confFrame->getCvFrame().clone();  // CV_8U
+        {
+            auto &d = dispFrame->getData();
+            cv::Mat tmp(dispFrame->getHeight(), dispFrame->getWidth(),
+                        CV_16UC1, const_cast<uint8_t*>(d.data()));
+            f.disparity = tmp.clone();
+        }
+        {
+            auto &d = colorFrame->getData();
+            cv::Mat tmp(colorFrame->getHeight(), colorFrame->getWidth(),
+                        CV_8UC3, const_cast<uint8_t*>(d.data()));
+            f.color = tmp.clone();
+        }
+        if (confFrame) {
+            auto &d = confFrame->getData();
+            cv::Mat tmp(confFrame->getHeight(), confFrame->getWidth(),
+                        CV_8UC1, const_cast<uint8_t*>(d.data()));
+            f.confidence = tmp.clone();
+        }
         f.valid = true;
 
         {
