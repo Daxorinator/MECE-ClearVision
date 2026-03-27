@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
+if(POLICY CMP0071)
+    cmake_policy(SET CMP0071 NEW)
+endif()
 
 # HunterGate must be called before any project() command — including ours.
 # These values must match exactly what extern/depthai-core/CMakeLists.txt uses.
