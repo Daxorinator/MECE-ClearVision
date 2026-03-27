@@ -22,7 +22,6 @@ bool OAKReceiver::start()
 
     // --- Stereo depth ---
     auto stereo = pipeline.create<dai::node::StereoDepth>();
-    stereo->setDefaultProfilePreset(dai::node::StereoDepth::PresetType::HIGH_DENSITY);
     stereo->setLeftRightCheck(true);
     stereo->setSubpixel(true);  // 5-bit subpixel, RAW16 range 0-3040
     stereo->setDepthAlign(dai::CameraBoardSocket::RGB);
