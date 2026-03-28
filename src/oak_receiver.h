@@ -40,6 +40,10 @@ public:
     // the last call. Returns false (and leaves out unchanged) if no new frame.
     bool getFrame(OAKFrame &out);
 
+    // Update stereo config at runtime — safe to call from any thread after start().
+    // Changes take effect within one frame.
+    void setStereoConfig(bool medianOn, int confidenceThreshold);
+
     // Configuration — set before calling start().
     // want_color=false: skips RGB camera, color XLink stream, and depth alignment.
     //   Disparity comes back at native mono resolution (640×480 for 480P) — 6.5× less USB bandwidth.
@@ -60,4 +64,10 @@ private:
     std::mutex        mtx_;
     OAKFrame          latest_;
     bool              new_frame_{false};
+
+    // Pending stereo config — written by setStereoConfig(), applied by threadLoop().
+    std::mutex cfg_mtx_;
+    bool       cfg_dirty_{false};
+    bool       cfg_median_on_{true};
+    int        cfg_confidence_{200};
 };

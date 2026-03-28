@@ -14,26 +14,36 @@ bool OAKReceiver::start()
     camLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_480_P);
     camRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_480_P);
 
+    // --- Stereo depth (common config) ---
+    auto stereoDepth = pipeline.create<dai::node::StereoDepth>();
+    stereoDepth->setLeftRightCheck(true);
+    stereoDepth->setSubpixel(true);
+    stereoDepth->setMedianFilter(dai::StereoDepthProperties::MedianFilter::KERNEL_7x7);
+    stereoDepth->setConfidenceThreshold(cfg_confidence_);
+    camLeft->out.link(stereoDepth->left);
+    camRight->out.link(stereoDepth->right);
+
+    // Runtime config channel — allows setStereoConfig() to update median/confidence
+    // on the fly without restarting the pipeline.
+    auto xinConfig = pipeline.create<dai::node::XLinkIn>();
+    xinConfig->setStreamName("stereoConfig");
+    xinConfig->out.link(stereoDepth->inputConfig);
+
+    auto xoutDisp = pipeline.create<dai::node::XLinkOut>();
+    xoutDisp->setStreamName("disparity");
+    stereoDepth->disparity.link(xoutDisp->input);
+
     // --- Color camera + depth alignment (only when color stream is wanted) ---
     if (want_color) {
         auto camRGB = pipeline.create<dai::node::ColorCamera>();
         camRGB->setResolution(dai::ColorCameraProperties::SensorResolution::THE_1080_P);
-        camRGB->setIspScale(2, 3);  // 1920×1080 → 1280×720 (closest supported to stereo native)
+        camRGB->setIspScale(2, 3);  // 1920×1080 → 1280×720
         camRGB->setInterleaved(false);
         camRGB->setColorOrder(dai::ColorCameraProperties::ColorOrder::BGR);
-
-        auto stereoDepth = pipeline.create<dai::node::StereoDepth>();
-        stereoDepth->setLeftRightCheck(true);
-        stereoDepth->setSubpixel(true);
         stereoDepth->setDepthAlign(dai::CameraBoardSocket::RGB);
-        camLeft->out.link(stereoDepth->left);
-        camRight->out.link(stereoDepth->right);
 
-        auto xoutDisp  = pipeline.create<dai::node::XLinkOut>();
         auto xoutColor = pipeline.create<dai::node::XLinkOut>();
-        xoutDisp->setStreamName("disparity");
         xoutColor->setStreamName("color");
-        stereoDepth->disparity.link(xoutDisp->input);
         camRGB->isp.link(xoutColor->input);
 
         if (want_confidence) {
@@ -41,18 +51,6 @@ bool OAKReceiver::start()
             xoutConf->setStreamName("confidence");
             stereoDepth->confidenceMap.link(xoutConf->input);
         }
-    } else {
-        // Disparity only — native mono resolution, no depth alignment.
-        // Much less USB bandwidth (640×480 × 2B vs 1920×1080 × 2B).
-        auto stereoDepth = pipeline.create<dai::node::StereoDepth>();
-        stereoDepth->setLeftRightCheck(true);
-        stereoDepth->setSubpixel(true);
-        camLeft->out.link(stereoDepth->left);
-        camRight->out.link(stereoDepth->right);
-
-        auto xoutDisp = pipeline.create<dai::node::XLinkOut>();
-        xoutDisp->setStreamName("disparity");
-        stereoDepth->disparity.link(xoutDisp->input);
     }
 
     try {
@@ -103,9 +101,18 @@ bool OAKReceiver::getFrame(OAKFrame &out)
     return true;
 }
 
+void OAKReceiver::setStereoConfig(bool medianOn, int confidence)
+{
+    std::lock_guard<std::mutex> lock(cfg_mtx_);
+    cfg_median_on_  = medianOn;
+    cfg_confidence_ = confidence;
+    cfg_dirty_      = true;
+}
+
 void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
 {
-    auto dispQueue = device->getOutputQueue("disparity", 1, false);
+    auto dispQueue   = device->getOutputQueue("disparity", 1, false);
+    auto configQueue = device->getInputQueue("stereoConfig");
     std::shared_ptr<dai::DataOutputQueue> colorQueue, confQueue;
     if (want_color)      colorQueue = device->getOutputQueue("color",      1, false);
     if (want_confidence) confQueue  = device->getOutputQueue("confidence", 1, false);
@@ -113,6 +120,20 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
     std::shared_ptr<dai::ImgFrame> lastColor;
 
     while (running_) {
+        // Apply any pending stereo config change before grabbing the next frame.
+        {
+            std::lock_guard<std::mutex> lock(cfg_mtx_);
+            if (cfg_dirty_) {
+                dai::StereoDepthConfig cfg;
+                cfg.setMedianFilter(cfg_median_on_
+                    ? dai::StereoDepthProperties::MedianFilter::KERNEL_7x7
+                    : dai::StereoDepthProperties::MedianFilter::MEDIAN_OFF);
+                cfg.setConfidenceThreshold(cfg_confidence_);
+                configQueue->send(cfg);
+                cfg_dirty_ = false;
+            }
+        }
+
         // Block only on disparity — it drives the frame rate.
         auto dispFrame = dispQueue->get<dai::ImgFrame>();
         if (!dispFrame) continue;

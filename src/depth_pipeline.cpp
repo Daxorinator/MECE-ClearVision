@@ -8,10 +8,13 @@
  * Run:    ./depth_pipeline
  *
  * Controls:
- *   ESC - Exit
+ *   ESC   - Exit
+ *   M     - Toggle hardware median 7×7 filter
+ *   +/-   - Increase/decrease confidence threshold (lower = stricter)
  */
 
 #include <cstdio>
+#include <algorithm>
 #include <chrono>
 #include <deque>
 
@@ -54,6 +57,9 @@ private:
     std::deque<std::chrono::steady_clock::time_point> frame_times;
     std::chrono::steady_clock::time_point last_fps_print;
     double current_fps{0.0};
+
+    bool median_on{true};
+    int  confidence{200};
 };
 
 DepthWindow::DepthWindow(QWidget *parent) : QWidget(parent)
@@ -87,6 +93,7 @@ DepthWindow::DepthWindow(QWidget *parent) : QWidget(parent)
 
     printf("OAK-D Lite opened  fx=%.1f fy=%.1f cx=%.1f cy=%.1f baseline=%.1fmm\n",
            oak.fx, oak.fy, oak.cx, oak.cy, oak.baseline_m * 1000.0f);
+    printf("Controls: M=median  +/-=confidence(%d)  ESC=exit\n", confidence);
 
     last_fps_print = std::chrono::steady_clock::now();
 
@@ -103,14 +110,34 @@ DepthWindow::~DepthWindow()
 
 void DepthWindow::keyPressEvent(QKeyEvent *e)
 {
-    if (e->key() == Qt::Key_Escape) close();
-    else QWidget::keyPressEvent(e);
+    if (e->key() == Qt::Key_Escape) {
+        close();
+    } else if (e->key() == Qt::Key_M) {
+        median_on = !median_on;
+        oak.setStereoConfig(median_on, confidence);
+        printf("Median 7x7: %s\n", median_on ? "ON" : "OFF");
+    } else if (e->key() == Qt::Key_Plus || e->key() == Qt::Key_Equal) {
+        confidence = std::min(confidence + 10, 255);
+        oak.setStereoConfig(median_on, confidence);
+        printf("Confidence threshold: %d (less strict)\n", confidence);
+    } else if (e->key() == Qt::Key_Minus) {
+        confidence = std::max(confidence - 10, 0);
+        oak.setStereoConfig(median_on, confidence);
+        printf("Confidence threshold: %d (more strict)\n", confidence);
+    } else {
+        QWidget::keyPressEvent(e);
+    }
 }
 
 void DepthWindow::onTimer()
 {
     OAKFrame f;
     if (!oak.getFrame(f)) return;
+
+    // Speckle filter — removes isolated false-match clusters before display.
+    // maxSpeckleSize=100: components < 100px are zeroed.
+    // maxDiff=16: 16 raw units = 0.5px at 1/32 subpixel scale.
+    cv::filterSpeckles(f.disparity, 0, 100, 16);
 
     cv::Mat disp_float;
     f.disparity.convertTo(disp_float, CV_32F, 1.0f / 32.0f);
@@ -144,7 +171,10 @@ void DepthWindow::onTimer()
         last_fps_print = now;
     }
 
-    status_lbl->setText(QString("FPS: %1").arg(current_fps, 0, 'f', 1));
+    status_lbl->setText(QString("FPS: %1  |  Median: %2  |  Confidence: %3")
+        .arg(current_fps, 0, 'f', 1)
+        .arg(median_on ? "7x7" : "OFF")
+        .arg(confidence));
     view->setPixmap(mat_to_pixmap(color));
 }
 
