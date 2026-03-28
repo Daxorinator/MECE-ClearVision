@@ -55,8 +55,8 @@
  * Configuration
  * ======================================================================== */
 
-#define CAMERA_WIDTH        1920
-#define CAMERA_HEIGHT       1080
+#define CAMERA_WIDTH        1280
+#define CAMERA_HEIGHT       720
 #define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
 #define HOLE_FILL_MAX_SEARCH 16

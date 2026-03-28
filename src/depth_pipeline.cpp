@@ -50,7 +50,7 @@ static QPixmap mat_to_pixmap(const cv::Mat &bgr)
     cv::cvtColor(bgr, rgb, cv::COLOR_BGR2RGB);
     QImage img(rgb.data, rgb.cols, rgb.rows,
                (int)rgb.step, QImage::Format_RGB888);
-    return QPixmap::fromImage(img.copy());
+    return QPixmap::fromImage(img);  // fromImage copies internally; no extra .copy() needed
 }
 
 /* ========================================================================
@@ -93,8 +93,13 @@ DepthWindow::DepthWindow(QWidget *parent)
 {
     setWindowTitle("Depth Pipeline (OAK-D Lite)");
 
-    int dw = (int)(1920 * disp_scale);
-    int dh = (int)(1080 * disp_scale);
+    // Disparity-only mode: no color stream, no depth alignment.
+    // Disparity comes back at native 640×480 (6.5× less USB bandwidth).
+    oak.want_color      = false;
+    oak.want_confidence = false;
+
+    int dw = (int)(640 * disp_scale);
+    int dh = (int)(480 * disp_scale);
     resize(dw + 20, dh + 80);
 
     auto *vbox = new QVBoxLayout(this);
@@ -132,7 +137,7 @@ DepthWindow::DepthWindow(QWidget *parent)
 
     timer = new QTimer(this);
     connect(timer, &QTimer::timeout, this, &DepthWindow::onTimer);
-    timer->start(TIMER_INTERVAL_MS);
+    timer->start(0);  // 0ms — fires each idle event loop iteration, no artificial cap
 }
 
 DepthWindow::~DepthWindow()
@@ -143,12 +148,8 @@ DepthWindow::~DepthWindow()
 
 void DepthWindow::updateStatus()
 {
-    int dw = (int)(1920 * disp_scale);
-    int dh = (int)(1080 * disp_scale);
     char buf[256];
-    snprintf(buf, sizeof(buf),
-             "FPS: %.1f  |  display: %dx%d (%.0f%%)",
-             current_fps, dw, dh, disp_scale * 100.0);
+    snprintf(buf, sizeof(buf), "FPS: %.1f  |  scale: %.0f%%", current_fps, disp_scale * 100.0);
     status_lbl->setText(buf);
 }
 
@@ -182,24 +183,25 @@ void DepthWindow::onTimer()
     if (!oak.getFrame(f))
         return;
 
-    /* Convert CV_16U subpixel disparity (0–3040) → CV_32F pixel units
-     * OAK-D subpixel = 5-bit, divide by 32.0 for actual pixel disparity */
-    cv::Mat disp_float;
-    f.disparity.convertTo(disp_float, CV_32F, 1.0f / 32.0f);
+    /* Resize to display resolution first — all subsequent ops run on smaller image */
+    int dw = (int)(f.disparity.cols * disp_scale);
+    int dh = (int)(f.disparity.rows * disp_scale);
+    cv::Mat disp_small;
+    if (disp_scale != 1.0)
+        cv::resize(f.disparity, disp_small, cv::Size(dw, dh), 0, 0, cv::INTER_NEAREST);
+    else
+        disp_small = f.disparity;
 
-    /* Colourmap: normalise to [0, max_disp], apply JET, mask invalid pixels */
-    const float max_disp = 95.0f;  // OAK-D stereo max ~95 px at 480P/75mm baseline
+    /* Convert subpixel CV_16U → CV_32F, auto-normalise to full colour range */
+    cv::Mat disp_float;
+    disp_small.convertTo(disp_float, CV_32F, 1.0f / 32.0f);
+
     cv::Mat disp8;
-    disp_float.convertTo(disp8, CV_8U, 255.0f / max_disp);
+    cv::normalize(disp_float, disp8, 0, 255, cv::NORM_MINMAX, CV_8U, disp_small > 0);
+
     cv::Mat color;
     cv::applyColorMap(disp8, color, cv::COLORMAP_JET);
-    color.setTo(cv::Scalar(0, 0, 0), (f.disparity == 0));
-
-    /* Scale for display */
-    int dw = (int)(color.cols * disp_scale);
-    int dh = (int)(color.rows * disp_scale);
-    if (disp_scale != 1.0)
-        cv::resize(color, color, cv::Size(dw, dh), 0, 0, cv::INTER_LINEAR);
+    color.setTo(cv::Scalar(0, 0, 0), (disp_small == 0));
 
     /* FPS */
     auto now = std::chrono::steady_clock::now();
@@ -220,8 +222,9 @@ void DepthWindow::onTimer()
     double since_print = std::chrono::duration<double>(now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
         double dmin, dmax;
-        cv::minMaxLoc(disp_float, &dmin, &dmax);
-        printf("FPS: %.1f  disp=[%.1f..%.1f] px\n", current_fps, dmin, dmax);
+        cv::minMaxLoc(disp_float, &dmin, &dmax, nullptr, disp_small > 0);
+        printf("FPS: %.1f  disp=[%.1f..%.1f] px  display=%dx%d\n",
+               current_fps, dmin, dmax, dw, dh);
         last_fps_print = now;
     }
 

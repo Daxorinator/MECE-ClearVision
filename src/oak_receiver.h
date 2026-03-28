@@ -33,9 +33,16 @@ public:
     bool start();
     void stop();
 
-    // Returns true and copies the latest frame if a new one has arrived since
+    // Returns true and moves the latest frame out if a new one has arrived since
     // the last call. Returns false (and leaves out unchanged) if no new frame.
     bool getFrame(OAKFrame &out);
+
+    // Configuration — set before calling start().
+    // want_color=false: skips RGB camera, color XLink stream, and depth alignment.
+    //   Disparity comes back at native mono resolution (640×480 for 480P) — 6.5× less USB bandwidth.
+    // want_confidence=false: skips the confidence map stream.
+    bool want_color{true};
+    bool want_confidence{false};
 
     // Camera intrinsics read from device EEPROM after start().
     // Valid only after start() returns true.

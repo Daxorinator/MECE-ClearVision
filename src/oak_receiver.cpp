@@ -14,41 +14,61 @@ bool OAKReceiver::start()
     camLeft->setResolution(dai::MonoCameraProperties::SensorResolution::THE_480_P);
     camRight->setResolution(dai::MonoCameraProperties::SensorResolution::THE_480_P);
 
-    // --- Color camera ---
-    auto camRGB = pipeline.create<dai::node::ColorCamera>();
-    camRGB->setResolution(dai::ColorCameraProperties::SensorResolution::THE_1080_P);
-    camRGB->setInterleaved(false);
-    camRGB->setColorOrder(dai::ColorCameraProperties::ColorOrder::BGR);
+    // --- Color camera + depth alignment (only when color stream is wanted) ---
+    if (want_color) {
+        auto camRGB = pipeline.create<dai::node::ColorCamera>();
+        camRGB->setResolution(dai::ColorCameraProperties::SensorResolution::THE_1080_P);
+        camRGB->setIspScale(2, 3);  // 1920×1080 → 1280×720 (closest supported to stereo native)
+        camRGB->setInterleaved(false);
+        camRGB->setColorOrder(dai::ColorCameraProperties::ColorOrder::BGR);
 
-    // --- Stereo depth ---
-    auto stereo = pipeline.create<dai::node::StereoDepth>();
-    stereo->setLeftRightCheck(true);
-    stereo->setSubpixel(true);  // 5-bit subpixel, RAW16 range 0-3040
-    stereo->setDepthAlign(dai::CameraBoardSocket::RGB);
-    camLeft->out.link(stereo->left);
-    camRight->out.link(stereo->right);
+        auto stereoDepth = pipeline.create<dai::node::StereoDepth>();
+        stereoDepth->setLeftRightCheck(true);
+        stereoDepth->setSubpixel(true);
+        stereoDepth->setDepthAlign(dai::CameraBoardSocket::RGB);
+        camLeft->out.link(stereoDepth->left);
+        camRight->out.link(stereoDepth->right);
 
-    // --- XLink outputs ---
-    auto xoutDisp  = pipeline.create<dai::node::XLinkOut>();
-    auto xoutColor = pipeline.create<dai::node::XLinkOut>();
-    auto xoutConf  = pipeline.create<dai::node::XLinkOut>();
-    xoutDisp->setStreamName("disparity");
-    xoutColor->setStreamName("color");
-    xoutConf->setStreamName("confidence");
-    stereo->disparity.link(xoutDisp->input);
-    camRGB->isp.link(xoutColor->input);
-    stereo->confidenceMap.link(xoutConf->input);
+        auto xoutDisp  = pipeline.create<dai::node::XLinkOut>();
+        auto xoutColor = pipeline.create<dai::node::XLinkOut>();
+        xoutDisp->setStreamName("disparity");
+        xoutColor->setStreamName("color");
+        stereoDepth->disparity.link(xoutDisp->input);
+        camRGB->isp.link(xoutColor->input);
+
+        if (want_confidence) {
+            auto xoutConf = pipeline.create<dai::node::XLinkOut>();
+            xoutConf->setStreamName("confidence");
+            stereoDepth->confidenceMap.link(xoutConf->input);
+        }
+    } else {
+        // Disparity only — native mono resolution, no depth alignment.
+        // Much less USB bandwidth (640×480 × 2B vs 1920×1080 × 2B).
+        auto stereoDepth = pipeline.create<dai::node::StereoDepth>();
+        stereoDepth->setLeftRightCheck(true);
+        stereoDepth->setSubpixel(true);
+        camLeft->out.link(stereoDepth->left);
+        camRight->out.link(stereoDepth->right);
+
+        auto xoutDisp = pipeline.create<dai::node::XLinkOut>();
+        xoutDisp->setStreamName("disparity");
+        stereoDepth->disparity.link(xoutDisp->input);
+    }
 
     try {
         auto device = std::make_shared<dai::Device>(pipeline);
 
         // Read intrinsics from EEPROM
         auto calib = device->readCalibration();
-        auto intr  = calib.getCameraIntrinsics(dai::CameraBoardSocket::RGB, 1920, 1080);
-        fx = intr[0][0];
-        fy = intr[1][1];
-        cx = intr[0][2];
-        cy = intr[1][2];
+        if (want_color) {
+            auto intr = calib.getCameraIntrinsics(dai::CameraBoardSocket::RGB, 1280, 720);
+            fx = intr[0][0];  fy = intr[1][1];
+            cx = intr[0][2];  cy = intr[1][2];
+        } else {
+            auto intr = calib.getCameraIntrinsics(dai::CameraBoardSocket::LEFT, 640, 480);
+            fx = intr[0][0];  fy = intr[1][1];
+            cx = intr[0][2];  cy = intr[1][2];
+        }
         baseline_m = calib.getBaselineDistance(
             dai::CameraBoardSocket::LEFT, dai::CameraBoardSocket::RIGHT) / 100.0f;
 
@@ -78,26 +98,33 @@ bool OAKReceiver::getFrame(OAKFrame &out)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     if (!new_frame_) return false;
-    out = latest_;
+    out = std::move(latest_);
     new_frame_ = false;
     return true;
 }
 
 void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
 {
-    auto dispQueue  = device->getOutputQueue("disparity",  1, false);
-    auto colorQueue = device->getOutputQueue("color",      1, false);
-    auto confQueue  = device->getOutputQueue("confidence", 1, false);
+    auto dispQueue = device->getOutputQueue("disparity", 1, false);
+    std::shared_ptr<dai::DataOutputQueue> colorQueue, confQueue;
+    if (want_color)      colorQueue = device->getOutputQueue("color",      1, false);
+    if (want_confidence) confQueue  = device->getOutputQueue("confidence", 1, false);
+
+    std::shared_ptr<dai::ImgFrame> lastColor;
 
     while (running_) {
-        auto dispFrame  = dispQueue->get<dai::ImgFrame>();
-        auto colorFrame = colorQueue->get<dai::ImgFrame>();
-        auto confFrame  = confQueue->get<dai::ImgFrame>();
+        // Block only on disparity — it drives the frame rate.
+        auto dispFrame = dispQueue->get<dai::ImgFrame>();
+        if (!dispFrame) continue;
 
-        if (!dispFrame || !colorFrame) continue;
+        if (colorQueue) {
+            auto f = colorQueue->tryGet<dai::ImgFrame>();
+            if (f) lastColor = f;
+        }
+        std::shared_ptr<dai::ImgFrame> confFrame;
+        if (confQueue) confFrame = confQueue->tryGet<dai::ImgFrame>();
 
-        // Construct cv::Mat from raw frame data — avoids requiring depthai-core
-        // to be built with OpenCV support (DEPTHAI_OPENCV_SUPPORT).
+        // Construct cv::Mat from raw frame data — avoids requiring DEPTHAI_OPENCV_SUPPORT.
         OAKFrame f;
         {
             auto &d = dispFrame->getData();
@@ -105,11 +132,11 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
                         CV_16UC1, const_cast<uint8_t*>(d.data()));
             f.disparity = tmp.clone();
         }
-        {
+        if (lastColor) {
             // Store NV12 as-is — consumers convert to their required format.
-            auto &d = colorFrame->getData();
-            int w = (int)colorFrame->getWidth();
-            int h = (int)colorFrame->getHeight();
+            auto &d = lastColor->getData();
+            int w = (int)lastColor->getWidth();
+            int h = (int)lastColor->getHeight();
             cv::Mat nv12(h * 3 / 2, w, CV_8UC1, const_cast<uint8_t*>(d.data()));
             f.color = nv12.clone();
         }
