@@ -138,7 +138,11 @@ void DepthWindow::onTimer()
     // Speckle filter — removes isolated false-match clusters before display.
     // maxSpeckleSize=100: components < 100px are zeroed.
     // maxDiff=16: 16 raw units = 0.5px at 1/32 subpixel scale.
-    cv::filterSpeckles(f.disparity, 0, 100, 16);
+    // filterSpeckles requires CV_16SC1; disparity is CV_16UC1 — reinterpret in place.
+    cv::Mat disp_s16;
+    f.disparity.convertTo(disp_s16, CV_16SC1);
+    cv::filterSpeckles(disp_s16, 0, 100, 16);
+    disp_s16.convertTo(f.disparity, CV_16UC1);
 
     cv::Mat disp_float;
     f.disparity.convertTo(disp_float, CV_32F, 1.0f / 32.0f);
