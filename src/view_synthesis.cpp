@@ -148,52 +148,57 @@ void main() {
 )";
 
 /* Initialises JFA seed image from depth SSBO.
- * Valid pixels seed themselves; holes get (-1,-1). */
+ * Valid pixels store packed (x | y<<16); holes store -1. */
 static const char *JFA_INIT_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform ivec2 u_size;
 layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
-layout(rg32i, binding = 0) writeonly uniform highp iimage2D u_seed;
+layout(r32i, binding = 0) writeonly uniform highp iimage2D u_seed;
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
     if (pos.x >= u_size.x || pos.y >= u_size.y) return;
     if (depth[pos.y * u_size.x + pos.x] > 0u)
-        imageStore(u_seed, pos, ivec4(pos.x, pos.y, 0, 0));
+        imageStore(u_seed, pos, ivec4(pos.x | (pos.y << 16), 0, 0, 0));
     else
-        imageStore(u_seed, pos, ivec4(-1, -1, 0, 0));
+        imageStore(u_seed, pos, ivec4(-1, 0, 0, 0));
 }
 )";
 
-/* One JFA pass — 9-neighbourhood lookup at current step distance. */
+/* One JFA pass — 9-neighbourhood lookup at current step distance.
+ * Seed packed as (x | y<<16) in r32i; -1 = no seed. */
 static const char *JFA_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform int u_step;
 uniform ivec2 u_size;
-layout(rg32i, binding = 0) readonly  uniform highp iimage2D u_seed_in;
-layout(rg32i, binding = 1) writeonly uniform highp iimage2D u_seed_out;
+layout(r32i, binding = 0) readonly  uniform highp iimage2D u_seed_in;
+layout(r32i, binding = 1) writeonly uniform highp iimage2D u_seed_out;
+
+ivec2 unpack(int p) { return ivec2(p & 0xFFFF, (p >> 16) & 0xFFFF); }
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
     if (pos.x >= u_size.x || pos.y >= u_size.y) return;
-    ivec2 best = imageLoad(u_seed_in, pos).xy;
-    float best_dist = (best.x < 0) ? 1e30 : length(vec2(pos - best));
+    int best_p = imageLoad(u_seed_in, pos).r;
+    ivec2 best = (best_p >= 0) ? unpack(best_p) : ivec2(-1);
+    float best_dist = (best_p >= 0) ? length(vec2(pos - best)) : 1e30;
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
             ivec2 nb = pos + ivec2(dx, dy) * u_step;
             if (nb.x < 0 || nb.x >= u_size.x || nb.y < 0 || nb.y >= u_size.y) continue;
-            ivec2 seed = imageLoad(u_seed_in, nb).xy;
-            if (seed.x < 0) continue;
+            int p = imageLoad(u_seed_in, nb).r;
+            if (p < 0) continue;
+            ivec2 seed = unpack(p);
             float d = length(vec2(pos - seed));
-            if (d < best_dist) { best_dist = d; best = seed; }
+            if (d < best_dist) { best_dist = d; best_p = p; best = seed; }
         }
     }
-    imageStore(u_seed_out, pos, ivec4(best.x, best.y, 0, 0));
+    imageStore(u_seed_out, pos, ivec4(best_p, 0, 0, 0));
 }
 )";
 
@@ -203,15 +208,15 @@ precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform ivec2 u_size;
-layout(rg32i, binding = 0) readonly  uniform highp iimage2D u_seed;
+layout(r32i, binding = 0) readonly  uniform highp iimage2D u_seed;
 layout(rgba8, binding = 1) readonly  uniform highp image2D  u_src;
 layout(rgba8, binding = 2) writeonly uniform highp image2D  u_out;
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
     if (pos.x >= u_size.x || pos.y >= u_size.y) return;
-    ivec2 seed = imageLoad(u_seed, pos).xy;
-    vec4 col = (seed.x >= 0) ? imageLoad(u_src, seed) : vec4(0.0);
+    int p = imageLoad(u_seed, pos).r;
+    vec4 col = (p >= 0) ? imageLoad(u_src, ivec2(p & 0xFFFF, (p >> 16) & 0xFFFF)) : vec4(0.0);
     imageStore(u_out, pos, col);
 }
 )";
@@ -345,12 +350,12 @@ static GLuint create_texture_rgba32f(int w, int h)
     return tex;
 }
 
-static GLuint create_texture_rg32i(int w, int h)
+static GLuint create_texture_r32i(int w, int h)
 {
     GLuint tex;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RG32I, w, h);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32I, w, h);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -410,8 +415,8 @@ private:
     GLuint tex_worldspace{0};   /* rgba32f, proc_w × proc_h — unprojected 3D */
     GLuint tex_output{0};       /* rgba8,   proc_w × proc_h — splat output */
     GLuint tex_filled{0};       /* rgba8,   proc_w × proc_h — JFA filled */
-    GLuint tex_jfa_a{0};        /* rg32i,   ping buffer */
-    GLuint tex_jfa_b{0};        /* rg32i,   pong buffer */
+    GLuint tex_jfa_a{0};        /* r32i,    ping buffer (packed x|y<<16) */
+    GLuint tex_jfa_b{0};        /* r32i,    pong buffer (packed x|y<<16) */
 
     GLuint ssbo_depth{0};
     GLuint quad_vao{0}, quad_vbo{0};
@@ -557,8 +562,8 @@ void SynthWindow::recreateTextures()
     tex_worldspace  = create_texture_rgba32f(proc_w, proc_h);
     tex_output      = create_texture_rgba8  (proc_w, proc_h);
     tex_filled      = create_texture_rgba8  (proc_w, proc_h);
-    tex_jfa_a       = create_texture_rg32i  (proc_w, proc_h);
-    tex_jfa_b       = create_texture_rg32i  (proc_w, proc_h);
+    tex_jfa_a       = create_texture_r32i  (proc_w, proc_h);
+    tex_jfa_b       = create_texture_r32i  (proc_w, proc_h);
     ssbo_depth      = create_ssbo(proc_w * proc_h);
 
     clear_black.assign(proc_w * proc_h * 4, 0);
@@ -840,7 +845,7 @@ void SynthWindow::paintGL()
         glUseProgram(prog_jfa_init);
         glUniform2i(uloc_jfai_size, proc_w, proc_h);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
-        glBindImageTexture(0, tex_jfa_a, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32I);
+        glBindImageTexture(0, tex_jfa_a, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32I);
         glDispatchCompute(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
@@ -856,8 +861,8 @@ void SynthWindow::paintGL()
             glUseProgram(prog_jfa);
             glUniform1i(uloc_jfa_step, step);
             glUniform2i(uloc_jfa_size, proc_w, proc_h);
-            glBindImageTexture(0, cur,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_RG32I);
-            glBindImageTexture(1, next, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32I);
+            glBindImageTexture(0, cur,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32I);
+            glBindImageTexture(1, next, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32I);
             glDispatchCompute(groups_x, groups_y, 1);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
             std::swap(cur, next);
@@ -867,7 +872,7 @@ void SynthWindow::paintGL()
         /* Gather: copy nearest-seed colour into tex_filled */
         glUseProgram(prog_jfa_gather);
         glUniform2i(uloc_jfag_size, proc_w, proc_h);
-        glBindImageTexture(0, cur,        0, GL_FALSE, 0, GL_READ_ONLY,  GL_RG32I);
+        glBindImageTexture(0, cur,        0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32I);
         glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
         glBindImageTexture(2, tex_filled, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
         glDispatchCompute(groups_x, groups_y, 1);
