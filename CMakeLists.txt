@@ -6,12 +6,27 @@ endif()
 # HunterGate must be called before any project() command — including ours.
 # These values must match exactly what extern/depthai-core/CMakeLists.txt uses.
 set(HUNTER_CONFIGURATION_TYPES "Release" CACHE STRING "Hunter dependencies list of build configurations")
+
+# depthai-core build options — disable everything we don't use to reduce build time.
+# These must be set before add_subdirectory(extern/depthai-core).
+set(DEPTHAI_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
+set(DEPTHAI_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
+set(DEPTHAI_BUILD_DOCS      OFF CACHE BOOL "" FORCE)
+set(DEPTHAI_OPENCV_SUPPORT  OFF CACHE BOOL "" FORCE)   # we use getData() directly
+set(DEPTHAI_ENABLE_BACKWARD OFF CACHE BOOL "" FORCE)   # backward-cpp stack traces
 include("${CMAKE_CURRENT_SOURCE_DIR}/extern/depthai-core/cmake/HunterGate.cmake")
 HunterGate(
     URL  "https://github.com/cpp-pm/hunter/archive/v0.23.322.tar.gz"
     SHA1 "cb0ea1f74f4a2c49a807de34885743495fccccbe"
     LOCAL
 )
+
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
+    message(STATUS "ccache found: ${CCACHE_PROGRAM}")
+endif()
 
 project(stereo_calibration CXX)
 
