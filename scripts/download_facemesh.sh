@@ -3,8 +3,6 @@
 # from PINTO0309's model zoo.  Places the file at src/models/.
 #
 # Usage: bash scripts/download_facemesh.sh
-#
-# Compatible with Git 2.17+ (Ubuntu 18.04 / JetPack 4.x).
 
 set -e
 
@@ -19,36 +17,25 @@ if [ -f "$OUT" ]; then
     exit 0
 fi
 
-echo "Fetching FaceMesh download script from PINTO0309 model zoo..."
-
 TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
-# Fetch just the download.sh for model #032 via raw GitHub URL (no git clone needed)
-DOWNLOAD_SH_URL="https://raw.githubusercontent.com/PINTO0309/PINTO_model_zoo/main/282_face_landmark_with_attention/download.sh"
+echo "Downloading 282_face_landmark_with_attention resources..."
+curl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/282_face_landmark_with_attention/resources.tar.gz" \
+    -o "$TMP/resources.tar.gz"
+tar -zxvf "$TMP/resources.tar.gz" -C "$TMP"
+rm "$TMP/resources.tar.gz"
 
-if ! curl -fsSL "$DOWNLOAD_SH_URL" -o "$TMP/download.sh"; then
-    echo "ERROR: failed to fetch download.sh from PINTO0309 model zoo."
-    echo "Check network connectivity or download manually:"
-    echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/282_face_landmark_with_attention"
-    echo "Place face_landmark_with_attention.onnx (192×192 input) in src/models/"
-    exit 1
-fi
-
-echo "Running PINTO0309 download script..."
-cd "$TMP"
-bash download.sh
-
-# Find the downloaded ONNX (prefer 192x192 variant, then any with_attention)
-ONNX=$(find "$TMP" -name "*with_attention*192*.onnx" 2>/dev/null | head -1)
+# Find the ONNX (prefer 192x192 float32, then any .onnx in the archive)
+ONNX=$(find "$TMP" -name "*192*float32*.onnx" 2>/dev/null | head -1)
 if [ -z "$ONNX" ]; then
-    ONNX=$(find "$TMP" -name "*with_attention*.onnx" 2>/dev/null | head -1)
+    ONNX=$(find "$TMP" -name "*.onnx" 2>/dev/null | head -1)
 fi
 if [ -z "$ONNX" ]; then
-    echo "Available files in download directory:"
-    find "$TMP" -name "*.onnx" 2>/dev/null | head -20
+    echo "Available files:"
+    find "$TMP" -type f | head -20
     echo
-    echo "ERROR: could not find face_landmark_with_attention ONNX."
+    echo "ERROR: no .onnx found in archive."
     echo "Download manually from:"
     echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/282_face_landmark_with_attention"
     echo "and place it at: $OUT"
