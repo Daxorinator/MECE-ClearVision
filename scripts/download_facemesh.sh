@@ -26,16 +26,12 @@ curl "https://s3.ap-northeast-2.wasabisys.com/pinto-model-zoo/282_face_landmark_
 tar -zxvf "$TMP/resources.tar.gz" -C "$TMP"
 rm "$TMP/resources.tar.gz"
 
-# Find the ONNX (prefer 192x192 float32, then any .onnx in the archive)
-ONNX=$(find "$TMP" -name "*192*float32*.onnx" 2>/dev/null | head -1)
-if [ -z "$ONNX" ]; then
-    ONNX=$(find "$TMP" -name "*.onnx" 2>/dev/null | head -1)
-fi
-if [ -z "$ONNX" ]; then
+ONNX="$TMP/face_landmark_with_attention_192x192/model_float32.onnx"
+if [ ! -f "$ONNX" ]; then
     echo "Available files:"
     find "$TMP" -type f | head -20
     echo
-    echo "ERROR: no .onnx found in archive."
+    echo "ERROR: expected $ONNX but it was not found in the archive."
     echo "Download manually from:"
     echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/282_face_landmark_with_attention"
     echo "and place it at: $OUT"
