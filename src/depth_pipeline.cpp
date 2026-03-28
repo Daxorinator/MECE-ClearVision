@@ -222,7 +222,7 @@ void DepthWindow::onTimer()
     double since_print = std::chrono::duration<double>(now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
         double dmin, dmax;
-        cv::minMaxLoc(disp_float, &dmin, &dmax, nullptr, disp_small > 0);
+        cv::minMaxLoc(disp_float, &dmin, &dmax, nullptr, nullptr, disp_small > 0);
         printf("FPS: %.1f  disp=[%.1f..%.1f] px  display=%dx%d\n",
                current_fps, dmin, dmax, dw, dh);
         last_fps_print = now;
