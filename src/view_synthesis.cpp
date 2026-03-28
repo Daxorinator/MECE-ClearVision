@@ -60,7 +60,7 @@
 #define CAMERA_HEIGHT       720
 #define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
-#define FACE_CAM_INDEX      2
+#define FACE_CAM_INDEX      0
 
 /* ========================================================================
  * GLSL Compute Shaders (OpenGL ES 3.1)
