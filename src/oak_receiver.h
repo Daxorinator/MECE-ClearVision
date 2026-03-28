@@ -4,7 +4,10 @@
 #include <mutex>
 #include <thread>
 #include <opencv2/core.hpp>
-#include <depthai/depthai.hpp>
+
+// Forward declaration — keeps <depthai/depthai.hpp> out of every file that
+// includes this header. The full definition is only needed in oak_receiver.cpp.
+namespace dai { class Device; }
 
 // Frames received from the OAK-D Lite over USB.
 // disparity:  CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity

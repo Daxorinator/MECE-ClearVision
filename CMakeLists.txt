@@ -92,6 +92,18 @@ target_link_libraries(view_synthesis
     EGL
     Threads::Threads
 )
+target_precompile_headers(view_synthesis PRIVATE
+    <opencv2/core.hpp>
+    <opencv2/imgproc.hpp>
+    <opencv2/cudaarithm.hpp>
+    <opencv2/cudaimgproc.hpp>
+    <opencv2/cudawarping.hpp>
+    <QApplication>
+    <QOpenGLWidget>
+    <QOpenGLFunctions>
+    <QTimer>
+    <QKeyEvent>
+)
 
 add_executable(oak_test src/oak_test.cpp)
 target_link_libraries(oak_test depthai::core Threads::Threads)
