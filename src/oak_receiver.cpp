@@ -125,6 +125,8 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
             std::lock_guard<std::mutex> lock(cfg_mtx_);
             if (cfg_dirty_) {
                 dai::StereoDepthConfig cfg;
+                cfg.setLeftRightCheck(true);
+                cfg.setSubpixel(true);
                 cfg.setMedianFilter(cfg_median_on_
                     ? dai::StereoDepthProperties::MedianFilter::KERNEL_7x7
                     : dai::StereoDepthProperties::MedianFilter::MEDIAN_OFF);
