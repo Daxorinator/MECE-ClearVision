@@ -227,6 +227,22 @@ void FaceTracker::threadLoop()
         }
     }
 
+    /* Also look for a separate iris output (10 landmarks × 3 = 30 floats) */
+    int iris_idx   = -1;
+    size_t iris_bytes = 0;
+    for (int i = 0; i < n_bindings; i++) {
+        if (engine->bindingIsInput(i) || i == output_idx) continue;
+        auto dims = engine->getBindingDimensions(i);
+        size_t vol = 1;
+        for (int d = 0; d < dims.nbDims; d++) vol *= (size_t)dims.d[d];
+        if (vol == 30) {   /* 10 iris landmarks × 3 coords */
+            iris_idx   = i;
+            iris_bytes = vol * sizeof(float);
+            printf("[FaceTracker] Found separate iris output at binding %d\n", i);
+            break;
+        }
+    }
+
     if (input_idx < 0 || output_idx < 0 || n_landmarks < 1) {
         fprintf(stderr, "[FaceTracker] Unexpected model bindings — aborting\n");
         delete context; delete engine;
@@ -234,10 +250,9 @@ void FaceTracker::threadLoop()
         return;
     }
 
-    if (n_landmarks < 478) {
-        fprintf(stderr, "[FaceTracker] WARNING: model has only %d landmarks "
-                "(need 478 for iris depth — check you have the *_with_attention model)\n",
-                n_landmarks);
+    if (n_landmarks < 478 && iris_idx < 0) {
+        fprintf(stderr, "[FaceTracker] WARNING: model has only %d landmarks and no "
+                "separate iris output — iris depth unavailable\n", n_landmarks);
     }
 
     /* Allocate GPU/CPU buffers */
@@ -245,18 +260,18 @@ void FaceTracker::threadLoop()
     cudaMalloc(&d_buffers[input_idx],  input_bytes);
     cudaMalloc(&d_buffers[output_idx], output_bytes);
 
-    /* Allocate extra output buffers (face flag etc.) */
+    /* Allocate all remaining output buffers (face flag, iris, etc.) */
     for (int i = 0; i < n_bindings; i++) {
-        if (!engine->bindingIsInput(i) && i != output_idx) {
-            auto dims = engine->getBindingDimensions(i);
-            size_t vol = 1;
-            for (int d = 0; d < dims.nbDims; d++) vol *= (size_t)dims.d[d];
-            cudaMalloc(&d_buffers[i], vol * sizeof(float));
-        }
+        if (d_buffers[i]) continue;   /* already allocated */
+        auto dims = engine->getBindingDimensions(i);
+        size_t vol = 1;
+        for (int d = 0; d < dims.nbDims; d++) vol *= (size_t)dims.d[d];
+        cudaMalloc(&d_buffers[i], vol * sizeof(float));
     }
 
     std::vector<float> h_input (input_bytes  / sizeof(float));
     std::vector<float> h_output(output_bytes / sizeof(float));
+    std::vector<float> h_iris  (iris_idx >= 0 ? 30 : 0);
 
     /* Diagnostic: print first few landmarks on first successful inference */
     bool first_infer = true;
@@ -335,6 +350,9 @@ void FaceTracker::threadLoop()
         context->executeV2(d_buffers);
         cudaMemcpy(h_output.data(), d_buffers[output_idx], output_bytes,
                    cudaMemcpyDeviceToHost);
+        if (iris_idx >= 0)
+            cudaMemcpy(h_iris.data(), d_buffers[iris_idx], iris_bytes,
+                       cudaMemcpyDeviceToHost);
 
         const float *lm = h_output.data();
 
@@ -361,15 +379,29 @@ void FaceTracker::threadLoop()
         /* Check face confidence if a second output exists */
         /* (Not strictly required — proceed regardless for now.) */
 
-        /* --- Iris depth estimation (requires 478 landmarks) --- */
-        if (n_landmarks < 478) { ++frame_count; continue; }
+        /* --- Iris depth estimation --- */
+        /* iris_lm points to either the separate iris output (indices 0-9)
+           or the tail of the face landmark array (indices 468-477). */
+        if (n_landmarks < 478 && iris_idx < 0) { ++frame_count; continue; }
 
-        /* Left iris (468–472): 468=center, 469=top, 470=right, 471=bottom, 472=left */
-        auto lx = [&](int idx, int c){ return lm[idx*3+c] * lm_scale; };
+        const float *iris_lm = (iris_idx >= 0) ? h_iris.data() : (lm + 468 * 3);
+        /* If separate iris output, coordinates are in crop-pixel space [0,192].
+           lm_scale was derived from face landmarks — apply same scale. */
+        /* Left iris: 0=center, 1=top, 2=right, 3=bottom, 4=left
+           Right iris: 5=center, 6=top, 7=right, 8=bottom, 9=left  */
+        auto lx = [&](int idx, int c){ return iris_lm[idx*3+c] * lm_scale; };
+
+        /* Separate iris output indices: 0=L_center,1=L_top,2=L_right,3=L_bottom,4=L_left
+                                         5=R_center,6=R_top,7=R_right,8=R_bottom,9=R_left
+           Packed (478 lm) indices:     468=L_center,469=L_top,470=L_right,471=L_bottom,472=L_left
+                                         473=R_center,...
+           We always offset by -468 when using separate output, so use local indices. */
+        int base = (iris_idx >= 0) ? 0 : 468;
+        auto ix = [&](int local, int c){ return lx(base + local, c); };
 
         /* Diameter of left iris (average horizontal + vertical span) */
-        float dh = std::hypot(lx(470,0)-lx(472,0), lx(470,1)-lx(472,1));
-        float dv = std::hypot(lx(469,0)-lx(471,0), lx(469,1)-lx(471,1));
+        float dh = std::hypot(ix(2,0)-ix(4,0), ix(2,1)-ix(4,1));
+        float dv = std::hypot(ix(1,0)-ix(3,0), ix(1,1)-ix(3,1));
         float diam_crop = (dh + dv) * 0.5f;
         if (diam_crop < 1.0f) { ++frame_count; continue; }   /* degenerate */
 
@@ -377,9 +409,9 @@ void FaceTracker::threadLoop()
         float crop_to_img  = (float)crop_rect.width / 192.0f;
         float iris_diam_px = diam_crop * crop_to_img;
 
-        /* Average of left (468) and right (473) iris centres */
-        float iris_cx = ((lx(468,0) + lx(473,0)) * 0.5f) * crop_to_img + crop_rect.x;
-        float iris_cy = ((lx(468,1) + lx(473,1)) * 0.5f) * crop_to_img + crop_rect.y;
+        /* Average of left (0) and right (5) iris centres */
+        float iris_cx = ((ix(0,0) + ix(5,0)) * 0.5f) * crop_to_img + crop_rect.x;
+        float iris_cy = ((ix(0,1) + ix(5,1)) * 0.5f) * crop_to_img + crop_rect.y;
 
         /* Depth from iris diameter */
         const float IRIS_DIAM_M = 0.01170f;
