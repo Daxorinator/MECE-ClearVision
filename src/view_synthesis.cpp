@@ -1,9 +1,10 @@
 /*
  * View Synthesis: DIBR (Depth-Image Based Rendering) via GPU Compute Shaders
  *
- * Synthesises a novel viewpoint from a virtual camera positioned halfway
- * between the two physical cameras using forward warping via
- * OpenGL ES 3.1 compute shaders.
+ * Synthesises a novel viewpoint from a virtual camera positioned at the
+ * viewer's head position, projecting through a virtual window model.
+ * Uses OAK-D Lite hardware disparity → 3D unproject → virtual window splat
+ * → JFA hole fill.
  *
  * Build:
  *   cd build && cmake .. && make view_synthesis
@@ -59,175 +60,163 @@
 #define CAMERA_HEIGHT       720
 #define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
-#define HOLE_FILL_MAX_SEARCH 16
-#define FACE_CAM_INDEX      2   // V4L2 index of the USB viewer-facing webcam
+#define FACE_CAM_INDEX      2
 
 /* ========================================================================
  * GLSL Compute Shaders (OpenGL ES 3.1)
  * ======================================================================== */
 
-static const char *DEPTH_SPLAT_CS = R"(#version 310 es
+/* Unprojects disparity texture to world-space 3D points.
+ * Output rgba32f: (X, Y, Z, 1) in metres; w=0 if invalid. */
+static const char *UNPROJECT_CS = R"(#version 310 es
+precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform sampler2D u_disparity;
-uniform float u_shift;
-uniform float u_disp_scale;
-uniform ivec2 u_output_size;
+uniform float u_fx, u_fy, u_cx, u_cy;
+uniform float u_baseline;
+uniform ivec2 u_size;
+layout(rgba32f, binding = 0) writeonly uniform highp image2D u_worldspace;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_size.x || pos.y >= u_size.y) return;
+    float d = texelFetch(u_disparity, pos, 0).r;
+    if (d < 0.5) { imageStore(u_worldspace, pos, vec4(0.0)); return; }
+    float Z = u_fx * u_baseline / d;
+    float X = (float(pos.x) - u_cx) * Z / u_fx;
+    float Y = (float(pos.y) - u_cy) * Z / u_fy;
+    imageStore(u_worldspace, pos, vec4(X, Y, Z, 1.0));
+}
+)";
+
+/* Splats world-space points into the depth SSBO from the virtual head position.
+ * Stores floatBitsToUint(1/Z_relative) — larger = closer, safe for atomicMax. */
+static const char *VWINDOW_DEPTH_CS = R"(#version 310 es
+precision highp float;
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba32f, binding = 0) readonly uniform highp image2D u_worldspace;
+uniform vec3 u_head_pos;
+uniform float u_fx, u_fy, u_cx, u_cy;
+uniform ivec2 u_size;
 layout(std430, binding = 0) buffer DepthBuffer { uint depth[]; };
 
 void main() {
     ivec2 src = ivec2(gl_GlobalInvocationID.xy);
-    if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
-    float disp = texelFetch(u_disparity, src, 0).r * u_disp_scale;
-    if (disp < 0.5) return;
-
-    float dst_xf = float(src.x) - disp * u_shift;
-    int dst_x0 = int(floor(dst_xf));
-    int dst_x1 = dst_x0 + 1;
-
-    uint depth_val = floatBitsToUint(disp);
-
-    if (dst_x0 >= 0 && dst_x0 < u_output_size.x)
-        atomicMax(depth[src.y * u_output_size.x + dst_x0], depth_val);
-
-    bool write_second = true;
-    if (src.x + 1 < u_output_size.x) {
-        float disp_neighbour = texelFetch(u_disparity, ivec2(src.x + 1, src.y), 0).r;
-        if (abs(disp - disp_neighbour) > 2.0)
-            write_second = false;
-    }
-
-    if (write_second && dst_x1 >= 0 && dst_x1 < u_output_size.x)
-        atomicMax(depth[src.y * u_output_size.x + dst_x1], depth_val);
+    if (src.x >= u_size.x || src.y >= u_size.y) return;
+    vec4 wp = imageLoad(u_worldspace, src);
+    if (wp.w < 0.5) return;
+    vec3 P = wp.xyz - u_head_pos;
+    if (P.z <= 0.0) return;
+    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
+    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
+    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
+    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
 }
 )";
 
-static const char *COLOR_SPLAT_CS = R"(#version 310 es
+/* Writes colour for each world point that wins its depth bucket. */
+static const char *VWINDOW_COLOR_CS = R"(#version 310 es
+precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
-uniform sampler2D u_color;
-uniform sampler2D u_disparity;
-uniform float u_shift;
-uniform ivec2 u_output_size;
+layout(rgba32f, binding = 0) readonly uniform highp image2D u_worldspace;
+uniform sampler2D u_colour;
+uniform vec3 u_head_pos;
+uniform float u_fx, u_fy, u_cx, u_cy;
+uniform ivec2 u_size;
 layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
 layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
 
 void main() {
     ivec2 src = ivec2(gl_GlobalInvocationID.xy);
-    if (src.x >= u_output_size.x || src.y >= u_output_size.y) return;
-    float disp = texelFetch(u_disparity, src, 0).r;
-    if (disp < 0.5) return;
-    int dst_x = int(round(float(src.x) - disp * u_shift));
-    if (dst_x < 0 || dst_x >= u_output_size.x) return;
-    uint my_depth = floatBitsToUint(disp);
-    uint stored = depth[src.y * u_output_size.x + dst_x];
-    if (my_depth >= stored) {
-        vec4 col = texelFetch(u_color, src, 0);
-        imageStore(u_output, ivec2(dst_x, src.y), col);
+    if (src.x >= u_size.x || src.y >= u_size.y) return;
+    vec4 wp = imageLoad(u_worldspace, src);
+    if (wp.w < 0.5) return;
+    vec3 P = wp.xyz - u_head_pos;
+    if (P.z <= 0.0) return;
+    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
+    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
+    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
+    uint my_depth = floatBitsToUint(1.0 / P.z);
+    if (my_depth >= depth[dst_y * u_size.x + dst_x]) {
+        vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
+        imageStore(u_output, ivec2(dst_x, dst_y), texture(u_colour, uv));
     }
 }
 )";
 
-static const char *HOLE_FILL_CS = R"(#version 310 es
+/* Initialises JFA seed image from depth SSBO.
+ * Valid pixels seed themselves; holes get (-1,-1). */
+static const char *JFA_INIT_CS = R"(#version 310 es
+precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
+uniform ivec2 u_size;
 layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
-layout(rgba8, binding = 1) readonly uniform highp image2D u_input;
-layout(rgba8, binding = 2) writeonly uniform highp image2D u_filled;
-uniform int u_max_search;
-uniform ivec2 u_output_size;
+layout(rg32i, binding = 0) writeonly uniform highp iimage2D u_seed;
 
 void main() {
     ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
-    if (pos.x >= u_output_size.x || pos.y >= u_output_size.y) return;
-
-    int w = u_output_size.x;
-    uint d = depth[pos.y * w + pos.x];
-    vec4 col = imageLoad(u_input, pos);
-    if (d > 0u) {
-        imageStore(u_filled, pos, col);
-        return;
-    }
-    vec4 left_col = vec4(0.0);
-    vec4 right_col = vec4(0.0);
-    uint left_d = 0u;
-    uint right_d = 0u;
-    for (int i = 1; i <= u_max_search; i++) {
-        if (left_d == 0u && pos.x - i >= 0) {
-            uint ld = depth[pos.y * w + pos.x - i];
-            if (ld > 0u) {
-                left_d = ld;
-                left_col = imageLoad(u_input, ivec2(pos.x - i, pos.y));
-            }
-        }
-        if (right_d == 0u && pos.x + i < w) {
-            uint rd = depth[pos.y * w + pos.x + i];
-            if (rd > 0u) {
-                right_d = rd;
-                right_col = imageLoad(u_input, ivec2(pos.x + i, pos.y));
-            }
-        }
-        if (left_d > 0u && right_d > 0u) break;
-    }
-    if (left_d > 0u && right_d > 0u)
-        col = (left_d < right_d) ? left_col : right_col;
-    imageStore(u_filled, pos, col);
+    if (pos.x >= u_size.x || pos.y >= u_size.y) return;
+    if (depth[pos.y * u_size.x + pos.x] > 0u)
+        imageStore(u_seed, pos, ivec4(pos.x, pos.y, 0, 0));
+    else
+        imageStore(u_seed, pos, ivec4(-1, -1, 0, 0));
 }
 )";
 
-static const char *DISPLAY_VS = R"(#version 310 es
-layout(location = 0) in vec2 a_pos;
-layout(location = 1) in vec2 a_uv;
-out vec2 v_uv;
-void main() {
-    v_uv = a_uv;
-    gl_Position = vec4(a_pos, 0.0, 1.0);
-}
-)";
-
-static const char *DISPLAY_FS = R"(#version 310 es
-precision mediump float;
-in vec2 v_uv;
-out vec4 frag_color;
-uniform sampler2D u_texture;
-void main() {
-    frag_color = texture(u_texture, v_uv);
-}
-)";
-
-static const char *BACKWARD_COLOR_CS = R"(#version 310 es
+/* One JFA pass — 9-neighbourhood lookup at current step distance. */
+static const char *JFA_CS = R"(#version 310 es
+precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
-uniform sampler2D u_colour;
-uniform ivec2 u_output_size;
-uniform float u_shift;
-
-layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
-layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
+uniform int u_step;
+uniform ivec2 u_size;
+layout(rg32i, binding = 0) readonly  uniform highp iimage2D u_seed_in;
+layout(rg32i, binding = 1) writeonly uniform highp iimage2D u_seed_out;
 
 void main() {
-    ivec2 dst = ivec2(gl_GlobalInvocationID.xy);
-    if (dst.x >= u_output_size.x || dst.y >= u_output_size.y) return;
-
-    uint stored = depth[dst.y * u_output_size.x + dst.x];
-    if (stored == 0u) return;
-
-    float warped_disp = uintBitsToFloat(stored);
-    float src_xf = float(dst.x) + warped_disp * u_shift;
-    float src_yf = float(dst.y);
-
-    if (src_xf < 0.0 || src_xf >= float(u_output_size.x) - 1.0) return;
-
-    vec2 uv = vec2((src_xf + 0.5) / float(u_output_size.x),
-                   (src_yf + 0.5) / float(u_output_size.y));
-
-    vec4 col = texture(u_colour, uv);
-    imageStore(u_output, dst, col);
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_size.x || pos.y >= u_size.y) return;
+    ivec2 best = imageLoad(u_seed_in, pos).xy;
+    float best_dist = (best.x < 0) ? 1e30 : length(vec2(pos - best));
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 nb = pos + ivec2(dx, dy) * u_step;
+            if (nb.x < 0 || nb.x >= u_size.x || nb.y < 0 || nb.y >= u_size.y) continue;
+            ivec2 seed = imageLoad(u_seed_in, nb).xy;
+            if (seed.x < 0) continue;
+            float d = length(vec2(pos - seed));
+            if (d < best_dist) { best_dist = d; best = seed; }
+        }
+    }
+    imageStore(u_seed_out, pos, ivec4(best.x, best.y, 0, 0));
 }
 )";
 
-/* Zero the depth SSBO entirely on the GPU — avoids uploading a 4 MB
- * CPU zero-vector every frame via glBufferSubData. */
+/* Copies colour from nearest valid seed into the filled output texture. */
+static const char *JFA_GATHER_CS = R"(#version 310 es
+precision highp float;
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform ivec2 u_size;
+layout(rg32i, binding = 0) readonly  uniform highp iimage2D u_seed;
+layout(rgba8, binding = 1) readonly  uniform highp image2D  u_src;
+layout(rgba8, binding = 2) writeonly uniform highp image2D  u_out;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    if (pos.x >= u_size.x || pos.y >= u_size.y) return;
+    ivec2 seed = imageLoad(u_seed, pos).xy;
+    vec4 col = (seed.x >= 0) ? imageLoad(u_src, seed) : vec4(0.0);
+    imageStore(u_out, pos, col);
+}
+)";
+
+/* Zeroes the depth SSBO on the GPU — avoids uploading a multi-MB zero vector. */
 static const char *CLEAR_CS = R"(#version 310 es
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) buffer DepthBuf { uint depth[]; };
@@ -236,6 +225,21 @@ void main() {
     uint idx = gl_GlobalInvocationID.x;
     if (idx < uint(u_total)) depth[idx] = 0u;
 }
+)";
+
+static const char *DISPLAY_VS = R"(#version 310 es
+layout(location = 0) in vec2 a_pos;
+layout(location = 1) in vec2 a_uv;
+out vec2 v_uv;
+void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }
+)";
+
+static const char *DISPLAY_FS = R"(#version 310 es
+precision mediump float;
+in vec2 v_uv;
+out vec4 frag_color;
+uniform sampler2D u_texture;
+void main() { frag_color = texture(u_texture, v_uv); }
 )";
 
 /* ========================================================================
@@ -328,6 +332,32 @@ static GLuint create_texture_r32f(int w, int h)
     return tex;
 }
 
+static GLuint create_texture_rgba32f(int w, int h)
+{
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA32F, w, h);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
+static GLuint create_texture_rg32i(int w, int h)
+{
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RG32I, w, h);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    return tex;
+}
+
 static GLuint create_ssbo(int num_elements)
 {
     GLuint buf;
@@ -359,56 +389,73 @@ protected:
 private:
     OAKReceiver oak_receiver;
 
-    bool use_hole_fill;
+    bool use_hole_fill{true};
 
-    /* Processing scale */
-    double proc_scale;
+    double proc_scale{0.5};
     int proc_w, proc_h;
 
-    /* GPU resources */
-    GLuint prog_depth_splat, prog_color_splat, prog_hole_fill, prog_display;
+    /* GL programs */
+    GLuint prog_unproject{0};
+    GLuint prog_vwindow_depth{0};
+    GLuint prog_vwindow_color{0};
+    GLuint prog_jfa_init{0};
+    GLuint prog_jfa{0};
+    GLuint prog_jfa_gather{0};
     GLuint prog_clear{0};
-    GLuint prog_backward_color{0};
-    GLint  uloc_clear_total{-1};
-    GLuint tex_left_color, tex_right_color;
-    GLuint tex_left_disp, tex_right_disp;
-    GLuint tex_output, tex_filled;
-    GLuint ssbo_depth;
-    GLuint quad_vao, quad_vbo;
-    bool gl_ready;
-    bool diag_frames_logged{false};   // one-shot: first frame received
+    GLuint prog_display{0};
 
+    /* GL textures */
+    GLuint tex_left_color{0};   /* rgba8,   proc_w × proc_h — colour input */
+    GLuint tex_left_disp{0};    /* r32f,    proc_w × proc_h — disparity input */
+    GLuint tex_worldspace{0};   /* rgba32f, proc_w × proc_h — unprojected 3D */
+    GLuint tex_output{0};       /* rgba8,   proc_w × proc_h — splat output */
+    GLuint tex_filled{0};       /* rgba8,   proc_w × proc_h — JFA filled */
+    GLuint tex_jfa_a{0};        /* rg32i,   ping buffer */
+    GLuint tex_jfa_b{0};        /* rg32i,   pong buffer */
 
-    /* Timer — singleShot chain drives the render loop (no fixed-interval cap) */
+    GLuint ssbo_depth{0};
+    GLuint quad_vao{0}, quad_vbo{0};
+    bool gl_ready{false};
+    bool diag_frames_logged{false};
+
     bool render_running{false};
 
     /* Face tracking */
-    FaceTracker *face_tracker          = nullptr;
-    bool         face_tracking_enabled = false;
+    FaceTracker *face_tracker{nullptr};
+    bool face_tracking_enabled{false};
 
     /* FPS tracking */
     std::deque<std::chrono::steady_clock::time_point> frame_times;
     std::chrono::steady_clock::time_point last_fps_print;
-    double current_fps;
+    double current_fps{0.0};
 
-    /* Staging buffers to avoid per-frame allocation */
-    cv::Mat rgba_buf;
+    /* Staging buffers */
     std::vector<GLubyte> clear_black;
-    cv::Mat m_disp_l_float;
     cv::Mat m_left_rgba;
 
-    /* CUDA acceleration */
+    /* CUDA temporal filter */
     bool use_cuda{false};
     cv::cuda::GpuMat gpu_disp_float;
     cv::cuda::GpuMat disp_filtered_gpu;
-    bool             disp_filtered_init{false};
+    bool disp_filtered_init{false};
 
-    /* Cached GL uniform locations (set once in initializeGL) */
-    GLint uloc_ds_disparity{-1}, uloc_ds_shift{-1}, uloc_ds_size{-1}, uloc_ds_scale{-1};
-    GLint uloc_cs_color{-1}, uloc_cs_disp{-1}, uloc_cs_shift{-1}, uloc_cs_size{-1};
-    GLint uloc_hf_maxsearch{-1}, uloc_hf_size{-1};
+    /* Cached uniform locations */
+    GLint uloc_clear_total{-1};
     GLint uloc_disp_texture{-1};
-    GLint uloc_bc_colour{-1}, uloc_bc_size{-1}, uloc_bc_shift{-1};
+
+    GLint uloc_unproj_disp{-1}, uloc_unproj_fx{-1}, uloc_unproj_fy{-1};
+    GLint uloc_unproj_cx{-1},   uloc_unproj_cy{-1}, uloc_unproj_baseline{-1};
+    GLint uloc_unproj_size{-1};
+
+    GLint uloc_vwd_head{-1}, uloc_vwd_fx{-1}, uloc_vwd_fy{-1};
+    GLint uloc_vwd_cx{-1},   uloc_vwd_cy{-1}, uloc_vwd_size{-1};
+
+    GLint uloc_vwc_colour{-1}, uloc_vwc_head{-1}, uloc_vwc_fx{-1}, uloc_vwc_fy{-1};
+    GLint uloc_vwc_cx{-1},     uloc_vwc_cy{-1},   uloc_vwc_size{-1};
+
+    GLint uloc_jfai_size{-1};
+    GLint uloc_jfa_step{-1}, uloc_jfa_size{-1};
+    GLint uloc_jfag_size{-1};
 
     void recreateTextures();
     void clearGPUBuffers();
@@ -416,16 +463,7 @@ private:
 
 /* ---- constructor ---- */
 
-SynthWindow::SynthWindow(QWidget *parent)
-    : QOpenGLWidget(parent),
-      use_hole_fill(true),
-      proc_scale(0.5),
-      prog_depth_splat(0), prog_color_splat(0), prog_hole_fill(0), prog_display(0), prog_backward_color(0),
-      tex_left_color(0), tex_right_color(0),
-      tex_left_disp(0), tex_right_disp(0),
-      tex_output(0), tex_filled(0), ssbo_depth(0),
-      quad_vao(0), quad_vbo(0),
-      gl_ready(false), current_fps(0.0)
+SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
 {
     setWindowTitle("View Synthesis (DIBR)");
 
@@ -439,6 +477,7 @@ SynthWindow::SynthWindow(QWidget *parent)
         printf("No CUDA — CPU temporal filter fallback\n");
     }
 
+    oak_receiver.want_color = true;
     oak_receiver.start();
 
     printf("\n============================================================\n");
@@ -446,7 +485,7 @@ SynthWindow::SynthWindow(QWidget *parent)
     printf("============================================================\n");
     printf("Resolution:      %dx%d\n", CAMERA_WIDTH, CAMERA_HEIGHT);
     printf("Processing:      %dx%d (%.0f%%)\n", proc_w, proc_h, proc_scale * 100.0);
-    printf("Hole filling:    %s\n", use_hole_fill ? "ON" : "OFF");
+    printf("Hole filling:    %s\n", use_hole_fill ? "ON (JFA)" : "OFF");
     printf("============================================================\n");
     printf("\nControls:\n");
     printf("  ESC   - Exit\n");
@@ -456,43 +495,29 @@ SynthWindow::SynthWindow(QWidget *parent)
     printf("  C     - Recalibrate face tracker (look straight ahead first)\n");
     printf("============================================================\n\n");
 
-    /* ---- Face tracker (USB webcam, background thread) ---- */
-    {
-        // Look for the Haar frontal-face cascade alongside the binary or in
-        // standard OpenCV system data directories.
-        const char *cascade_candidates[] = {
-            "haarcascade_frontalface_alt2.xml",
-            "/usr/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
-            "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
-            "/usr/share/opencv/haarcascades/haarcascade_frontalface_alt2.xml",
-        };
-        std::string cascade_path;
-        for (const char *c : cascade_candidates) {
-            if (FILE *f = std::fopen(c, "rb")) {
-                std::fclose(f);
-                cascade_path = c;
-                break;
-            }
-        }
-
-        if (cascade_path.empty()) {
-            printf("[FaceTracker] Haar cascade not found — face tracking disabled.\n");
-            printf("  Expected: haarcascade_frontalface_alt2.xml\n");
-            printf("  Install: sudo apt-get install opencv-data\n");
+    /* Face tracker */
+    const char *cascade_candidates[] = {
+        "haarcascade_frontalface_alt2.xml",
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
+        "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
+        "/usr/share/opencv/haarcascades/haarcascade_frontalface_alt2.xml",
+    };
+    std::string cascade_path;
+    for (const char *c : cascade_candidates) {
+        if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); cascade_path = c; break; }
+    }
+    if (cascade_path.empty()) {
+        printf("[FaceTracker] Haar cascade not found — face tracking disabled.\n");
+    } else {
+        face_tracker = new FaceTracker();
+        if (face_tracker->start(FACE_CAM_INDEX, cascade_path)) {
+            face_tracking_enabled = true;
+            printf("[FaceTracker] Started on camera %d\n", FACE_CAM_INDEX);
         } else {
-            face_tracker = new FaceTracker();
-            if (face_tracker->start(FACE_CAM_INDEX, cascade_path)) {
-                face_tracking_enabled = true;
-                printf("[FaceTracker] Started on camera %d  cascade: %s\n",
-                       FACE_CAM_INDEX, cascade_path.c_str());
-                printf("[FaceTracker] Press C to calibrate, F to toggle\n");
-            } else {
-                printf("[FaceTracker] Failed to start\n");
-                delete face_tracker;
-                face_tracker = nullptr;
-            }
+            printf("[FaceTracker] Failed to start\n");
+            delete face_tracker;
+            face_tracker = nullptr;
         }
-
     }
 
     last_fps_print = std::chrono::steady_clock::now();
@@ -502,27 +527,19 @@ SynthWindow::SynthWindow(QWidget *parent)
 
 SynthWindow::~SynthWindow()
 {
-    if (face_tracker) {
-        face_tracker->stop();
-        delete face_tracker;
-        face_tracker = nullptr;
-    }
+    if (face_tracker) { face_tracker->stop(); delete face_tracker; face_tracker = nullptr; }
     oak_receiver.stop();
     makeCurrent();
-    if (prog_depth_splat) glDeleteProgram(prog_depth_splat);
-    if (prog_color_splat) glDeleteProgram(prog_color_splat);
-    if (prog_hole_fill)   glDeleteProgram(prog_hole_fill);
-    if (prog_display)        glDeleteProgram(prog_display);
-    if (prog_backward_color) glDeleteProgram(prog_backward_color);
-    if (prog_clear)       glDeleteProgram(prog_clear);
-    GLuint textures[] = { tex_left_color, tex_right_color,
-                          tex_left_disp, tex_right_disp,
-                          tex_output, tex_filled };
-    for (auto t : textures)
-        if (t) glDeleteTextures(1, &t);
+    GLuint progs[] = { prog_unproject, prog_vwindow_depth, prog_vwindow_color,
+                       prog_jfa_init, prog_jfa, prog_jfa_gather,
+                       prog_clear, prog_display };
+    for (auto p : progs) if (p) glDeleteProgram(p);
+    GLuint textures[] = { tex_left_color, tex_left_disp, tex_worldspace,
+                          tex_output, tex_filled, tex_jfa_a, tex_jfa_b };
+    for (auto t : textures) if (t) glDeleteTextures(1, &t);
     if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
-    if (quad_vbo) glDeleteBuffers(1, &quad_vbo);
-    if (quad_vao) glDeleteVertexArrays(1, &quad_vao);
+    if (quad_vbo)   glDeleteBuffers(1, &quad_vbo);
+    if (quad_vao)   glDeleteVertexArrays(1, &quad_vao);
     doneCurrent();
 }
 
@@ -530,41 +547,36 @@ SynthWindow::~SynthWindow()
 
 void SynthWindow::recreateTextures()
 {
-    GLuint old[] = { tex_left_color, tex_right_color,
-                     tex_left_disp, tex_right_disp,
-                     tex_output, tex_filled };
-    for (auto t : old)
-        if (t) glDeleteTextures(1, &t);
+    GLuint old_tex[] = { tex_left_color, tex_left_disp, tex_worldspace,
+                         tex_output, tex_filled, tex_jfa_a, tex_jfa_b };
+    for (auto t : old_tex) if (t) glDeleteTextures(1, &t);
     if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
 
-    tex_left_color  = create_texture_rgba8(proc_w, proc_h);
-    tex_right_color = create_texture_rgba8(proc_w, proc_h);
-    tex_left_disp   = create_texture_r32f(proc_w, proc_h);
-    tex_right_disp  = create_texture_r32f(proc_w, proc_h);
-    tex_output      = create_texture_rgba8(proc_w, proc_h);
-    tex_filled      = create_texture_rgba8(proc_w, proc_h);
+    tex_left_color  = create_texture_rgba8  (proc_w, proc_h);
+    tex_left_disp   = create_texture_r32f   (proc_w, proc_h);
+    tex_worldspace  = create_texture_rgba32f(proc_w, proc_h);
+    tex_output      = create_texture_rgba8  (proc_w, proc_h);
+    tex_filled      = create_texture_rgba8  (proc_w, proc_h);
+    tex_jfa_a       = create_texture_rg32i  (proc_w, proc_h);
+    tex_jfa_b       = create_texture_rg32i  (proc_w, proc_h);
     ssbo_depth      = create_ssbo(proc_w * proc_h);
 
     clear_black.assign(proc_w * proc_h * 4, 0);
-    m_disp_l_float.create(proc_h, proc_w, CV_32F);
     m_left_rgba.create(proc_h, proc_w, CV_8UC4);
 
-    printf("GPU textures + SSBOs created: %dx%d\n", proc_w, proc_h);
+    printf("GPU textures + SSBO created: %dx%d\n", proc_w, proc_h);
 }
 
-/* ---- clear depth buffer and output ---- */
+/* ---- clear depth SSBO and output texture ---- */
 
 void SynthWindow::clearGPUBuffers()
 {
-    /* Clear depth SSBO to 0 on GPU — avoids uploading a ~4 MB zero-vector
-     * every frame via glBufferSubData. */
     glUseProgram(prog_clear);
     glUniform1i(uloc_clear_total, proc_w * proc_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glDispatchCompute((proc_w * proc_h + 63) / 64, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    /* Clear output texture to black */
     glBindTexture(GL_TEXTURE_2D, tex_output);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, clear_black.data());
@@ -578,25 +590,26 @@ void SynthWindow::initializeGL()
     printf("GLSL version:   %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
     printf("Renderer:       %s\n", glGetString(GL_RENDERER));
 
-    /* Compile compute programs */
-    prog_depth_splat    = create_compute_program(DEPTH_SPLAT_CS);
-    prog_color_splat    = create_compute_program(COLOR_SPLAT_CS);
-    prog_hole_fill      = create_compute_program(HOLE_FILL_CS);
-    prog_display        = create_render_program(DISPLAY_VS, DISPLAY_FS);
-    prog_clear          = create_compute_program(CLEAR_CS);
-    prog_backward_color = create_compute_program(BACKWARD_COLOR_CS);
+    prog_unproject     = create_compute_program(UNPROJECT_CS);
+    prog_vwindow_depth = create_compute_program(VWINDOW_DEPTH_CS);
+    prog_vwindow_color = create_compute_program(VWINDOW_COLOR_CS);
+    prog_jfa_init      = create_compute_program(JFA_INIT_CS);
+    prog_jfa           = create_compute_program(JFA_CS);
+    prog_jfa_gather    = create_compute_program(JFA_GATHER_CS);
+    prog_clear         = create_compute_program(CLEAR_CS);
+    prog_display       = create_render_program(DISPLAY_VS, DISPLAY_FS);
 
-    if (!prog_depth_splat || !prog_color_splat || !prog_hole_fill || !prog_display || !prog_clear || !prog_backward_color) {
+    if (!prog_unproject || !prog_vwindow_depth || !prog_vwindow_color ||
+        !prog_jfa_init  || !prog_jfa           || !prog_jfa_gather    ||
+        !prog_clear     || !prog_display) {
         fprintf(stderr, "FATAL: shader compilation failed\n");
         return;
     }
 
-    /* Create textures */
     recreateTextures();
 
-    /* Create fullscreen quad VAO/VBO */
+    /* Fullscreen quad */
     float quad[] = {
-        /* pos.x  pos.y  uv.s  uv.t  (V flipped: GL bottom → UV top) */
         -1.0f, -1.0f,  0.0f, 1.0f,
          1.0f, -1.0f,  1.0f, 1.0f,
         -1.0f,  1.0f,  0.0f, 0.0f,
@@ -614,25 +627,41 @@ void SynthWindow::initializeGL()
                           (void *)(2 * sizeof(float)));
     glBindVertexArray(0);
 
+    /* Cache uniform locations */
+    uloc_clear_total    = glGetUniformLocation(prog_clear,   "u_total");
+    uloc_disp_texture   = glGetUniformLocation(prog_display, "u_texture");
+
+    uloc_unproj_disp     = glGetUniformLocation(prog_unproject, "u_disparity");
+    uloc_unproj_fx       = glGetUniformLocation(prog_unproject, "u_fx");
+    uloc_unproj_fy       = glGetUniformLocation(prog_unproject, "u_fy");
+    uloc_unproj_cx       = glGetUniformLocation(prog_unproject, "u_cx");
+    uloc_unproj_cy       = glGetUniformLocation(prog_unproject, "u_cy");
+    uloc_unproj_baseline = glGetUniformLocation(prog_unproject, "u_baseline");
+    uloc_unproj_size     = glGetUniformLocation(prog_unproject, "u_size");
+
+    uloc_vwd_head = glGetUniformLocation(prog_vwindow_depth, "u_head_pos");
+    uloc_vwd_fx   = glGetUniformLocation(prog_vwindow_depth, "u_fx");
+    uloc_vwd_fy   = glGetUniformLocation(prog_vwindow_depth, "u_fy");
+    uloc_vwd_cx   = glGetUniformLocation(prog_vwindow_depth, "u_cx");
+    uloc_vwd_cy   = glGetUniformLocation(prog_vwindow_depth, "u_cy");
+    uloc_vwd_size = glGetUniformLocation(prog_vwindow_depth, "u_size");
+
+    uloc_vwc_colour = glGetUniformLocation(prog_vwindow_color, "u_colour");
+    uloc_vwc_head   = glGetUniformLocation(prog_vwindow_color, "u_head_pos");
+    uloc_vwc_fx     = glGetUniformLocation(prog_vwindow_color, "u_fx");
+    uloc_vwc_fy     = glGetUniformLocation(prog_vwindow_color, "u_fy");
+    uloc_vwc_cx     = glGetUniformLocation(prog_vwindow_color, "u_cx");
+    uloc_vwc_cy     = glGetUniformLocation(prog_vwindow_color, "u_cy");
+    uloc_vwc_size   = glGetUniformLocation(prog_vwindow_color, "u_size");
+
+    uloc_jfai_size = glGetUniformLocation(prog_jfa_init,   "u_size");
+    uloc_jfa_step  = glGetUniformLocation(prog_jfa,        "u_step");
+    uloc_jfa_size  = glGetUniformLocation(prog_jfa,        "u_size");
+    uloc_jfag_size = glGetUniformLocation(prog_jfa_gather, "u_size");
+
     gl_ready = true;
-    uloc_ds_disparity = glGetUniformLocation(prog_depth_splat, "u_disparity");
-    uloc_ds_shift     = glGetUniformLocation(prog_depth_splat, "u_shift");
-    uloc_ds_size      = glGetUniformLocation(prog_depth_splat, "u_output_size");
-    uloc_ds_scale     = glGetUniformLocation(prog_depth_splat, "u_disp_scale");
-    uloc_cs_color     = glGetUniformLocation(prog_color_splat, "u_color");
-    uloc_cs_disp      = glGetUniformLocation(prog_color_splat, "u_disparity");
-    uloc_cs_shift     = glGetUniformLocation(prog_color_splat, "u_shift");
-    uloc_cs_size      = glGetUniformLocation(prog_color_splat, "u_output_size");
-    uloc_hf_maxsearch = glGetUniformLocation(prog_hole_fill,   "u_max_search");
-    uloc_hf_size      = glGetUniformLocation(prog_hole_fill,   "u_output_size");
-    uloc_disp_texture = glGetUniformLocation(prog_display,        "u_texture");
-    uloc_clear_total  = glGetUniformLocation(prog_clear,          "u_total");
-    uloc_bc_colour    = glGetUniformLocation(prog_backward_color, "u_colour");
-    uloc_bc_size      = glGetUniformLocation(prog_backward_color, "u_output_size");
-    uloc_bc_shift     = glGetUniformLocation(prog_backward_color, "u_shift");
     printf("GPU pipeline initialised\n");
 
-    /* Kick off the self-sustaining render loop (no fixed-interval cap) */
     render_running = true;
     QTimer::singleShot(0, this, [this](){ update(); });
 }
@@ -641,43 +670,28 @@ void SynthWindow::initializeGL()
 
 void SynthWindow::keyPressEvent(QKeyEvent *e)
 {
-    if (e->key() == Qt::Key_Escape) {
-        close();
-        return;
-    }
+    if (e->key() == Qt::Key_Escape) { close(); return; }
 
     bool changed = false;
-
-    if (e->key() == Qt::Key_1) {
-        proc_scale = 1.0;
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_2) {
-        proc_scale = 0.5;
-        changed = true;
-    }
-    else if (e->key() == Qt::Key_3) {
-        proc_scale = 0.25;
-        changed = true;
-    }
+    if      (e->key() == Qt::Key_1) { proc_scale = 1.0;  changed = true; }
+    else if (e->key() == Qt::Key_2) { proc_scale = 0.5;  changed = true; }
+    else if (e->key() == Qt::Key_3) { proc_scale = 0.25; changed = true; }
     else if (e->key() == Qt::Key_H) {
         use_hole_fill = !use_hole_fill;
-        printf("Hole filling: %s\n", use_hole_fill ? "ON" : "OFF");
+        printf("Hole filling: %s\n", use_hole_fill ? "ON (JFA)" : "OFF");
     }
     else if (e->key() == Qt::Key_F) {
         if (face_tracker) {
             face_tracking_enabled = !face_tracking_enabled;
             printf("Face tracking: %s\n", face_tracking_enabled ? "ON" : "OFF");
         } else {
-            printf("Face tracking not available (model not loaded)\n");
+            printf("Face tracking not available\n");
         }
     }
     else if (e->key() == Qt::Key_C) {
         if (face_tracker && face_tracking_enabled) {
             face_tracker->calibrate();
             printf("Face tracker recalibrated\n");
-        } else {
-            printf("Face tracking not active — cannot calibrate\n");
         }
     }
 
@@ -685,17 +699,10 @@ void SynthWindow::keyPressEvent(QKeyEvent *e)
         int new_w = (int)(CAMERA_WIDTH  * proc_scale);
         int new_h = (int)(CAMERA_HEIGHT * proc_scale);
         if (new_w != proc_w || new_h != proc_h) {
-            proc_w = new_w;
-            proc_h = new_h;
-            if (gl_ready) {
-                makeCurrent();
-                recreateTextures();
-                doneCurrent();
-            }
+            proc_w = new_w; proc_h = new_h;
+            if (gl_ready) { makeCurrent(); recreateTextures(); doneCurrent(); }
         }
-        printf("scale=%.2f  hole=%s\n",
-               proc_scale,
-               use_hole_fill ? "ON" : "OFF");
+        printf("scale=%.2f  hole=%s\n", proc_scale, use_hole_fill ? "ON" : "OFF");
     }
 
     QOpenGLWidget::keyPressEvent(e);
@@ -712,29 +719,24 @@ void SynthWindow::resizeGL(int w, int h)
 
 void SynthWindow::paintGL()
 {
-    if (!gl_ready) { printf("[DIAG] paintGL: gl_ready=false\n"); return; }
+    if (!gl_ready) return;
 
-    /* 1. Grab frame from OAK-D Lite */
     OAKFrame oak_frame;
     if (!oak_receiver.getFrame(oak_frame)) { update(); return; }
-    // Convert disparity from CV_16U subpixel (divide by 32) to CV_32F
+
+    /* Convert disparity CV_16U subpixel (÷32) → CV_32F pixel disparity */
     cv::Mat disp_l_float;
     oak_frame.disparity.convertTo(disp_l_float, CV_32F, 1.0f / 32.0f);
 
     if (!diag_frames_logged) {
-        printf("[DIAG] First frame: color(NV12) mat=%dx%d image=%dx%d  disp=%dx%d type=%d  proc=%dx%d\n",
+        printf("[DIAG] First frame: color=%dx%d  disp=%dx%d type=%d  proc=%dx%d  cuda=%d\n",
                oak_frame.color.cols, oak_frame.color.rows,
-               oak_frame.color.cols, oak_frame.color.rows * 2 / 3,
-               oak_frame.disparity.cols, oak_frame.disparity.rows, oak_frame.disparity.type(),
-               proc_w, proc_h);
-        printf("[DIAG] use_cuda=%d\n", use_cuda);
+               oak_frame.disparity.cols, oak_frame.disparity.rows,
+               oak_frame.disparity.type(), proc_w, proc_h, use_cuda);
         diag_frames_logged = true;
     }
 
-    /* Convert NV12 → RGBA at full resolution, then resize to processing resolution.
-     * A single cvtColor call is cheaper than NV12→BGR→RGBA (two conversions).
-     * TODO: upload Y and UV planes as GL_R8 + GL_RG8 textures and perform
-     *       BT.601 YUV→RGB in the compute shader to eliminate this CPU step. */
+    /* NV12 → RGBA, resize to processing resolution */
     {
         cv::Mat rgba_full;
         cv::cvtColor(oak_frame.color, rgba_full, cv::COLOR_YUV2RGBA_NV12);
@@ -742,7 +744,7 @@ void SynthWindow::paintGL()
     }
     cv::resize(disp_l_float, disp_l_float, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
 
-    /* IIR temporal disparity filter — smooths frame-to-frame flicker */
+    /* IIR temporal filter on disparity */
     if (use_cuda) {
         const float alpha = 0.2f;
         gpu_disp_float.upload(disp_l_float);
@@ -750,12 +752,13 @@ void SynthWindow::paintGL()
             gpu_disp_float.copyTo(disp_filtered_gpu);
             disp_filtered_init = true;
         } else {
-            cv::cuda::addWeighted(gpu_disp_float, alpha, disp_filtered_gpu, 1.0 - alpha, 0.0, disp_filtered_gpu);
+            cv::cuda::addWeighted(gpu_disp_float, alpha, disp_filtered_gpu, 1.0 - alpha,
+                                  0.0, disp_filtered_gpu);
         }
         disp_filtered_gpu.download(disp_l_float);
     }
 
-    /* 3. Upload left color + disparity to GL */
+    /* Upload colour + disparity textures */
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, m_left_rgba.data);
@@ -764,58 +767,113 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
 
-    /* 4. Clear depth buffer and output */
     clearGPUBuffers();
+
+    /* Intrinsics scaled to processing resolution */
+    float scale_x = (float)proc_w / CAMERA_WIDTH;
+    float scale_y = (float)proc_h / CAMERA_HEIGHT;
+    float vfx = oak_receiver.fx * scale_x;
+    float vfy = oak_receiver.fy * scale_y;
+    float vcx = oak_receiver.cx * scale_x;
+    float vcy = oak_receiver.cy * scale_y;
+
+    /* Head position from face tracker (lateral shift → head_pos.x).
+     * Phase 5 will replace this with iris-depth 3D head position. */
+    float raw_shift = (face_tracking_enabled && face_tracker && face_tracker->isActive())
+                      ? face_tracker->shift() : 0.5f;
+    float head_x = (raw_shift - 0.5f) * oak_receiver.baseline_m;
+    float head_y = 0.0f;
+    float head_z = 0.0f;
 
     GLuint groups_x = (proc_w + 15) / 16;
     GLuint groups_y = (proc_h + 15) / 16;
 
-    /* ---- Resolve virtual camera shift ---- */
-    const float u_shift = (face_tracking_enabled && face_tracker &&
-                           face_tracker->isActive())
-                          ? face_tracker->shift()
-                          : 0.5f;
-
-    /* ---- Pass 1: Depth splat (left view → z-buffer) ---- */
-    glUseProgram(prog_depth_splat);
+    /* ---- Pass 1: Unproject disparity → world-space texture ---- */
+    glUseProgram(prog_unproject);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(uloc_ds_disparity, 0);
-    glUniform1f(uloc_ds_shift, u_shift);
-    glUniform1f(uloc_ds_scale, 1.0f);
-    glUniform2i(uloc_ds_size, proc_w, proc_h);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
+    glUniform1i(uloc_unproj_disp,     0);
+    glUniform1f(uloc_unproj_fx,       vfx);
+    glUniform1f(uloc_unproj_fy,       vfy);
+    glUniform1f(uloc_unproj_cx,       vcx);
+    glUniform1f(uloc_unproj_cy,       vcy);
+    glUniform1f(uloc_unproj_baseline, oak_receiver.baseline_m);
+    glUniform2i(uloc_unproj_size,     proc_w, proc_h);
+    glBindImageTexture(0, tex_worldspace, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
     glDispatchCompute(groups_x, groups_y, 1);
-
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-
-    /* ---- Pass 2: Backward colour warp (destination-driven, bilinear source) ---- */
-    glUseProgram(prog_backward_color);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_left_color);
-    glUniform1i(uloc_bc_colour, 0);
-    glUniform2i(uloc_bc_size, proc_w, proc_h);
-    glUniform1f(uloc_bc_shift, u_shift);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
-    glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-    glDispatchCompute(groups_x, groups_y, 1);
-
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-    /* ---- Pass 3: Hole fill ---- */
-    GLuint display_tex;
+    /* ---- Pass 2: Virtual window depth splat → SSBO ---- */
+    glUseProgram(prog_vwindow_depth);
+    glUniform3f(uloc_vwd_head,  head_x, head_y, head_z);
+    glUniform1f(uloc_vwd_fx,    vfx);
+    glUniform1f(uloc_vwd_fy,    vfy);
+    glUniform1f(uloc_vwd_cx,    vcx);
+    glUniform1f(uloc_vwd_cy,    vcy);
+    glUniform2i(uloc_vwd_size,  proc_w, proc_h);
+    glBindImageTexture(0, tex_worldspace, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
+    glDispatchCompute(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+    /* ---- Pass 3: Virtual window colour splat → tex_output ---- */
+    glUseProgram(prog_vwindow_color);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_left_color);
+    glUniform1i(uloc_vwc_colour, 0);
+    glUniform3f(uloc_vwc_head,   head_x, head_y, head_z);
+    glUniform1f(uloc_vwc_fx,     vfx);
+    glUniform1f(uloc_vwc_fy,     vfy);
+    glUniform1f(uloc_vwc_cx,     vcx);
+    glUniform1f(uloc_vwc_cy,     vcy);
+    glUniform2i(uloc_vwc_size,   proc_w, proc_h);
+    glBindImageTexture(0, tex_worldspace, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32F);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
+    glBindImageTexture(1, tex_output,     0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    /* ---- Pass 4: JFA hole fill ---- */
+    GLuint display_tex = tex_output;
     if (use_hole_fill) {
-        glUseProgram(prog_hole_fill);
+        /* Init seed image from depth SSBO */
+        glUseProgram(prog_jfa_init);
+        glUniform2i(uloc_jfai_size, proc_w, proc_h);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
-        glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA8);
-        glBindImageTexture(2, tex_filled, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-        glUniform1i(uloc_hf_maxsearch, HOLE_FILL_MAX_SEARCH);
-        glUniform2i(uloc_hf_size, proc_w, proc_h);
+        glBindImageTexture(0, tex_jfa_a, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32I);
         glDispatchCompute(groups_x, groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+        /* JFA passes — step halves each iteration */
+        GLuint cur  = tex_jfa_a;
+        GLuint next = tex_jfa_b;
+        int max_dim = std::max(proc_w, proc_h);
+        int step = 1;
+        while (step < max_dim) step <<= 1;
+        step >>= 1;
+
+        while (step >= 1) {
+            glUseProgram(prog_jfa);
+            glUniform1i(uloc_jfa_step, step);
+            glUniform2i(uloc_jfa_size, proc_w, proc_h);
+            glBindImageTexture(0, cur,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_RG32I);
+            glBindImageTexture(1, next, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RG32I);
+            glDispatchCompute(groups_x, groups_y, 1);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            std::swap(cur, next);
+            step >>= 1;
+        }
+
+        /* Gather: copy nearest-seed colour into tex_filled */
+        glUseProgram(prog_jfa_gather);
+        glUniform2i(uloc_jfag_size, proc_w, proc_h);
+        glBindImageTexture(0, cur,        0, GL_FALSE, 0, GL_READ_ONLY,  GL_RG32I);
+        glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
+        glBindImageTexture(2, tex_filled, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+        glDispatchCompute(groups_x, groups_y, 1);
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
         display_tex = tex_filled;
-    } else {
-        display_tex = tex_output;
     }
 
     /* ---- Render fullscreen quad ---- */
@@ -829,12 +887,10 @@ void SynthWindow::paintGL()
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     glBindVertexArray(0);
 
-    /* ---- FPS overlay using QPainter ---- */
+    /* ---- FPS overlay ---- */
     auto now = std::chrono::steady_clock::now();
     frame_times.push_back(now);
-    while ((int)frame_times.size() > FPS_WINDOW)
-        frame_times.pop_front();
-
+    while ((int)frame_times.size() > FPS_WINDOW) frame_times.pop_front();
     if (frame_times.size() >= 2) {
         double elapsed = std::chrono::duration<double>(
             frame_times.back() - frame_times.front()).count();
@@ -846,44 +902,27 @@ void SynthWindow::paintGL()
     QFont font("monospace", 14);
     font.setBold(true);
     painter.setFont(font);
-
     char info[320];
     snprintf(info, sizeof(info),
-             "FPS: %.1f | Hole=%s | %dx%d | Track:%s shift=%.2f",
+             "FPS: %.1f | Hole=%s | %dx%d | Track:%s hx=%.1fcm",
              current_fps,
-             use_hole_fill ? "ON" : "OFF",
+             use_hole_fill ? "JFA" : "OFF",
              proc_w, proc_h,
-             (face_tracking_enabled && face_tracker && face_tracker->isActive())
-                 ? "ON" : "OFF",
-             u_shift);
-
-    /* Draw text shadow for readability */
-    painter.setPen(Qt::black);
-    painter.drawText(12, 32, info);
-    painter.setPen(Qt::white);
-    painter.drawText(10, 30, info);
+             (face_tracking_enabled && face_tracker && face_tracker->isActive()) ? "ON" : "OFF",
+             head_x * 100.0f);
+    painter.setPen(Qt::black); painter.drawText(12, 32, info);
+    painter.setPen(Qt::white); painter.drawText(10, 30, info);
     painter.end();
 
-    /* Print FPS to terminal periodically */
-    double since_print = std::chrono::duration<double>(
-        now - last_fps_print).count();
+    double since_print = std::chrono::duration<double>(now - last_fps_print).count();
     if (since_print >= FPS_PRINT_INTERVAL) {
-        double dmin, dmax;
-        cv::minMaxLoc(disp_l_float, &dmin, &dmax);
-        int nonzero = cv::countNonZero(disp_l_float > 0.5f);
-        printf("FPS: %.1f  |  hole=%s  proc=%dx%d  track=%s  shift=%.2f  disp=[%.1f..%.1f] valid=%d/%d\n",
-               current_fps,
-               use_hole_fill ? "ON" : "OFF",
-               proc_w, proc_h,
-               (face_tracking_enabled && face_tracker && face_tracker->isActive())
-                   ? "ON" : "OFF",
-               u_shift,
-               dmin, dmax, nonzero, proc_w * proc_h);
+        printf("FPS: %.1f  hole=%s  proc=%dx%d  track=%s  head=(%.1f,%.1f,%.1f)cm\n",
+               current_fps, use_hole_fill ? "JFA" : "OFF", proc_w, proc_h,
+               (face_tracking_enabled && face_tracker && face_tracker->isActive()) ? "ON" : "OFF",
+               head_x * 100.0f, head_y * 100.0f, head_z * 100.0f);
         last_fps_print = now;
     }
 
-    /* Re-arm the render loop — singleShot(0) posts to the event queue so
-     * other Qt events (key presses etc.) are processed between frames. */
     if (render_running)
         QTimer::singleShot(0, this, [this](){ update(); });
 }
@@ -894,7 +933,6 @@ void SynthWindow::paintGL()
 
 int main(int argc, char *argv[])
 {
-    /* Request OpenGL ES 3.1 context */
     QSurfaceFormat fmt;
     fmt.setRenderableType(QSurfaceFormat::OpenGLES);
     fmt.setVersion(3, 1);
@@ -902,7 +940,6 @@ int main(int argc, char *argv[])
     QSurfaceFormat::setDefaultFormat(fmt);
 
     QApplication app(argc, argv);
-
     SynthWindow win;
     win.resize(960, 540);
     win.show();
