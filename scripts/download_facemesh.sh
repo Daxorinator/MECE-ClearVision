@@ -25,12 +25,12 @@ TMP=$(mktemp -d)
 trap "rm -rf $TMP" EXIT
 
 # Fetch just the download.sh for model #032 via raw GitHub URL (no git clone needed)
-DOWNLOAD_SH_URL="https://raw.githubusercontent.com/PINTO0309/PINTO_model_zoo/main/032_face_landmark_with_attention/download.sh"
+DOWNLOAD_SH_URL="https://raw.githubusercontent.com/PINTO0309/PINTO_model_zoo/main/282_face_landmark_with_attention/download.sh"
 
 if ! curl -fsSL "$DOWNLOAD_SH_URL" -o "$TMP/download.sh"; then
     echo "ERROR: failed to fetch download.sh from PINTO0309 model zoo."
     echo "Check network connectivity or download manually:"
-    echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/032_face_landmark_with_attention"
+    echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/282_face_landmark_with_attention"
     echo "Place face_landmark_with_attention.onnx (192×192 input) in src/models/"
     exit 1
 fi
@@ -50,7 +50,7 @@ if [ -z "$ONNX" ]; then
     echo
     echo "ERROR: could not find face_landmark_with_attention ONNX."
     echo "Download manually from:"
-    echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/032_face_landmark_with_attention"
+    echo "  https://github.com/PINTO0309/PINTO_model_zoo/tree/main/282_face_landmark_with_attention"
     echo "and place it at: $OUT"
     exit 1
 fi
