@@ -69,7 +69,7 @@ static nvinfer1::ICudaEngine *load_or_build_engine(const std::string &onnx_path)
     }
 
     auto *config = builder->createBuilderConfig();
-    config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 256u << 20);
+    config->setMaxWorkspaceSize(256u << 20);
 
     /* Use FP16 if the platform supports it (Maxwell has limited FP16 but try). */
     if (builder->platformHasFastFp16())
