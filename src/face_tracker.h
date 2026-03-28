@@ -4,61 +4,77 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <vector>
 
 #include <opencv2/core.hpp>
-#include <opencv2/objdetect.hpp>   // CascadeClassifier
+#include <opencv2/objdetect.hpp>
 
-/* ---- Tuning constants ---- */
-#define FT_SMOOTH        0.08f   // EMA alpha — lower = smoother, more lag
-#define FT_SENSITIVITY   0.8f    // normalised X displacement → u_shift scale
-#define FT_SHIFT_MIN     0.2f
-#define FT_SHIFT_MAX     0.8f
-#define FT_DETECT_EVERY  10      // run Haar every N frames
-#define FT_MIN_POINTS    4       // force re-detect if fewer LK points survive
-#define FT_MAX_POINTS    12      // goodFeaturesToTrack max corners
+#define FT_DETECT_EVERY  15      // run Haar every N frames
+#define FT_SMOOTH        0.12f   // EMA alpha for head position smoothing
 
 /*
- * FaceTracker — background thread that opens a USB webcam, runs a Haar
- * cascade detector every N frames and Lucas-Kanade sparse optical-flow
- * tracking in between.  Exposes a mutex-protected u_shift in [0, 1].
+ * Head position in the face-tracker camera's coordinate frame (metres).
+ * x: lateral  (positive = camera's right = viewer's left)
+ * y: vertical (positive = down)
+ * z: depth    (positive = away from camera = toward screen)
+ * valid: false until first successful iris detection
  *
- * Face lateral position is mapped to u_shift via:
- *   rel_x   = (face_centre_x − half_width) / half_width   ∈ [−1, 1]
- *   u_shift = 0.5 + (ema(rel_x) − ref_x) * FT_SENSITIVITY
+ * Phase 5 note: x/y are relative to calibration reference.  z is absolute.
+ * When mapping to OAK-D camera frame: negate x (cameras face opposite directions).
+ */
+struct HeadPos {
+    float x{0.f}, y{0.f}, z{0.6f};
+    bool valid{false};
+};
+
+/*
+ * FaceTracker — background thread that opens a USB webcam, detects faces
+ * with a Haar cascade every FT_DETECT_EVERY frames, then runs a MediaPipe
+ * FaceMesh ONNX model (478 landmarks, iris indices 468–477) via TensorRT to
+ * estimate the viewer's 3-D head position from iris diameter.
  *
- * Call calibrate() when the user is looking straight ahead to zero ref_x.
+ * Iris depth formula:  Z = IRIS_DIAM_M * focal_px / iris_diam_px
+ * where IRIS_DIAM_M = 11.7 mm (average human iris).
+ *
+ * Call calibrate() once the viewer is looking straight ahead and at a
+ * comfortable distance; this zeros the x/y reference.
+ *
+ * TRT engine is built from ONNX on first run (~2–5 min on Nano) and cached
+ * next to the ONNX file with a .trt extension for fast subsequent loads.
  */
 class FaceTracker {
 public:
     FaceTracker()  = default;
     ~FaceTracker() { stop(); }
 
-    // Start background thread.  cascade_path = path to Haar *.xml file.
-    bool start(int camera_index, const std::string &cascade_path);
+    // cascade_path   : Haar frontalface XML (for face detection)
+    // facemesh_onnx  : path to face_landmark_with_attention.onnx (478 landmarks)
+    bool start(int camera_index,
+               const std::string &cascade_path,
+               const std::string &facemesh_onnx);
     void stop();
 
-    // Store current EMA position as the "looking straight ahead" reference.
+    // Store current iris position as the "looking straight ahead" reference.
     void calibrate();
 
-    // Thread-safe; returns current u_shift [0, 1].
-    float shift()    const;
-    bool  isActive() const;
+    HeadPos headPos() const;
+
+    // True once the TRT engine is loaded and the first detection has fired.
+    bool isActive() const;
 
 private:
     void threadLoop();
 
     cv::CascadeClassifier cascade_;
+    std::string facemesh_onnx_;
 
-    std::thread       worker_;
-    std::atomic<bool> running_{false};
+    std::thread        worker_;
+    std::atomic<bool>  running_{false};
+    std::atomic<bool>  active_{false};
     mutable std::mutex mtx_;
 
-    // Protected by mtx_:
-    float u_shift_val_{0.5f};
-    float ema_x_{0.0f};
-    float ref_x_{0.0f};
-    bool  first_detection_{true};
+    HeadPos head_pos_;
+    float   ref_iris_x_{0.f}, ref_iris_y_{0.f};
+    bool    calibrated_{false};
 
     int         camera_index_{0};
     std::string cascade_path_;

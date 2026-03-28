@@ -511,13 +511,29 @@ SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
     for (const char *c : cascade_candidates) {
         if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); cascade_path = c; break; }
     }
+    /* Search for FaceMesh ONNX model */
+    const char *facemesh_candidates[] = {
+        "face_landmark_with_attention.onnx",
+        "../src/models/face_landmark_with_attention.onnx",
+        "src/models/face_landmark_with_attention.onnx",
+    };
+    std::string facemesh_path;
+    for (const char *c : facemesh_candidates) {
+        if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); facemesh_path = c; break; }
+    }
+
     if (cascade_path.empty()) {
         printf("[FaceTracker] Haar cascade not found — face tracking disabled.\n");
+    } else if (facemesh_path.empty()) {
+        printf("[FaceTracker] FaceMesh ONNX model not found.\n");
+        printf("  Run:  bash scripts/download_facemesh.sh\n");
+        printf("  Then place face_landmark_with_attention.onnx in src/models/\n");
     } else {
         face_tracker = new FaceTracker();
-        if (face_tracker->start(FACE_CAM_INDEX, cascade_path)) {
+        if (face_tracker->start(FACE_CAM_INDEX, cascade_path, facemesh_path)) {
             face_tracking_enabled = true;
-            printf("[FaceTracker] Started on camera %d\n", FACE_CAM_INDEX);
+            printf("[FaceTracker] Started on camera %d  model: %s\n",
+                   FACE_CAM_INDEX, facemesh_path.c_str());
         } else {
             printf("[FaceTracker] Failed to start\n");
             delete face_tracker;
@@ -782,13 +798,19 @@ void SynthWindow::paintGL()
     float vcx = oak_receiver.cx * scale_x;
     float vcy = oak_receiver.cy * scale_y;
 
-    /* Head position from face tracker (lateral shift → head_pos.x).
-     * Phase 5 will replace this with iris-depth 3D head position. */
-    float raw_shift = (face_tracking_enabled && face_tracker && face_tracker->isActive())
-                      ? face_tracker->shift() : 0.5f;
-    float head_x = (raw_shift - 0.5f) * oak_receiver.baseline_m;
-    float head_y = 0.0f;
-    float head_z = 0.0f;
+    /* Head position from iris-depth face tracker.
+     * x/y are relative to calibration reference; z is absolute depth in metres.
+     * Negate x: face-tracker camera faces viewer (x=right from cam = viewer's left),
+     * OAK-D faces scene (x=right from cam = viewer's right). */
+    float head_x = 0.0f, head_y = 0.0f, head_z = 0.0f;
+    if (face_tracking_enabled && face_tracker && face_tracker->isActive()) {
+        HeadPos hp = face_tracker->headPos();
+        if (hp.valid) {
+            head_x = -hp.x;
+            head_y =  hp.y;
+            head_z =  0.0f;  /* z offset from display plane deferred to Phase 6 */
+        }
+    }
 
     GLuint groups_x = (proc_w + 15) / 16;
     GLuint groups_y = (proc_h + 15) / 16;
