@@ -33,6 +33,12 @@ bool OAKReceiver::start()
     xoutDisp->setStreamName("disparity");
     stereoDepth->disparity.link(xoutDisp->input);
 
+    if (want_right_rect) {
+        auto xoutRectR = pipeline.create<dai::node::XLinkOut>();
+        xoutRectR->setStreamName("rectifiedRight");
+        stereoDepth->rectifiedRight.link(xoutRectR->input);
+    }
+
     // --- Color camera + depth alignment (only when color stream is wanted) ---
     if (want_color) {
         auto camRGB = pipeline.create<dai::node::ColorCamera>();
@@ -113,9 +119,10 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
 {
     auto dispQueue   = device->getOutputQueue("disparity", 1, false);
     auto configQueue = device->getInputQueue("stereoConfig");
-    std::shared_ptr<dai::DataOutputQueue> colorQueue, confQueue;
-    if (want_color)      colorQueue = device->getOutputQueue("color",      1, false);
-    if (want_confidence) confQueue  = device->getOutputQueue("confidence", 1, false);
+    std::shared_ptr<dai::DataOutputQueue> colorQueue, confQueue, rectRQueue;
+    if (want_color)      colorQueue = device->getOutputQueue("color",          1, false);
+    if (want_right_rect) rectRQueue = device->getOutputQueue("rectifiedRight", 1, false);
+    if (want_confidence) confQueue  = device->getOutputQueue("confidence",     1, false);
 
     std::shared_ptr<dai::ImgFrame> lastColor;
 
@@ -144,8 +151,9 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
             auto f = colorQueue->tryGet<dai::ImgFrame>();
             if (f) lastColor = f;
         }
-        std::shared_ptr<dai::ImgFrame> confFrame;
-        if (confQueue) confFrame = confQueue->tryGet<dai::ImgFrame>();
+        std::shared_ptr<dai::ImgFrame> confFrame, rectRFrame;
+        if (confQueue)  confFrame  = confQueue->tryGet<dai::ImgFrame>();
+        if (rectRQueue) rectRFrame = rectRQueue->tryGet<dai::ImgFrame>();
 
         // Construct cv::Mat from raw frame data — avoids requiring DEPTHAI_OPENCV_SUPPORT.
         OAKFrame f;
@@ -162,6 +170,12 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
             int h = (int)lastColor->getHeight();
             cv::Mat nv12(h * 3 / 2, w, CV_8UC1, const_cast<uint8_t*>(d.data()));
             f.color = nv12.clone();
+        }
+        if (rectRFrame) {
+            auto &d = rectRFrame->getData();
+            cv::Mat tmp(rectRFrame->getHeight(), rectRFrame->getWidth(),
+                        CV_8UC1, const_cast<uint8_t*>(d.data()));
+            f.right_rect = tmp.clone();
         }
         if (confFrame) {
             auto &d = confFrame->getData();

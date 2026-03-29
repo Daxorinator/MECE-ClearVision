@@ -10,17 +10,16 @@
 namespace dai { class Device; }
 
 // Frames received from the OAK-D Lite over USB.
-// disparity:  CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity
-// color:      CV_8UC1, NV12 layout — rows = height * 3/2, cols = width.
-//             Y plane occupies rows [0, height), interleaved UV plane rows [height, height*3/2).
-//             ColorCamera::isp always outputs NV12 regardless of setColorOrder/setInterleaved.
-//             Convert with e.g. cv::cvtColor(color, out, cv::COLOR_YUV2RGBA_NV12).
-//             TODO: upload Y and UV planes as separate GL_R8 / GL_RG8 textures and perform
-//                   BT.601 YUV→RGB in the compute shader to avoid this CPU conversion entirely.
-// confidence: CV_8U, 0 = maximum confidence (optional, may be empty)
+// disparity:   CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity
+// color:       CV_8UC1, NV12 layout — rows = height * 3/2, cols = width.
+//              ColorCamera::isp always outputs NV12; convert with cv::COLOR_YUV2RGBA_NV12.
+// right_rect:  CV_8UC1 grayscale rectified right image, native mono res (640×480).
+//              Available only when want_right_rect=true.  Used for disocclusion fill.
+// confidence:  CV_8U, 0 = maximum confidence (optional, may be empty)
 struct OAKFrame {
     cv::Mat disparity;
     cv::Mat color;
+    cv::Mat right_rect;
     cv::Mat confidence;
     bool valid{false};
 };
@@ -47,8 +46,11 @@ public:
     // Configuration — set before calling start().
     // want_color=false: skips RGB camera, color XLink stream, and depth alignment.
     //   Disparity comes back at native mono resolution (640×480 for 480P) — 6.5× less USB bandwidth.
+    // want_right_rect=true: streams the rectified right grayscale image (640×480).
+    //   Adds ~18 MB/s USB bandwidth.  Used for right-eye disocclusion fill.
     // want_confidence=false: skips the confidence map stream.
     bool want_color{true};
+    bool want_right_rect{false};
     bool want_confidence{false};
 
     // Camera intrinsics read from device EEPROM after start().
