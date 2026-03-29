@@ -111,15 +111,8 @@ void main() {
     if (P.z <= 0.0) return;
     int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
     int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    uint d_val = floatBitsToUint(1.0 / P.z);
-    for (int dy = 0; dy <= 1; dy++) {
-        for (int dx = 0; dx <= 1; dx++) {
-            int px = dst_x + dx;
-            int py = dst_y + dy;
-            if (px < 0 || px >= u_size.x || py < 0 || py >= u_size.y) continue;
-            atomicMax(depth[py * u_size.x + px], d_val);
-        }
-    }
+    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
+    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
 }
 )";
 
@@ -146,18 +139,11 @@ void main() {
     if (P.z <= 0.0) return;
     int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
     int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
+    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
     uint my_depth = floatBitsToUint(1.0 / P.z);
+    if (my_depth < depth[dst_y * u_size.x + dst_x]) return;
     vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
-    vec4 col = texture(u_colour, uv);
-    for (int dy = 0; dy <= 1; dy++) {
-        for (int dx = 0; dx <= 1; dx++) {
-            int px = dst_x + dx;
-            int py = dst_y + dy;
-            if (px < 0 || px >= u_size.x || py < 0 || py >= u_size.y) continue;
-            if (my_depth >= depth[py * u_size.x + px])
-                imageStore(u_output, ivec2(px, py), col);
-        }
-    }
+    imageStore(u_output, ivec2(dst_x, dst_y), texture(u_colour, uv));
 }
 )";
 
@@ -259,7 +245,17 @@ void main() {
     if (src.x >= u_size.x || src.y >= u_size.y) return;
     float d = texelFetch(u_disparity, src, 0).r;
     if (d < 0.5) return;
-    float Z  = u_fx * u_baseline / d;
+    /* At disoccluded right-camera pixels the left disparity holds the foreground
+     * depth (the near object that blocks the view from the left camera).  Scan
+     * leftward to find the first pixel whose disparity is significantly smaller
+     * (= farther away = background) and use that depth instead. */
+    float d_use = d;
+    for (int i = 1; i <= 8; i++) {
+        int sx = max(src.x - i, 0);
+        float dl = texelFetch(u_disparity, ivec2(sx, src.y), 0).r;
+        if (dl > 0.5 && dl < d_use * 0.65) { d_use = dl; break; }
+    }
+    float Z  = u_fx * u_baseline / d_use;
     /* Right camera origin is +baseline in X relative to left camera. */
     float Xw = (float(src.x) - u_cx) * Z / u_fx + u_baseline;
     float Yw = (float(src.y) - u_cy) * Z / u_fy;
