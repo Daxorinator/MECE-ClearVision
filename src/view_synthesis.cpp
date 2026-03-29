@@ -232,7 +232,8 @@ precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 uniform sampler2D u_right_colour;
-uniform sampler2D u_disparity;
+uniform sampler2D u_disparity;      /* right-camera disparity (CPU-reprojected) */
+uniform sampler2D u_left_disp;      /* original left-camera disparity */
 uniform vec3 u_head_pos;
 uniform float u_fx, u_fy, u_cx, u_cy;
 uniform float u_baseline;
@@ -245,6 +246,13 @@ void main() {
     if (src.x >= u_size.x || src.y >= u_size.y) return;
     float d = texelFetch(u_disparity, src, 0).r;
     if (d < 0.5) return;
+    /* Disocclusion filter: only fill where the left camera sees foreground (high
+     * disparity) at this same pixel position but the right camera sees background
+     * (much lower disparity after hole fill).  Skips textureless/invalid areas
+     * where the left disparity is zero and skips same-world-point pixels where
+     * both cameras see the same depth. */
+    float d_left = texelFetch(u_left_disp, src, 0).r;
+    if (d_left < 0.5 || d >= d_left * 0.7) return;
     float Z  = u_fx * u_baseline / d;
     /* Right camera origin is +baseline in X relative to left camera. */
     float Xw = (float(src.x) - u_cx) * Z / u_fx + u_baseline;
@@ -502,7 +510,7 @@ private:
     GLint uloc_vwc_colour{-1}, uloc_vwc_head{-1}, uloc_vwc_fx{-1}, uloc_vwc_fy{-1};
     GLint uloc_vwc_cx{-1},     uloc_vwc_cy{-1},   uloc_vwc_size{-1};
 
-    GLint uloc_vwr_right{-1}, uloc_vwr_disp{-1}, uloc_vwr_head{-1};
+    GLint uloc_vwr_right{-1}, uloc_vwr_disp{-1}, uloc_vwr_ldisp{-1}, uloc_vwr_head{-1};
     GLint uloc_vwr_fx{-1},    uloc_vwr_fy{-1},   uloc_vwr_cx{-1};
     GLint uloc_vwr_cy{-1},    uloc_vwr_baseline{-1}, uloc_vwr_size{-1};
 
@@ -733,6 +741,7 @@ void SynthWindow::initializeGL()
 
     uloc_vwr_right    = glGetUniformLocation(prog_vwindow_right, "u_right_colour");
     uloc_vwr_disp     = glGetUniformLocation(prog_vwindow_right, "u_disparity");
+    uloc_vwr_ldisp    = glGetUniformLocation(prog_vwindow_right, "u_left_disp");
     uloc_vwr_head     = glGetUniformLocation(prog_vwindow_right, "u_head_pos");
     uloc_vwr_fx       = glGetUniformLocation(prog_vwindow_right, "u_fx");
     uloc_vwr_fy       = glGetUniformLocation(prog_vwindow_right, "u_fy");
@@ -977,7 +986,10 @@ void SynthWindow::paintGL()
     glUniform1i(uloc_vwr_right, 0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_right_disp);
-    glUniform1i(uloc_vwr_disp,     1);
+    glUniform1i(uloc_vwr_disp,  1);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
+    glUniform1i(uloc_vwr_ldisp, 2);
     glUniform3f(uloc_vwr_head,     head_x, head_y, head_z);
     glUniform1f(uloc_vwr_fx,       vfx);
     glUniform1f(uloc_vwr_fy,       vfy);
