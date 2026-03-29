@@ -490,10 +490,12 @@ private:
     cv::Mat m_left_rgba;
     cv::Mat m_right_rgba;
 
-    /* CUDA temporal filter */
+    /* Temporal IIR filter state */
     bool use_cuda{false};
     cv::cuda::GpuMat gpu_disp_float;
     cv::cuda::GpuMat disp_filtered_gpu;
+    cv::cuda::GpuMat disp_invalid_mask_gpu;  /* scratch for zero-decay fix */
+    cv::Mat          disp_filtered_cpu;       /* CPU fallback state */
     bool disp_filtered_init{false};
 
     /* Cached uniform locations */
@@ -821,9 +823,16 @@ void SynthWindow::paintGL()
     if (!oak_receiver.getFrame(oak_frame)) { update(); return; }
     if (oak_frame.left_rect.empty()) { update(); return; }
 
-    /* Convert disparity CV_16U subpixel (÷32) → CV_32F pixel disparity */
+    /* Speckle filter on raw CV_16U disparity — removes isolated false-match clusters
+     * before temporal filtering.  filterSpeckles requires CV_16SC1; OAK-D subpixel
+     * values are always positive so the reinterpret is safe. */
+    cv::Mat disp_s16;
+    oak_frame.disparity.convertTo(disp_s16, CV_16SC1);
+    cv::filterSpeckles(disp_s16, 0, 150, 16);
+
+    /* Convert disparity CV_16S subpixel (÷32) → CV_32F pixel disparity */
     cv::Mat disp_l_float;
-    oak_frame.disparity.convertTo(disp_l_float, CV_32F, 1.0f / 32.0f);
+    disp_s16.convertTo(disp_l_float, CV_32F, 1.0f / 32.0f);
 
     if (!diag_frames_logged) {
         printf("[DIAG] First frame: left=%dx%d  disp=%dx%d type=%d  proc=%dx%d  cuda=%d\n",
@@ -841,18 +850,41 @@ void SynthWindow::paintGL()
     }
     cv::resize(disp_l_float, disp_l_float, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
 
-    /* IIR temporal filter on disparity */
+    /* IIR temporal filter on disparity.
+     * Critical: do NOT blend invalid (zero) new pixels into the running state —
+     * that would decay valid depth values toward zero, growing holes over time.
+     * Where new disparity is zero, preserve the previous filtered value unchanged. */
+    const float alpha = 0.3f;
     if (use_cuda) {
-        const float alpha = 0.2f;
         gpu_disp_float.upload(disp_l_float);
         if (!disp_filtered_init || disp_filtered_gpu.size() != gpu_disp_float.size()) {
             gpu_disp_float.copyTo(disp_filtered_gpu);
             disp_filtered_init = true;
         } else {
-            cv::cuda::addWeighted(gpu_disp_float, alpha, disp_filtered_gpu, 1.0 - alpha,
-                                  0.0, disp_filtered_gpu);
+            cv::cuda::GpuMat blended;
+            cv::cuda::addWeighted(gpu_disp_float, alpha, disp_filtered_gpu, 1.0f - alpha,
+                                  0.0f, blended);
+            /* Restore previous state where new disparity is zero (invalid). */
+            cv::cuda::threshold(gpu_disp_float, disp_invalid_mask_gpu,
+                                0.5, 255.0, cv::THRESH_BINARY_INV);
+            disp_invalid_mask_gpu.convertTo(disp_invalid_mask_gpu, CV_8U);
+            disp_filtered_gpu.copyTo(blended, disp_invalid_mask_gpu);
+            blended.copyTo(disp_filtered_gpu);
         }
         disp_filtered_gpu.download(disp_l_float);
+    } else {
+        if (!disp_filtered_init || disp_filtered_cpu.size() != disp_l_float.size()) {
+            disp_l_float.copyTo(disp_filtered_cpu);
+            disp_filtered_init = true;
+        } else {
+            cv::Mat blended;
+            cv::addWeighted(disp_l_float, alpha, disp_filtered_cpu, 1.0f - alpha,
+                            0.0f, blended);
+            cv::Mat invalid = (disp_l_float == 0.0f);
+            disp_filtered_cpu.copyTo(blended, invalid);
+            blended.copyTo(disp_filtered_cpu);
+        }
+        disp_filtered_cpu.copyTo(disp_l_float);
     }
 
     /* Upload colour + disparity textures */

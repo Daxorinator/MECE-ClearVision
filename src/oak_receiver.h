@@ -76,5 +76,5 @@ private:
     std::mutex cfg_mtx_;
     bool       cfg_dirty_{false};
     bool       cfg_median_on_{true};
-    int        cfg_confidence_{200};
+    int        cfg_confidence_{230};
 };
