@@ -236,45 +236,6 @@ void main() {
 )";
 
 /* Right-eye disocclusion fill.
- * Iterates right-camera pixels: world X = (xr-cx)*Z/fx + baseline (right origin).
- * Projects to virtual view with the same head_pos.
- * Writes ONLY into holes (depth SSBO == 0) and marks them filled. */
-static const char *VWINDOW_RIGHT_CS = R"(#version 310 es
-precision highp float;
-layout(local_size_x = 16, local_size_y = 16) in;
-
-uniform sampler2D u_right_colour;
-uniform sampler2D u_disparity;
-uniform vec3 u_head_pos;
-uniform float u_fx, u_fy, u_cx, u_cy;
-uniform float u_baseline;
-uniform ivec2 u_size;
-layout(std430, binding = 0) buffer DepthBuffer { uint depth[]; };
-layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
-
-void main() {
-    ivec2 src = ivec2(gl_GlobalInvocationID.xy);
-    if (src.x >= u_size.x || src.y >= u_size.y) return;
-    float d = texelFetch(u_disparity, src, 0).r;
-    if (d < 0.5) return;
-    float Z  = u_fx * u_baseline / d;
-    /* Right camera origin is +baseline in X relative to left/RGB camera. */
-    float Xw = (float(src.x) - u_cx) * Z / u_fx + u_baseline;
-    float Yw = (float(src.y) - u_cy) * Z / u_fy;
-    vec3 P = vec3(Xw, Yw, Z) - u_head_pos;
-    if (P.z <= 0.0) return;
-    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
-    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    /* Only fill holes left by the left-eye pass. */
-    if (depth[dst_y * u_size.x + dst_x] != 0u) return;
-    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
-    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
-    imageStore(u_output, ivec2(dst_x, dst_y), texture(u_right_colour, uv));
-}
-)";
-
-/* Right-eye disocclusion fill.
  * Iterates over right-camera pixels (xr, yr).  Uses left disparity at (xr, yr)
  * as an approximation for the right-camera depth — valid because in mono mode
  * the disparity is left-aligned and disoccluded right-camera pixels lie where
