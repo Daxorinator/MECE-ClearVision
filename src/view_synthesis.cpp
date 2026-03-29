@@ -264,11 +264,10 @@ void main() {
     int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
     int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
     if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    /* Only fill holes left by the left-eye pass. */
-    if (depth[dst_y * u_size.x + dst_x] != 0u) return;
+    /* DEBUG: skip hole check, write solid red to see where right-eye projects */
+    // if (depth[dst_y * u_size.x + dst_x] != 0u) return;
     atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
-    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
-    imageStore(u_output, ivec2(dst_x, dst_y), texture(u_right_colour, uv));
+    imageStore(u_output, ivec2(dst_x, dst_y), vec4(1.0, 0.0, 0.0, 1.0));
 }
 )";
 
@@ -295,7 +294,12 @@ precision mediump float;
 in vec2 v_uv;
 out vec4 frag_color;
 uniform sampler2D u_texture;
-void main() { frag_color = texture(u_texture, v_uv); }
+void main() {
+    vec4 col = texture(u_texture, v_uv);
+    // DEBUG: show unfilled holes as magenta
+    if (col.a < 0.5) col = vec4(1.0, 0.0, 1.0, 1.0);
+    frag_color = col;
+}
 )";
 
 /* ========================================================================
