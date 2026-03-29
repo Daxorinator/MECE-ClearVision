@@ -823,6 +823,7 @@ void SynthWindow::paintGL()
 
     OAKFrame oak_frame;
     if (!oak_receiver.getFrame(oak_frame)) { update(); return; }
+    if (oak_frame.left_rect.empty()) { update(); return; }
 
     /* Convert disparity CV_16U subpixel (÷32) → CV_32F pixel disparity */
     cv::Mat disp_l_float;
