@@ -111,12 +111,20 @@ void main() {
     if (P.z <= 0.0) return;
     int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
     int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
+    uint d_val = floatBitsToUint(1.0 / P.z);
+    for (int dy = 0; dy <= 1; dy++) {
+        for (int dx = 0; dx <= 1; dx++) {
+            int px = dst_x + dx;
+            int py = dst_y + dy;
+            if (px < 0 || px >= u_size.x || py < 0 || py >= u_size.y) continue;
+            atomicMax(depth[py * u_size.x + px], d_val);
+        }
+    }
 }
 )";
 
-/* Writes colour for each world point that wins its depth bucket. */
+/* Writes colour for each world point that wins its depth bucket.
+ * Splatted to a 2×2 block to eliminate 1-pixel forward-warp cracks. */
 static const char *VWINDOW_COLOR_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -138,11 +146,17 @@ void main() {
     if (P.z <= 0.0) return;
     int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
     int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
     uint my_depth = floatBitsToUint(1.0 / P.z);
-    if (my_depth >= depth[dst_y * u_size.x + dst_x]) {
-        vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
-        imageStore(u_output, ivec2(dst_x, dst_y), texture(u_colour, uv));
+    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
+    vec4 col = texture(u_colour, uv);
+    for (int dy = 0; dy <= 1; dy++) {
+        for (int dx = 0; dx <= 1; dx++) {
+            int px = dst_x + dx;
+            int py = dst_y + dy;
+            if (px < 0 || px >= u_size.x || py < 0 || py >= u_size.y) continue;
+            if (my_depth >= depth[py * u_size.x + px])
+                imageStore(u_output, ivec2(px, py), col);
+        }
     }
 }
 )";
@@ -932,26 +946,6 @@ void SynthWindow::paintGL()
     glBindImageTexture(1, tex_output,     0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-
-    /* ---- Pass 3b: Right-eye disocclusion fill ---- */
-    glUseProgram(prog_vwindow_right);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex_right_color);
-    glUniform1i(uloc_vwr_right, 0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(uloc_vwr_disp,     1);
-    glUniform3f(uloc_vwr_head,     head_x, head_y, head_z);
-    glUniform1f(uloc_vwr_fx,       vfx);
-    glUniform1f(uloc_vwr_fy,       vfy);
-    glUniform1f(uloc_vwr_cx,       vcx);
-    glUniform1f(uloc_vwr_cy,       vcy);
-    glUniform1f(uloc_vwr_baseline, oak_receiver.baseline_m);
-    glUniform2i(uloc_vwr_size,     proc_w, proc_h);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
-    glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-    glDispatchCompute(groups_x, groups_y, 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
 
     /* ---- Pass 4: JFA hole fill ---- */
     GLuint display_tex = tex_output;
