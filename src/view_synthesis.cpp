@@ -56,8 +56,8 @@
  * Configuration
  * ======================================================================== */
 
-#define CAMERA_WIDTH        1280
-#define CAMERA_HEIGHT       720
+#define CAMERA_WIDTH        640
+#define CAMERA_HEIGHT       480
 #define FPS_WINDOW          24
 #define FPS_PRINT_INTERVAL  2.0
 #define FACE_CAM_INDEX      0
@@ -274,6 +274,47 @@ void main() {
 }
 )";
 
+/* Right-eye disocclusion fill.
+ * Iterates over right-camera pixels (xr, yr).  Uses left disparity at (xr, yr)
+ * as an approximation for the right-camera depth — valid because in mono mode
+ * the disparity is left-aligned and disoccluded right-camera pixels lie where
+ * the left camera sees background (same small disparity).
+ * Writes ONLY into holes (depth SSBO == 0) left by the left-eye pass. */
+static const char *VWINDOW_RIGHT_CS = R"(#version 310 es
+precision highp float;
+layout(local_size_x = 16, local_size_y = 16) in;
+
+uniform sampler2D u_right_colour;
+uniform sampler2D u_disparity;
+uniform vec3 u_head_pos;
+uniform float u_fx, u_fy, u_cx, u_cy;
+uniform float u_baseline;
+uniform ivec2 u_size;
+layout(std430, binding = 0) buffer DepthBuffer { uint depth[]; };
+layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
+
+void main() {
+    ivec2 src = ivec2(gl_GlobalInvocationID.xy);
+    if (src.x >= u_size.x || src.y >= u_size.y) return;
+    float d = texelFetch(u_disparity, src, 0).r;
+    if (d < 0.5) return;
+    float Z  = u_fx * u_baseline / d;
+    /* Right camera origin is +baseline in X relative to left camera. */
+    float Xw = (float(src.x) - u_cx) * Z / u_fx + u_baseline;
+    float Yw = (float(src.y) - u_cy) * Z / u_fy;
+    vec3 P = vec3(Xw, Yw, Z) - u_head_pos;
+    if (P.z <= 0.0) return;
+    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
+    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
+    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
+    /* Only fill holes left by the left-eye pass. */
+    if (depth[dst_y * u_size.x + dst_x] != 0u) return;
+    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
+    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
+    imageStore(u_output, ivec2(dst_x, dst_y), texture(u_right_colour, uv));
+}
+)";
+
 /* Zeroes the depth SSBO on the GPU — avoids uploading a multi-MB zero vector. */
 static const char *CLEAR_CS = R"(#version 310 es
 layout(local_size_x = 64) in;
@@ -449,7 +490,7 @@ private:
 
     bool use_hole_fill{true};
 
-    double proc_scale{0.5};
+    double proc_scale{1.0};
     int proc_w, proc_h;
 
     /* GL programs */
@@ -542,7 +583,8 @@ SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
         printf("No CUDA — CPU temporal filter fallback\n");
     }
 
-    oak_receiver.want_color      = true;
+    oak_receiver.want_color      = false;  /* use mono stereo images for correct coord frame */
+    oak_receiver.want_left_rect  = true;
     oak_receiver.want_right_rect = true;
     oak_receiver.start();
 
@@ -826,17 +868,17 @@ void SynthWindow::paintGL()
     oak_frame.disparity.convertTo(disp_l_float, CV_32F, 1.0f / 32.0f);
 
     if (!diag_frames_logged) {
-        printf("[DIAG] First frame: color=%dx%d  disp=%dx%d type=%d  proc=%dx%d  cuda=%d\n",
-               oak_frame.color.cols, oak_frame.color.rows,
+        printf("[DIAG] First frame: left=%dx%d  disp=%dx%d type=%d  proc=%dx%d  cuda=%d\n",
+               oak_frame.left_rect.cols, oak_frame.left_rect.rows,
                oak_frame.disparity.cols, oak_frame.disparity.rows,
                oak_frame.disparity.type(), proc_w, proc_h, use_cuda);
         diag_frames_logged = true;
     }
 
-    /* NV12 → RGBA, resize to processing resolution */
+    /* Grayscale rectified left → RGBA, resize to processing resolution */
     {
         cv::Mat rgba_full;
-        cv::cvtColor(oak_frame.color, rgba_full, cv::COLOR_YUV2RGBA_NV12);
+        cv::cvtColor(oak_frame.left_rect, rgba_full, cv::COLOR_GRAY2RGBA);
         cv::resize(rgba_full, m_left_rgba, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_LINEAR);
     }
     cv::resize(disp_l_float, disp_l_float, cv::Size(proc_w, proc_h), 0, 0, cv::INTER_AREA);
@@ -870,10 +912,12 @@ void SynthWindow::paintGL()
         cv::resize(oak_frame.right_rect, right_resized,
                    cv::Size(proc_w, proc_h), 0, 0, cv::INTER_LINEAR);
         cv::cvtColor(right_resized, m_right_rgba, cv::COLOR_GRAY2RGBA);
-        glBindTexture(GL_TEXTURE_2D, tex_right_color);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
-                        GL_RGBA, GL_UNSIGNED_BYTE, m_right_rgba.data);
+    } else {
+        m_right_rgba.setTo(0);
     }
+    glBindTexture(GL_TEXTURE_2D, tex_right_color);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+                    GL_RGBA, GL_UNSIGNED_BYTE, m_right_rgba.data);
 
     clearGPUBuffers();
 
@@ -946,6 +990,26 @@ void SynthWindow::paintGL()
     glBindImageTexture(1, tex_output,     0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+    /* ---- Pass 3b: Right-eye disocclusion fill ---- */
+    glUseProgram(prog_vwindow_right);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex_right_color);
+    glUniform1i(uloc_vwr_right, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
+    glUniform1i(uloc_vwr_disp,     1);
+    glUniform3f(uloc_vwr_head,     head_x, head_y, head_z);
+    glUniform1f(uloc_vwr_fx,       vfx);
+    glUniform1f(uloc_vwr_fy,       vfy);
+    glUniform1f(uloc_vwr_cx,       vcx);
+    glUniform1f(uloc_vwr_cy,       vcy);
+    glUniform1f(uloc_vwr_baseline, oak_receiver.baseline_m);
+    glUniform2i(uloc_vwr_size,     proc_w, proc_h);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
+    glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    glDispatchCompute(groups_x, groups_y, 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
 
     /* ---- Pass 4: JFA hole fill ---- */
     GLuint display_tex = tex_output;

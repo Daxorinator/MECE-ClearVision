@@ -10,15 +10,19 @@
 namespace dai { class Device; }
 
 // Frames received from the OAK-D Lite over USB.
-// disparity:   CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity
-// color:       CV_8UC1, NV12 layout — rows = height * 3/2, cols = width.
-//              ColorCamera::isp always outputs NV12; convert with cv::COLOR_YUV2RGBA_NV12.
-// right_rect:  CV_8UC1 grayscale rectified right image, native mono res (640×480).
-//              Available only when want_right_rect=true.  Used for disocclusion fill.
+// disparity:   CV_16U, subpixel 5-bit encoding — divide by 32.0 for pixel disparity.
+//              When want_color=true:  aligned to RGB camera, 1280×720.
+//              When want_color=false: aligned to left mono camera, 640×480.
+// color:       CV_8UC1, NV12 layout (want_color=true only).
+// left_rect:   CV_8UC1 grayscale rectified left  image, 640×480 (want_left_rect=true).
+// right_rect:  CV_8UC1 grayscale rectified right image, 640×480 (want_right_rect=true).
+//              In want_color=false mode left_rect/right_rect share the same coordinate
+//              frame as the disparity — use these for DIBR colour + disocclusion fill.
 // confidence:  CV_8U, 0 = maximum confidence (optional, may be empty)
 struct OAKFrame {
     cv::Mat disparity;
     cv::Mat color;
+    cv::Mat left_rect;
     cv::Mat right_rect;
     cv::Mat confidence;
     bool valid{false};
@@ -50,6 +54,7 @@ public:
     //   Adds ~18 MB/s USB bandwidth.  Used for right-eye disocclusion fill.
     // want_confidence=false: skips the confidence map stream.
     bool want_color{true};
+    bool want_left_rect{false};
     bool want_right_rect{false};
     bool want_confidence{false};
 

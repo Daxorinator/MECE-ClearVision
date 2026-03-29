@@ -33,6 +33,11 @@ bool OAKReceiver::start()
     xoutDisp->setStreamName("disparity");
     stereoDepth->disparity.link(xoutDisp->input);
 
+    if (want_left_rect) {
+        auto xoutRectL = pipeline.create<dai::node::XLinkOut>();
+        xoutRectL->setStreamName("rectifiedLeft");
+        stereoDepth->rectifiedLeft.link(xoutRectL->input);
+    }
     if (want_right_rect) {
         auto xoutRectR = pipeline.create<dai::node::XLinkOut>();
         xoutRectR->setStreamName("rectifiedRight");
@@ -119,8 +124,9 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
 {
     auto dispQueue   = device->getOutputQueue("disparity", 1, false);
     auto configQueue = device->getInputQueue("stereoConfig");
-    std::shared_ptr<dai::DataOutputQueue> colorQueue, confQueue, rectRQueue;
+    std::shared_ptr<dai::DataOutputQueue> colorQueue, confQueue, rectLQueue, rectRQueue;
     if (want_color)      colorQueue = device->getOutputQueue("color",          1, false);
+    if (want_left_rect)  rectLQueue = device->getOutputQueue("rectifiedLeft",  1, false);
     if (want_right_rect) rectRQueue = device->getOutputQueue("rectifiedRight", 1, false);
     if (want_confidence) confQueue  = device->getOutputQueue("confidence",     1, false);
 
@@ -151,8 +157,9 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
             auto f = colorQueue->tryGet<dai::ImgFrame>();
             if (f) lastColor = f;
         }
-        std::shared_ptr<dai::ImgFrame> confFrame, rectRFrame;
+        std::shared_ptr<dai::ImgFrame> confFrame, rectLFrame, rectRFrame;
         if (confQueue)  confFrame  = confQueue->tryGet<dai::ImgFrame>();
+        if (rectLQueue) rectLFrame = rectLQueue->tryGet<dai::ImgFrame>();
         if (rectRQueue) rectRFrame = rectRQueue->tryGet<dai::ImgFrame>();
 
         // Construct cv::Mat from raw frame data — avoids requiring DEPTHAI_OPENCV_SUPPORT.
@@ -170,6 +177,12 @@ void OAKReceiver::threadLoop(std::shared_ptr<dai::Device> device)
             int h = (int)lastColor->getHeight();
             cv::Mat nv12(h * 3 / 2, w, CV_8UC1, const_cast<uint8_t*>(d.data()));
             f.color = nv12.clone();
+        }
+        if (rectLFrame) {
+            auto &d = rectLFrame->getData();
+            cv::Mat tmp(rectLFrame->getHeight(), rectLFrame->getWidth(),
+                        CV_8UC1, const_cast<uint8_t*>(d.data()));
+            f.left_rect = tmp.clone();
         }
         if (rectRFrame) {
             auto &d = rectRFrame->getData();
