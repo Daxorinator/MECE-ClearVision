@@ -227,21 +227,23 @@ void FaceTracker::threadLoop()
         }
     }
 
-    /* Also look for a separate iris output (10 landmarks × 3 = 30 floats) */
-    int iris_idx   = -1;
-    size_t iris_bytes = 0;
+    /* Look for separate left/right iris outputs: 5 pts × 2 coords (x,y) = vol 10 each */
+    int left_iris_idx  = -1;
+    int right_iris_idx = -1;
     for (int i = 0; i < n_bindings; i++) {
         if (engine->bindingIsInput(i) || i == output_idx) continue;
         auto dims = engine->getBindingDimensions(i);
         size_t vol = 1;
         for (int d = 0; d < dims.nbDims; d++) vol *= (size_t)dims.d[d];
-        if (vol == 30) {   /* 10 iris landmarks × 3 coords */
-            iris_idx   = i;
-            iris_bytes = vol * sizeof(float);
-            printf("[FaceTracker] Found separate iris output at binding %d\n", i);
-            break;
+        if (vol == 10) {
+            std::string name = engine->getBindingName(i);
+            if (name.find("left")  != std::string::npos) left_iris_idx  = i;
+            if (name.find("right") != std::string::npos) right_iris_idx = i;
         }
     }
+    if (left_iris_idx >= 0 && right_iris_idx >= 0)
+        printf("[FaceTracker] Found iris outputs: left=binding%d right=binding%d\n",
+               left_iris_idx, right_iris_idx);
 
     if (input_idx < 0 || output_idx < 0 || n_landmarks < 1) {
         fprintf(stderr, "[FaceTracker] Unexpected model bindings — aborting\n");
@@ -250,9 +252,9 @@ void FaceTracker::threadLoop()
         return;
     }
 
-    if (n_landmarks < 478 && iris_idx < 0) {
-        fprintf(stderr, "[FaceTracker] WARNING: model has only %d landmarks and no "
-                "separate iris output — iris depth unavailable\n", n_landmarks);
+    if (n_landmarks < 478 && left_iris_idx < 0) {
+        fprintf(stderr, "[FaceTracker] WARNING: no iris outputs found — "
+                "iris depth unavailable\n");
     }
 
     /* Allocate GPU/CPU buffers */
@@ -269,9 +271,10 @@ void FaceTracker::threadLoop()
         cudaMalloc(&d_buffers[i], vol * sizeof(float));
     }
 
-    std::vector<float> h_input (input_bytes  / sizeof(float));
-    std::vector<float> h_output(output_bytes / sizeof(float));
-    std::vector<float> h_iris  (iris_idx >= 0 ? 30 : 0);
+    std::vector<float> h_input     (input_bytes  / sizeof(float));
+    std::vector<float> h_output   (output_bytes / sizeof(float));
+    std::vector<float> h_left_iris (10, 0.f);
+    std::vector<float> h_right_iris(10, 0.f);
 
     /* Diagnostic: print first few landmarks on first successful inference */
     bool first_infer = true;
@@ -350,8 +353,11 @@ void FaceTracker::threadLoop()
         context->executeV2(d_buffers);
         cudaMemcpy(h_output.data(), d_buffers[output_idx], output_bytes,
                    cudaMemcpyDeviceToHost);
-        if (iris_idx >= 0)
-            cudaMemcpy(h_iris.data(), d_buffers[iris_idx], iris_bytes,
+        if (left_iris_idx >= 0)
+            cudaMemcpy(h_left_iris.data(),  d_buffers[left_iris_idx],  10*sizeof(float),
+                       cudaMemcpyDeviceToHost);
+        if (right_iris_idx >= 0)
+            cudaMemcpy(h_right_iris.data(), d_buffers[right_iris_idx], 10*sizeof(float),
                        cudaMemcpyDeviceToHost);
 
         const float *lm = h_output.data();
@@ -380,28 +386,21 @@ void FaceTracker::threadLoop()
         /* (Not strictly required — proceed regardless for now.) */
 
         /* --- Iris depth estimation --- */
-        /* iris_lm points to either the separate iris output (indices 0-9)
-           or the tail of the face landmark array (indices 468-477). */
-        if (n_landmarks < 478 && iris_idx < 0) { ++frame_count; continue; }
+        if (n_landmarks < 478 && left_iris_idx < 0) { ++frame_count; continue; }
 
-        const float *iris_lm = (iris_idx >= 0) ? h_iris.data() : (lm + 468 * 3);
-        /* If separate iris output, coordinates are in crop-pixel space [0,192].
-           lm_scale was derived from face landmarks — apply same scale. */
-        /* Left iris: 0=center, 1=top, 2=right, 3=bottom, 4=left
-           Right iris: 5=center, 6=top, 7=right, 8=bottom, 9=left  */
-        auto lx = [&](int idx, int c){ return iris_lm[idx*3+c] * lm_scale; };
+        /* Separate iris outputs: 5 pts × 2 coords (x,y, stride=2) in crop-pixel space.
+           Packed fallback (478 lm): stride=3, left starts at 468, right at 473.
+           Point order: 0=center, 1=top, 2=right, 3=bottom, 4=left */
+        const float *l_iris = (left_iris_idx  >= 0) ? h_left_iris.data()  : (lm + 468*3);
+        const float *r_iris = (right_iris_idx >= 0) ? h_right_iris.data() : (lm + 473*3);
+        const int stride    = (left_iris_idx  >= 0) ? 2 : 3;
 
-        /* Separate iris output indices: 0=L_center,1=L_top,2=L_right,3=L_bottom,4=L_left
-                                         5=R_center,6=R_top,7=R_right,8=R_bottom,9=R_left
-           Packed (478 lm) indices:     468=L_center,469=L_top,470=L_right,471=L_bottom,472=L_left
-                                         473=R_center,...
-           We always offset by -468 when using separate output, so use local indices. */
-        int base = (iris_idx >= 0) ? 0 : 468;
-        auto ix = [&](int local, int c){ return lx(base + local, c); };
+        auto lix = [&](int pt, int c){ return l_iris[pt*stride+c] * lm_scale; };
+        auto rix = [&](int pt, int c){ return r_iris[pt*stride+c] * lm_scale; };
 
         /* Diameter of left iris (average horizontal + vertical span) */
-        float dh = std::hypot(ix(2,0)-ix(4,0), ix(2,1)-ix(4,1));
-        float dv = std::hypot(ix(1,0)-ix(3,0), ix(1,1)-ix(3,1));
+        float dh = std::hypot(lix(2,0)-lix(4,0), lix(2,1)-lix(4,1));
+        float dv = std::hypot(lix(1,0)-lix(3,0), lix(1,1)-lix(3,1));
         float diam_crop = (dh + dv) * 0.5f;
         if (diam_crop < 1.0f) { ++frame_count; continue; }   /* degenerate */
 
@@ -409,9 +408,9 @@ void FaceTracker::threadLoop()
         float crop_to_img  = (float)crop_rect.width / 192.0f;
         float iris_diam_px = diam_crop * crop_to_img;
 
-        /* Average of left (0) and right (5) iris centres */
-        float iris_cx = ((ix(0,0) + ix(5,0)) * 0.5f) * crop_to_img + crop_rect.x;
-        float iris_cy = ((ix(0,1) + ix(5,1)) * 0.5f) * crop_to_img + crop_rect.y;
+        /* Average of left and right iris centres */
+        float iris_cx = ((lix(0,0) + rix(0,0)) * 0.5f) * crop_to_img + crop_rect.x;
+        float iris_cy = ((lix(0,1) + rix(0,1)) * 0.5f) * crop_to_img + crop_rect.y;
 
         /* Depth from iris diameter */
         const float IRIS_DIAM_M = 0.01170f;
