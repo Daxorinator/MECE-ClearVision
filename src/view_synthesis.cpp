@@ -222,11 +222,11 @@ void main() {
 )";
 
 /* Right-eye disocclusion fill.
- * Iterates over right-camera pixels (xr, yr).  Uses left disparity at (xr, yr)
- * as an approximation for the right-camera depth — valid because in mono mode
- * the disparity is left-aligned and disoccluded right-camera pixels lie where
- * the left camera sees background (same small disparity).
- * Writes ONLY into holes (depth SSBO == 0) left by the left-eye pass. */
+ * Iterates over right-camera pixels (xr, yr) using a right-camera disparity map
+ * built on the CPU by reprojecting the left disparity (for each left pixel xl with
+ * disparity d, the same world point appears in the right camera at xr = xl - d).
+ * Disocclusion holes in the right disparity are pre-filled with background depth
+ * (right-to-left scan per row).  Writes ONLY into holes left by the left-eye pass. */
 static const char *VWINDOW_RIGHT_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -245,17 +245,7 @@ void main() {
     if (src.x >= u_size.x || src.y >= u_size.y) return;
     float d = texelFetch(u_disparity, src, 0).r;
     if (d < 0.5) return;
-    /* At disoccluded right-camera pixels the left disparity holds the foreground
-     * depth (the near object that blocks the view from the left camera).  Scan
-     * leftward to find the first pixel whose disparity is significantly smaller
-     * (= farther away = background) and use that depth instead. */
-    float d_use = d;
-    for (int i = 1; i <= 8; i++) {
-        int sx = max(src.x - i, 0);
-        float dl = texelFetch(u_disparity, ivec2(sx, src.y), 0).r;
-        if (dl > 0.5 && dl < d_use * 0.65) { d_use = dl; break; }
-    }
-    float Z  = u_fx * u_baseline / d_use;
+    float Z  = u_fx * u_baseline / d;
     /* Right camera origin is +baseline in X relative to left camera. */
     float Xw = (float(src.x) - u_cx) * Z / u_fx + u_baseline;
     float Yw = (float(src.y) - u_cy) * Z / u_fy;
@@ -264,10 +254,10 @@ void main() {
     int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
     int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
     if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    /* DEBUG: skip hole check, write solid red to see where right-eye projects */
-    // if (depth[dst_y * u_size.x + dst_x] != 0u) return;
+    if (depth[dst_y * u_size.x + dst_x] != 0u) return;
     atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
-    imageStore(u_output, ivec2(dst_x, dst_y), vec4(1.0, 0.0, 0.0, 1.0));
+    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
+    imageStore(u_output, ivec2(dst_x, dst_y), texture(u_right_colour, uv));
 }
 )";
 
@@ -294,12 +284,7 @@ precision mediump float;
 in vec2 v_uv;
 out vec4 frag_color;
 uniform sampler2D u_texture;
-void main() {
-    vec4 col = texture(u_texture, v_uv);
-    // DEBUG: show unfilled holes as magenta
-    if (col.a < 0.5) col = vec4(1.0, 0.0, 1.0, 1.0);
-    frag_color = col;
-}
+void main() { frag_color = texture(u_texture, v_uv); }
 )";
 
 /* ========================================================================
@@ -469,6 +454,7 @@ private:
     GLuint tex_left_color{0};   /* rgba8,   proc_w × proc_h — left colour input */
     GLuint tex_right_color{0};  /* rgba8,   proc_w × proc_h — right rect (gray→rgba) */
     GLuint tex_left_disp{0};    /* r32f,    proc_w × proc_h — disparity input */
+    GLuint tex_right_disp{0};   /* r32f,    proc_w × proc_h — right-camera disparity */
     GLuint tex_worldspace{0};   /* rgba32f, proc_w × proc_h — unprojected 3D */
     GLuint tex_output{0};       /* rgba8,   proc_w × proc_h — splat output */
     GLuint tex_filled{0};       /* rgba8,   proc_w × proc_h — JFA filled */
@@ -620,8 +606,8 @@ SynthWindow::~SynthWindow()
                        prog_jfa_init, prog_jfa, prog_jfa_gather,
                        prog_clear, prog_display };
     for (auto p : progs) if (p) glDeleteProgram(p);
-    GLuint textures[] = { tex_left_color, tex_right_color, tex_left_disp, tex_worldspace,
-                          tex_output, tex_filled, tex_jfa_a, tex_jfa_b };
+    GLuint textures[] = { tex_left_color, tex_right_color, tex_left_disp, tex_right_disp,
+                          tex_worldspace, tex_output, tex_filled, tex_jfa_a, tex_jfa_b };
     for (auto t : textures) if (t) glDeleteTextures(1, &t);
     if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
     if (quad_vbo)   glDeleteBuffers(1, &quad_vbo);
@@ -633,14 +619,15 @@ SynthWindow::~SynthWindow()
 
 void SynthWindow::recreateTextures()
 {
-    GLuint old_tex[] = { tex_left_color, tex_right_color, tex_left_disp, tex_worldspace,
-                         tex_output, tex_filled, tex_jfa_a, tex_jfa_b };
+    GLuint old_tex[] = { tex_left_color, tex_right_color, tex_left_disp, tex_right_disp,
+                         tex_worldspace, tex_output, tex_filled, tex_jfa_a, tex_jfa_b };
     for (auto t : old_tex) if (t) glDeleteTextures(1, &t);
     if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
 
     tex_left_color  = create_texture_rgba8  (proc_w, proc_h);
     tex_right_color = create_texture_rgba8  (proc_w, proc_h);
     tex_left_disp   = create_texture_r32f   (proc_w, proc_h);
+    tex_right_disp  = create_texture_r32f   (proc_w, proc_h);
     tex_worldspace  = create_texture_rgba32f(proc_w, proc_h);
     tex_output      = create_texture_rgba8  (proc_w, proc_h);
     tex_filled      = create_texture_rgba8  (proc_w, proc_h);
@@ -868,6 +855,36 @@ void SynthWindow::paintGL()
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
                     GL_RED, GL_FLOAT, disp_l_float.data);
 
+    /* Build right-camera disparity by reprojecting left disparity.
+     * For each left pixel (xl, y) with disparity d, the same world point appears
+     * in the right camera at xr = xl - d.  Take max disparity (nearest object wins)
+     * when multiple left pixels map to the same right pixel.
+     * Then fill disocclusion holes (d=0) by scanning right-to-left: the background
+     * depth that fills each hole is visible just to the right of the hole. */
+    cv::Mat right_disp_float = cv::Mat::zeros(proc_h, proc_w, CV_32F);
+    for (int y = 0; y < proc_h; y++) {
+        const float* src = disp_l_float.ptr<float>(y);
+        float*       dst = right_disp_float.ptr<float>(y);
+        for (int x = 0; x < proc_w; x++) {
+            float d = src[x];
+            if (d < 0.5f) continue;
+            int xr = (int)(x - d + 0.5f);
+            if (xr >= 0 && xr < proc_w && d > dst[xr])
+                dst[xr] = d;
+        }
+    }
+    for (int y = 0; y < proc_h; y++) {
+        float* row = right_disp_float.ptr<float>(y);
+        float fill = 0.0f;
+        for (int x = proc_w - 1; x >= 0; x--) {
+            if (row[x] > 0.5f) fill = row[x];
+            else if (fill > 0.5f) row[x] = fill;
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, tex_right_disp);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+                    GL_RED, GL_FLOAT, right_disp_float.data);
+
     /* Upload right rectified image (grayscale → RGBA, scaled to proc res) */
     if (!oak_frame.right_rect.empty()) {
         cv::Mat right_resized;
@@ -959,7 +976,7 @@ void SynthWindow::paintGL()
     glBindTexture(GL_TEXTURE_2D, tex_right_color);
     glUniform1i(uloc_vwr_right, 0);
     glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, tex_left_disp);
+    glBindTexture(GL_TEXTURE_2D, tex_right_disp);
     glUniform1i(uloc_vwr_disp,     1);
     glUniform3f(uloc_vwr_head,     head_x, head_y, head_z);
     glUniform1f(uloc_vwr_fx,       vfx);
