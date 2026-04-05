@@ -6,10 +6,8 @@
 #include <thread>
 
 #include <opencv2/core.hpp>
-#include <opencv2/objdetect.hpp>
 
-#define FT_DETECT_EVERY  15      // run Haar every N frames
-#define FT_SMOOTH        0.12f   // EMA alpha for head position smoothing
+#define FT_SMOOTH  0.12f   // EMA alpha for head position smoothing
 
 /*
  * Head position in the face-tracker camera's coordinate frame (metres).
@@ -18,7 +16,7 @@
  * z: depth    (positive = away from camera = toward screen)
  * valid: false until first successful iris detection
  *
- * Phase 5 note: x/y are relative to calibration reference.  z is absolute.
+ * x/y are relative to calibration reference.  z is absolute.
  * When mapping to OAK-D camera frame: negate x (cameras face opposite directions).
  */
 struct HeadPos {
@@ -27,10 +25,13 @@ struct HeadPos {
 };
 
 /*
- * FaceTracker — background thread that opens a USB webcam, detects faces
- * with a Haar cascade every FT_DETECT_EVERY frames, then runs a MediaPipe
+ * FaceTracker — background thread that opens a USB webcam and runs a MediaPipe
  * FaceMesh ONNX model (478 landmarks, iris indices 468–477) via TensorRT to
  * estimate the viewer's 3-D head position from iris diameter.
+ *
+ * On the first frame (or after losing the face) FaceMesh is run on the full
+ * frame.  After each successful inference the crop is updated from the iris
+ * position so subsequent frames use a tighter, face-centred input.
  *
  * Iris depth formula:  Z = IRIS_DIAM_M * focal_px / iris_diam_px
  * where IRIS_DIAM_M = 11.7 mm (average human iris).
@@ -46,11 +47,8 @@ public:
     FaceTracker()  = default;
     ~FaceTracker() { stop(); }
 
-    // cascade_path   : Haar frontalface XML (for face detection)
-    // facemesh_onnx  : path to face_landmark_with_attention.onnx (478 landmarks)
-    bool start(int camera_index,
-               const std::string &cascade_path,
-               const std::string &facemesh_onnx);
+    // facemesh_onnx : path to face_landmark_with_attention.onnx (478 landmarks)
+    bool start(int camera_index, const std::string &facemesh_onnx);
     void stop();
 
     // Store current iris position as the "looking straight ahead" reference.
@@ -64,7 +62,6 @@ public:
 private:
     void threadLoop();
 
-    cv::CascadeClassifier cascade_;
     std::string facemesh_onnx_;
 
     std::thread        worker_;
@@ -76,6 +73,5 @@ private:
     float   ref_iris_x_{0.f}, ref_iris_y_{0.f};
     bool    calibrated_{false};
 
-    int         camera_index_{0};
-    std::string cascade_path_;
+    int camera_index_{0};
 };

@@ -91,59 +91,91 @@ void main() {
 }
 )";
 
-/* Splats world-space points into the depth SSBO from the virtual head position.
- * Stores floatBitsToUint(1/Z_relative) — larger = closer, safe for atomicMax. */
+/* Splats world-space points into the depth SSBO via virtual-window ray projection.
+ * For each world point W, casts a ray from the viewer's head through W and finds
+ * where it intersects the physical display plane.  Maps intersection UV to the
+ * output texture (out_w × out_h) and stores 1/dist for atomicMax depth test. */
 static const char *VWINDOW_DEPTH_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba32f, binding = 0) readonly uniform highp image2D u_worldspace;
-uniform vec3 u_head_pos;
-uniform float u_fx, u_fy, u_cx, u_cy;
-uniform ivec2 u_size;
+uniform vec3  u_head_pos;
+uniform vec3  u_display_pos;
+uniform vec3  u_display_normal;   /* points from display toward scene */
+uniform vec3  u_display_right;    /* display +X direction in world space */
+uniform vec3  u_display_up;       /* display +Y direction in world space */
+uniform vec2  u_display_size_m;   /* (width_m, height_m) */
+uniform ivec2 u_src_size;         /* source texture dims (proc_w × proc_h) */
+uniform ivec2 u_out_size;         /* output texture dims (out_w × out_h) */
 layout(std430, binding = 0) buffer DepthBuffer { uint depth[]; };
 
 void main() {
     ivec2 src = ivec2(gl_GlobalInvocationID.xy);
-    if (src.x >= u_size.x || src.y >= u_size.y) return;
+    if (src.x >= u_src_size.x || src.y >= u_src_size.y) return;
     vec4 wp = imageLoad(u_worldspace, src);
     if (wp.w < 0.5) return;
-    vec3 P = wp.xyz - u_head_pos;
-    if (P.z <= 0.0) return;
-    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
-    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
+    vec3 W   = wp.xyz;
+    vec3 dir = normalize(W - u_head_pos);
+    float denom = dot(dir, u_display_normal);
+    if (abs(denom) < 1e-6) return;
+    float t = dot(u_display_pos - u_head_pos, u_display_normal) / denom;
+    if (t <= 0.0) return;
+    vec3 Q     = u_head_pos + t * dir;
+    vec3 Q_rel = Q - u_display_pos;
+    float u_coord = dot(Q_rel, u_display_right) / u_display_size_m.x + 0.5;
+    float v_coord = dot(Q_rel, u_display_up)    / u_display_size_m.y + 0.5;
+    if (u_coord < 0.0 || u_coord >= 1.0 || v_coord < 0.0 || v_coord >= 1.0) return;
+    int dst_x = int(u_coord * float(u_out_size.x));
+    int dst_y = int(v_coord * float(u_out_size.y));
+    if (dst_x < 0 || dst_x >= u_out_size.x || dst_y < 0 || dst_y >= u_out_size.y) return;
+    float dist = length(W - u_head_pos);
+    atomicMax(depth[dst_y * u_out_size.x + dst_x], floatBitsToUint(1.0 / dist));
 }
 )";
 
 /* Writes colour for each world point that wins its depth bucket.
- * Splatted to a 2×2 block to eliminate 1-pixel forward-warp cracks. */
+ * Uses virtual-window ray projection: same intersection math as VWINDOW_DEPTH_CS. */
 static const char *VWINDOW_COLOR_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(rgba32f, binding = 0) readonly uniform highp image2D u_worldspace;
 uniform sampler2D u_colour;
-uniform vec3 u_head_pos;
-uniform float u_fx, u_fy, u_cx, u_cy;
-uniform ivec2 u_size;
+uniform vec3  u_head_pos;
+uniform vec3  u_display_pos;
+uniform vec3  u_display_normal;
+uniform vec3  u_display_right;
+uniform vec3  u_display_up;
+uniform vec2  u_display_size_m;
+uniform ivec2 u_src_size;
+uniform ivec2 u_out_size;
 layout(std430, binding = 0) readonly buffer DepthBuffer { uint depth[]; };
 layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
 
 void main() {
     ivec2 src = ivec2(gl_GlobalInvocationID.xy);
-    if (src.x >= u_size.x || src.y >= u_size.y) return;
+    if (src.x >= u_src_size.x || src.y >= u_src_size.y) return;
     vec4 wp = imageLoad(u_worldspace, src);
     if (wp.w < 0.5) return;
-    vec3 P = wp.xyz - u_head_pos;
-    if (P.z <= 0.0) return;
-    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
-    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    uint my_depth = floatBitsToUint(1.0 / P.z);
-    if (my_depth < depth[dst_y * u_size.x + dst_x]) return;
-    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
+    vec3 W   = wp.xyz;
+    vec3 dir = normalize(W - u_head_pos);
+    float denom = dot(dir, u_display_normal);
+    if (abs(denom) < 1e-6) return;
+    float t = dot(u_display_pos - u_head_pos, u_display_normal) / denom;
+    if (t <= 0.0) return;
+    vec3 Q     = u_head_pos + t * dir;
+    vec3 Q_rel = Q - u_display_pos;
+    float u_coord = dot(Q_rel, u_display_right) / u_display_size_m.x + 0.5;
+    float v_coord = dot(Q_rel, u_display_up)    / u_display_size_m.y + 0.5;
+    if (u_coord < 0.0 || u_coord >= 1.0 || v_coord < 0.0 || v_coord >= 1.0) return;
+    int dst_x = int(u_coord * float(u_out_size.x));
+    int dst_y = int(v_coord * float(u_out_size.y));
+    if (dst_x < 0 || dst_x >= u_out_size.x || dst_y < 0 || dst_y >= u_out_size.y) return;
+    float dist     = length(W - u_head_pos);
+    uint  my_depth = floatBitsToUint(1.0 / dist);
+    if (my_depth < depth[dst_y * u_out_size.x + dst_x]) return;
+    vec2 uv = (vec2(src) + 0.5) / vec2(u_src_size);
     imageStore(u_output, ivec2(dst_x, dst_y), texture(u_colour, uv));
 }
 )";
@@ -223,11 +255,9 @@ void main() {
 )";
 
 /* Right-eye disocclusion fill.
- * Iterates over right-camera pixels (xr, yr) using a right-camera disparity map
- * built on the CPU by reprojecting the left disparity (for each left pixel xl with
- * disparity d, the same world point appears in the right camera at xr = xl - d).
- * Disocclusion holes in the right disparity are pre-filled with background depth
- * (right-to-left scan per row).  Writes ONLY into holes left by the left-eye pass. */
+ * Iterates over right-camera pixels using a CPU-reprojected right disparity map.
+ * Disocclusion filter ensures only true disocclusions (not textureless areas) are filled.
+ * Uses virtual-window ray projection to find display UV; writes only into holes. */
 static const char *VWINDOW_RIGHT_CS = R"(#version 310 es
 precision highp float;
 layout(local_size_x = 16, local_size_y = 16) in;
@@ -235,37 +265,50 @@ layout(local_size_x = 16, local_size_y = 16) in;
 uniform sampler2D u_right_colour;
 uniform sampler2D u_disparity;      /* right-camera disparity (CPU-reprojected) */
 uniform sampler2D u_left_disp;      /* original left-camera disparity */
-uniform vec3 u_head_pos;
+uniform vec3  u_head_pos;
 uniform float u_fx, u_fy, u_cx, u_cy;
 uniform float u_baseline;
-uniform ivec2 u_size;
+uniform vec3  u_display_pos;
+uniform vec3  u_display_normal;
+uniform vec3  u_display_right;
+uniform vec3  u_display_up;
+uniform vec2  u_display_size_m;
+uniform ivec2 u_src_size;
+uniform ivec2 u_out_size;
 layout(std430, binding = 0) buffer DepthBuffer { uint depth[]; };
 layout(rgba8, binding = 1) writeonly uniform highp image2D u_output;
 
 void main() {
     ivec2 src = ivec2(gl_GlobalInvocationID.xy);
-    if (src.x >= u_size.x || src.y >= u_size.y) return;
+    if (src.x >= u_src_size.x || src.y >= u_src_size.y) return;
     float d = texelFetch(u_disparity, src, 0).r;
     if (d < 0.5) return;
-    /* Disocclusion filter: only fill where the left camera sees foreground (high
-     * disparity) at this same pixel position but the right camera sees background
-     * (much lower disparity after hole fill).  Skips textureless/invalid areas
-     * where the left disparity is zero and skips same-world-point pixels where
-     * both cameras see the same depth. */
+    /* Disocclusion filter: skip textureless areas (d_left≈0) and same-world-point
+     * pixels where both cameras see the same surface depth. */
     float d_left = texelFetch(u_left_disp, src, 0).r;
     if (d_left < 0.5 || d >= d_left * 0.7) return;
     float Z  = u_fx * u_baseline / d;
     /* Right camera origin is +baseline in X relative to left camera. */
     float Xw = (float(src.x) - u_cx) * Z / u_fx + u_baseline;
     float Yw = (float(src.y) - u_cy) * Z / u_fy;
-    vec3 P = vec3(Xw, Yw, Z) - u_head_pos;
-    if (P.z <= 0.0) return;
-    int dst_x = int(u_fx * P.x / P.z + u_cx + 0.5);
-    int dst_y = int(u_fy * P.y / P.z + u_cy + 0.5);
-    if (dst_x < 0 || dst_x >= u_size.x || dst_y < 0 || dst_y >= u_size.y) return;
-    if (depth[dst_y * u_size.x + dst_x] != 0u) return;
-    atomicMax(depth[dst_y * u_size.x + dst_x], floatBitsToUint(1.0 / P.z));
-    vec2 uv = (vec2(src) + 0.5) / vec2(u_size);
+    vec3 W   = vec3(Xw, Yw, Z);
+    vec3 dir = normalize(W - u_head_pos);
+    float denom = dot(dir, u_display_normal);
+    if (abs(denom) < 1e-6) return;
+    float t = dot(u_display_pos - u_head_pos, u_display_normal) / denom;
+    if (t <= 0.0) return;
+    vec3 Q     = u_head_pos + t * dir;
+    vec3 Q_rel = Q - u_display_pos;
+    float u_coord = dot(Q_rel, u_display_right) / u_display_size_m.x + 0.5;
+    float v_coord = dot(Q_rel, u_display_up)    / u_display_size_m.y + 0.5;
+    if (u_coord < 0.0 || u_coord >= 1.0 || v_coord < 0.0 || v_coord >= 1.0) return;
+    int dst_x = int(u_coord * float(u_out_size.x));
+    int dst_y = int(v_coord * float(u_out_size.y));
+    if (dst_x < 0 || dst_x >= u_out_size.x || dst_y < 0 || dst_y >= u_out_size.y) return;
+    if (depth[dst_y * u_out_size.x + dst_x] != 0u) return;
+    float dist = length(W - u_head_pos);
+    atomicMax(depth[dst_y * u_out_size.x + dst_x], floatBitsToUint(1.0 / dist));
+    vec2 uv = (vec2(src) + 0.5) / vec2(u_src_size);
     imageStore(u_output, ivec2(dst_x, dst_y), texture(u_right_colour, uv));
 }
 )";
@@ -284,8 +327,9 @@ void main() {
 static const char *DISPLAY_VS = R"(#version 310 es
 layout(location = 0) in vec2 a_pos;
 layout(location = 1) in vec2 a_uv;
+uniform vec2 u_scale;   /* NDC scale to letterbox/pillarbox output to correct aspect */
 out vec2 v_uv;
-void main() { v_uv = a_uv; gl_Position = vec4(a_pos, 0.0, 1.0); }
+void main() { v_uv = a_uv; gl_Position = vec4(a_pos * u_scale, 0.0, 1.0); }
 )";
 
 static const char *DISPLAY_FS = R"(#version 310 es
@@ -448,6 +492,22 @@ private:
     double proc_scale{1.0};
     int proc_w, proc_h;
 
+    /* Physical display geometry — bench-test defaults.
+     * pos/normal/right/up in OAK-D world space (metres).
+     * display is 0.8 m in front of OAK-D; viewer (head) is at z≈0 (OAK-D position).
+     * normal points from display toward viewer (−Z in OAK-D frame). */
+    struct DisplayConfig {
+        float pos[3]     = {0.f, 0.f, 0.8f};
+        float normal[3]  = {0.f, 0.f,-1.f};   /* toward viewer */
+        float right_v[3] = {1.f, 0.f, 0.f};
+        float up_v[3]    = {0.f,-1.f, 0.f};   /* −Y = up in image coords */
+        float width_m    = 0.133f;             /* 480/1920 × 532 mm */
+        float height_m   = 0.300f;
+    } display_config;
+
+    int out_w{480};
+    int out_h{1080};
+
     /* GL programs */
     GLuint prog_unproject{0};
     GLuint prog_vwindow_depth{0};
@@ -465,10 +525,10 @@ private:
     GLuint tex_left_disp{0};    /* r32f,    proc_w × proc_h — disparity input */
     GLuint tex_right_disp{0};   /* r32f,    proc_w × proc_h — right-camera disparity */
     GLuint tex_worldspace{0};   /* rgba32f, proc_w × proc_h — unprojected 3D */
-    GLuint tex_output{0};       /* rgba8,   proc_w × proc_h — splat output */
-    GLuint tex_filled{0};       /* rgba8,   proc_w × proc_h — JFA filled */
-    GLuint tex_jfa_a{0};        /* r32i,    ping buffer (packed x|y<<16) */
-    GLuint tex_jfa_b{0};        /* r32i,    pong buffer (packed x|y<<16) */
+    GLuint tex_output{0};       /* rgba8,   out_w  × out_h  — virtual-window splat */
+    GLuint tex_filled{0};       /* rgba8,   out_w  × out_h  — JFA filled */
+    GLuint tex_jfa_a{0};        /* r32i,    out_w  × out_h  — JFA ping */
+    GLuint tex_jfa_b{0};        /* r32i,    out_w  × out_h  — JFA pong */
 
     GLuint ssbo_depth{0};
     GLuint quad_vao{0}, quad_vbo{0};
@@ -502,20 +562,34 @@ private:
     /* Cached uniform locations */
     GLint uloc_clear_total{-1};
     GLint uloc_disp_texture{-1};
+    GLint uloc_disp_scale{-1};      /* DISPLAY_VS: NDC scale for aspect-correct letterbox */
 
     GLint uloc_unproj_disp{-1}, uloc_unproj_fx{-1}, uloc_unproj_fy{-1};
     GLint uloc_unproj_cx{-1},   uloc_unproj_cy{-1}, uloc_unproj_baseline{-1};
     GLint uloc_unproj_size{-1};
 
-    GLint uloc_vwd_head{-1}, uloc_vwd_fx{-1}, uloc_vwd_fy{-1};
-    GLint uloc_vwd_cx{-1},   uloc_vwd_cy{-1}, uloc_vwd_size{-1};
+    /* VWINDOW_DEPTH_CS */
+    GLint uloc_vwd_head{-1};
+    GLint uloc_vwd_disp_pos{-1}, uloc_vwd_disp_normal{-1};
+    GLint uloc_vwd_disp_right{-1}, uloc_vwd_disp_up{-1};
+    GLint uloc_vwd_disp_size{-1};
+    GLint uloc_vwd_src_size{-1}, uloc_vwd_out_size{-1};
 
-    GLint uloc_vwc_colour{-1}, uloc_vwc_head{-1}, uloc_vwc_fx{-1}, uloc_vwc_fy{-1};
-    GLint uloc_vwc_cx{-1},     uloc_vwc_cy{-1},   uloc_vwc_size{-1};
+    /* VWINDOW_COLOR_CS */
+    GLint uloc_vwc_colour{-1}, uloc_vwc_head{-1};
+    GLint uloc_vwc_disp_pos{-1}, uloc_vwc_disp_normal{-1};
+    GLint uloc_vwc_disp_right{-1}, uloc_vwc_disp_up{-1};
+    GLint uloc_vwc_disp_size{-1};
+    GLint uloc_vwc_src_size{-1}, uloc_vwc_out_size{-1};
 
+    /* VWINDOW_RIGHT_CS */
     GLint uloc_vwr_right{-1}, uloc_vwr_disp{-1}, uloc_vwr_ldisp{-1}, uloc_vwr_head{-1};
     GLint uloc_vwr_fx{-1},    uloc_vwr_fy{-1},   uloc_vwr_cx{-1};
-    GLint uloc_vwr_cy{-1},    uloc_vwr_baseline{-1}, uloc_vwr_size{-1};
+    GLint uloc_vwr_cy{-1},    uloc_vwr_baseline{-1};
+    GLint uloc_vwr_disp_pos{-1}, uloc_vwr_disp_normal{-1};
+    GLint uloc_vwr_disp_right{-1}, uloc_vwr_disp_up{-1};
+    GLint uloc_vwr_disp_size{-1};
+    GLint uloc_vwr_src_size{-1}, uloc_vwr_out_size{-1};
 
     GLint uloc_jfai_size{-1};
     GLint uloc_jfa_step{-1}, uloc_jfa_size{-1};
@@ -551,6 +625,10 @@ SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
     printf("============================================================\n");
     printf("Resolution:      %dx%d\n", CAMERA_WIDTH, CAMERA_HEIGHT);
     printf("Processing:      %dx%d (%.0f%%)\n", proc_w, proc_h, proc_scale * 100.0);
+    printf("Output (display):%dx%d\n", out_w, out_h);
+    printf("Display size:    %.0f × %.0f mm @ (0,0,%.2fm)\n",
+           display_config.width_m * 1000.f, display_config.height_m * 1000.f,
+           display_config.pos[2]);
     printf("Hole filling:    %s\n", use_hole_fill ? "ON (JFA)" : "OFF");
     printf("============================================================\n");
     printf("\nControls:\n");
@@ -561,18 +639,7 @@ SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
     printf("  C     - Recalibrate face tracker (look straight ahead first)\n");
     printf("============================================================\n\n");
 
-    /* Face tracker */
-    const char *cascade_candidates[] = {
-        "haarcascade_frontalface_alt2.xml",
-        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
-        "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_alt2.xml",
-        "/usr/share/opencv/haarcascades/haarcascade_frontalface_alt2.xml",
-    };
-    std::string cascade_path;
-    for (const char *c : cascade_candidates) {
-        if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); cascade_path = c; break; }
-    }
-    /* Search for FaceMesh ONNX model */
+    /* Face tracker — search for FaceMesh ONNX model */
     const char *facemesh_candidates[] = {
         "face_landmark_with_attention.onnx",
         "../src/models/face_landmark_with_attention.onnx",
@@ -583,15 +650,13 @@ SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
         if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); facemesh_path = c; break; }
     }
 
-    if (cascade_path.empty()) {
-        printf("[FaceTracker] Haar cascade not found — face tracking disabled.\n");
-    } else if (facemesh_path.empty()) {
-        printf("[FaceTracker] FaceMesh ONNX model not found.\n");
+    if (facemesh_path.empty()) {
+        printf("[FaceTracker] FaceMesh ONNX model not found — face tracking disabled.\n");
         printf("  Run:  bash scripts/download_facemesh.sh\n");
         printf("  Then place face_landmark_with_attention.onnx in src/models/\n");
     } else {
         face_tracker = new FaceTracker();
-        if (face_tracker->start(FACE_CAM_INDEX, cascade_path, facemesh_path)) {
+        if (face_tracker->start(FACE_CAM_INDEX, facemesh_path)) {
             face_tracking_enabled = true;
             printf("[FaceTracker] Started on camera %d  model: %s\n",
                    FACE_CAM_INDEX, facemesh_path.c_str());
@@ -635,22 +700,25 @@ void SynthWindow::recreateTextures()
     for (auto t : old_tex) if (t) glDeleteTextures(1, &t);
     if (ssbo_depth) glDeleteBuffers(1, &ssbo_depth);
 
+    /* Source / processing textures — sized proc_w × proc_h */
     tex_left_color  = create_texture_rgba8  (proc_w, proc_h);
     tex_right_color = create_texture_rgba8  (proc_w, proc_h);
     tex_left_disp   = create_texture_r32f   (proc_w, proc_h);
     tex_right_disp  = create_texture_r32f   (proc_w, proc_h);
     tex_worldspace  = create_texture_rgba32f(proc_w, proc_h);
-    tex_output      = create_texture_rgba8  (proc_w, proc_h);
-    tex_filled      = create_texture_rgba8  (proc_w, proc_h);
-    tex_jfa_a       = create_texture_r32i  (proc_w, proc_h);
-    tex_jfa_b       = create_texture_r32i  (proc_w, proc_h);
-    ssbo_depth      = create_ssbo(proc_w * proc_h);
 
-    clear_black.assign(proc_w * proc_h * 4, 0);
+    /* Output / virtual-window textures — sized out_w × out_h (display strip) */
+    tex_output = create_texture_rgba8(out_w, out_h);
+    tex_filled = create_texture_rgba8(out_w, out_h);
+    tex_jfa_a  = create_texture_r32i (out_w, out_h);
+    tex_jfa_b  = create_texture_r32i (out_w, out_h);
+    ssbo_depth = create_ssbo(out_w * out_h);
+
+    clear_black.assign(out_w * out_h * 4, 0);
     m_left_rgba.create(proc_h, proc_w, CV_8UC4);
     m_right_rgba.create(proc_h, proc_w, CV_8UC4);
 
-    printf("GPU textures + SSBO created: %dx%d\n", proc_w, proc_h);
+    printf("GPU textures created: src %dx%d  out %dx%d\n", proc_w, proc_h, out_w, out_h);
 }
 
 /* ---- clear depth SSBO and output texture ---- */
@@ -658,13 +726,13 @@ void SynthWindow::recreateTextures()
 void SynthWindow::clearGPUBuffers()
 {
     glUseProgram(prog_clear);
-    glUniform1i(uloc_clear_total, proc_w * proc_h);
+    glUniform1i(uloc_clear_total, out_w * out_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
-    glDispatchCompute((proc_w * proc_h + 63) / 64, 1, 1);
+    glDispatchCompute((out_w * out_h + 63) / 64, 1, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
     glBindTexture(GL_TEXTURE_2D, tex_output);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, proc_w, proc_h,
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, out_w, out_h,
                     GL_RGBA, GL_UNSIGNED_BYTE, clear_black.data());
 }
 
@@ -718,6 +786,7 @@ void SynthWindow::initializeGL()
     /* Cache uniform locations */
     uloc_clear_total    = glGetUniformLocation(prog_clear,   "u_total");
     uloc_disp_texture   = glGetUniformLocation(prog_display, "u_texture");
+    uloc_disp_scale     = glGetUniformLocation(prog_display, "u_scale");
 
     uloc_unproj_disp     = glGetUniformLocation(prog_unproject, "u_disparity");
     uloc_unproj_fx       = glGetUniformLocation(prog_unproject, "u_fx");
@@ -727,31 +796,41 @@ void SynthWindow::initializeGL()
     uloc_unproj_baseline = glGetUniformLocation(prog_unproject, "u_baseline");
     uloc_unproj_size     = glGetUniformLocation(prog_unproject, "u_size");
 
-    uloc_vwd_head = glGetUniformLocation(prog_vwindow_depth, "u_head_pos");
-    uloc_vwd_fx   = glGetUniformLocation(prog_vwindow_depth, "u_fx");
-    uloc_vwd_fy   = glGetUniformLocation(prog_vwindow_depth, "u_fy");
-    uloc_vwd_cx   = glGetUniformLocation(prog_vwindow_depth, "u_cx");
-    uloc_vwd_cy   = glGetUniformLocation(prog_vwindow_depth, "u_cy");
-    uloc_vwd_size = glGetUniformLocation(prog_vwindow_depth, "u_size");
+    uloc_vwd_head         = glGetUniformLocation(prog_vwindow_depth, "u_head_pos");
+    uloc_vwd_disp_pos     = glGetUniformLocation(prog_vwindow_depth, "u_display_pos");
+    uloc_vwd_disp_normal  = glGetUniformLocation(prog_vwindow_depth, "u_display_normal");
+    uloc_vwd_disp_right   = glGetUniformLocation(prog_vwindow_depth, "u_display_right");
+    uloc_vwd_disp_up      = glGetUniformLocation(prog_vwindow_depth, "u_display_up");
+    uloc_vwd_disp_size    = glGetUniformLocation(prog_vwindow_depth, "u_display_size_m");
+    uloc_vwd_src_size     = glGetUniformLocation(prog_vwindow_depth, "u_src_size");
+    uloc_vwd_out_size     = glGetUniformLocation(prog_vwindow_depth, "u_out_size");
 
-    uloc_vwc_colour = glGetUniformLocation(prog_vwindow_color, "u_colour");
-    uloc_vwc_head   = glGetUniformLocation(prog_vwindow_color, "u_head_pos");
-    uloc_vwc_fx     = glGetUniformLocation(prog_vwindow_color, "u_fx");
-    uloc_vwc_fy     = glGetUniformLocation(prog_vwindow_color, "u_fy");
-    uloc_vwc_cx     = glGetUniformLocation(prog_vwindow_color, "u_cx");
-    uloc_vwc_cy     = glGetUniformLocation(prog_vwindow_color, "u_cy");
-    uloc_vwc_size   = glGetUniformLocation(prog_vwindow_color, "u_size");
+    uloc_vwc_colour       = glGetUniformLocation(prog_vwindow_color, "u_colour");
+    uloc_vwc_head         = glGetUniformLocation(prog_vwindow_color, "u_head_pos");
+    uloc_vwc_disp_pos     = glGetUniformLocation(prog_vwindow_color, "u_display_pos");
+    uloc_vwc_disp_normal  = glGetUniformLocation(prog_vwindow_color, "u_display_normal");
+    uloc_vwc_disp_right   = glGetUniformLocation(prog_vwindow_color, "u_display_right");
+    uloc_vwc_disp_up      = glGetUniformLocation(prog_vwindow_color, "u_display_up");
+    uloc_vwc_disp_size    = glGetUniformLocation(prog_vwindow_color, "u_display_size_m");
+    uloc_vwc_src_size     = glGetUniformLocation(prog_vwindow_color, "u_src_size");
+    uloc_vwc_out_size     = glGetUniformLocation(prog_vwindow_color, "u_out_size");
 
-    uloc_vwr_right    = glGetUniformLocation(prog_vwindow_right, "u_right_colour");
-    uloc_vwr_disp     = glGetUniformLocation(prog_vwindow_right, "u_disparity");
-    uloc_vwr_ldisp    = glGetUniformLocation(prog_vwindow_right, "u_left_disp");
-    uloc_vwr_head     = glGetUniformLocation(prog_vwindow_right, "u_head_pos");
-    uloc_vwr_fx       = glGetUniformLocation(prog_vwindow_right, "u_fx");
-    uloc_vwr_fy       = glGetUniformLocation(prog_vwindow_right, "u_fy");
-    uloc_vwr_cx       = glGetUniformLocation(prog_vwindow_right, "u_cx");
-    uloc_vwr_cy       = glGetUniformLocation(prog_vwindow_right, "u_cy");
-    uloc_vwr_baseline = glGetUniformLocation(prog_vwindow_right, "u_baseline");
-    uloc_vwr_size     = glGetUniformLocation(prog_vwindow_right, "u_size");
+    uloc_vwr_right        = glGetUniformLocation(prog_vwindow_right, "u_right_colour");
+    uloc_vwr_disp         = glGetUniformLocation(prog_vwindow_right, "u_disparity");
+    uloc_vwr_ldisp        = glGetUniformLocation(prog_vwindow_right, "u_left_disp");
+    uloc_vwr_head         = glGetUniformLocation(prog_vwindow_right, "u_head_pos");
+    uloc_vwr_fx           = glGetUniformLocation(prog_vwindow_right, "u_fx");
+    uloc_vwr_fy           = glGetUniformLocation(prog_vwindow_right, "u_fy");
+    uloc_vwr_cx           = glGetUniformLocation(prog_vwindow_right, "u_cx");
+    uloc_vwr_cy           = glGetUniformLocation(prog_vwindow_right, "u_cy");
+    uloc_vwr_baseline     = glGetUniformLocation(prog_vwindow_right, "u_baseline");
+    uloc_vwr_disp_pos     = glGetUniformLocation(prog_vwindow_right, "u_display_pos");
+    uloc_vwr_disp_normal  = glGetUniformLocation(prog_vwindow_right, "u_display_normal");
+    uloc_vwr_disp_right   = glGetUniformLocation(prog_vwindow_right, "u_display_right");
+    uloc_vwr_disp_up      = glGetUniformLocation(prog_vwindow_right, "u_display_up");
+    uloc_vwr_disp_size    = glGetUniformLocation(prog_vwindow_right, "u_display_size_m");
+    uloc_vwr_src_size     = glGetUniformLocation(prog_vwindow_right, "u_src_size");
+    uloc_vwr_out_size     = glGetUniformLocation(prog_vwindow_right, "u_out_size");
 
     uloc_jfai_size = glGetUniformLocation(prog_jfa_init,   "u_size");
     uloc_jfa_step  = glGetUniformLocation(prog_jfa,        "u_step");
@@ -964,8 +1043,12 @@ void SynthWindow::paintGL()
         }
     }
 
+    /* Source dispatch groups (proc_w × proc_h) — used for unproject + splat passes */
     GLuint groups_x = (proc_w + 15) / 16;
     GLuint groups_y = (proc_h + 15) / 16;
+    /* Output dispatch groups (out_w × out_h) — used for JFA passes */
+    GLuint out_groups_x = (out_w + 15) / 16;
+    GLuint out_groups_y = (out_h + 15) / 16;
 
     /* ---- Pass 1: Unproject disparity → world-space texture ---- */
     glUseProgram(prog_unproject);
@@ -982,30 +1065,34 @@ void SynthWindow::paintGL()
     glDispatchCompute(groups_x, groups_y, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
-    /* ---- Pass 2: Virtual window depth splat → SSBO ---- */
+    /* ---- Pass 2: Virtual-window depth splat → SSBO ---- */
     glUseProgram(prog_vwindow_depth);
-    glUniform3f(uloc_vwd_head,  head_x, head_y, head_z);
-    glUniform1f(uloc_vwd_fx,    vfx);
-    glUniform1f(uloc_vwd_fy,    vfy);
-    glUniform1f(uloc_vwd_cx,    vcx);
-    glUniform1f(uloc_vwd_cy,    vcy);
-    glUniform2i(uloc_vwd_size,  proc_w, proc_h);
+    glUniform3f (uloc_vwd_head,        head_x, head_y, head_z);
+    glUniform3fv(uloc_vwd_disp_pos,    1, display_config.pos);
+    glUniform3fv(uloc_vwd_disp_normal, 1, display_config.normal);
+    glUniform3fv(uloc_vwd_disp_right,  1, display_config.right_v);
+    glUniform3fv(uloc_vwd_disp_up,     1, display_config.up_v);
+    glUniform2f (uloc_vwd_disp_size,   display_config.width_m, display_config.height_m);
+    glUniform2i (uloc_vwd_src_size,    proc_w, proc_h);
+    glUniform2i (uloc_vwd_out_size,    out_w, out_h);
     glBindImageTexture(0, tex_worldspace, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA32F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glDispatchCompute(groups_x, groups_y, 1);
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-    /* ---- Pass 3: Virtual window colour splat → tex_output ---- */
+    /* ---- Pass 3: Virtual-window colour splat → tex_output ---- */
     glUseProgram(prog_vwindow_color);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_left_color);
-    glUniform1i(uloc_vwc_colour, 0);
-    glUniform3f(uloc_vwc_head,   head_x, head_y, head_z);
-    glUniform1f(uloc_vwc_fx,     vfx);
-    glUniform1f(uloc_vwc_fy,     vfy);
-    glUniform1f(uloc_vwc_cx,     vcx);
-    glUniform1f(uloc_vwc_cy,     vcy);
-    glUniform2i(uloc_vwc_size,   proc_w, proc_h);
+    glUniform1i (uloc_vwc_colour,       0);
+    glUniform3f (uloc_vwc_head,         head_x, head_y, head_z);
+    glUniform3fv(uloc_vwc_disp_pos,     1, display_config.pos);
+    glUniform3fv(uloc_vwc_disp_normal,  1, display_config.normal);
+    glUniform3fv(uloc_vwc_disp_right,   1, display_config.right_v);
+    glUniform3fv(uloc_vwc_disp_up,      1, display_config.up_v);
+    glUniform2f (uloc_vwc_disp_size,    display_config.width_m, display_config.height_m);
+    glUniform2i (uloc_vwc_src_size,     proc_w, proc_h);
+    glUniform2i (uloc_vwc_out_size,     out_w, out_h);
     glBindImageTexture(0, tex_worldspace, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA32F);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glBindImageTexture(1, tex_output,     0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
@@ -1016,40 +1103,46 @@ void SynthWindow::paintGL()
     glUseProgram(prog_vwindow_right);
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex_right_color);
-    glUniform1i(uloc_vwr_right, 0);
+    glUniform1i (uloc_vwr_right,        0);
     glActiveTexture(GL_TEXTURE1);
     glBindTexture(GL_TEXTURE_2D, tex_right_disp);
-    glUniform1i(uloc_vwr_disp,  1);
+    glUniform1i (uloc_vwr_disp,         1);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, tex_left_disp);
-    glUniform1i(uloc_vwr_ldisp, 2);
-    glUniform3f(uloc_vwr_head,     head_x, head_y, head_z);
-    glUniform1f(uloc_vwr_fx,       vfx);
-    glUniform1f(uloc_vwr_fy,       vfy);
-    glUniform1f(uloc_vwr_cx,       vcx);
-    glUniform1f(uloc_vwr_cy,       vcy);
-    glUniform1f(uloc_vwr_baseline, oak_receiver.baseline_m);
-    glUniform2i(uloc_vwr_size,     proc_w, proc_h);
+    glUniform1i (uloc_vwr_ldisp,        2);
+    glUniform3f (uloc_vwr_head,         head_x, head_y, head_z);
+    glUniform1f (uloc_vwr_fx,           vfx);
+    glUniform1f (uloc_vwr_fy,           vfy);
+    glUniform1f (uloc_vwr_cx,           vcx);
+    glUniform1f (uloc_vwr_cy,           vcy);
+    glUniform1f (uloc_vwr_baseline,     oak_receiver.baseline_m);
+    glUniform3fv(uloc_vwr_disp_pos,     1, display_config.pos);
+    glUniform3fv(uloc_vwr_disp_normal,  1, display_config.normal);
+    glUniform3fv(uloc_vwr_disp_right,   1, display_config.right_v);
+    glUniform3fv(uloc_vwr_disp_up,      1, display_config.up_v);
+    glUniform2f (uloc_vwr_disp_size,    display_config.width_m, display_config.height_m);
+    glUniform2i (uloc_vwr_src_size,     proc_w, proc_h);
+    glUniform2i (uloc_vwr_out_size,     out_w, out_h);
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
     glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     glDispatchCompute(groups_x, groups_y, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
 
-    /* ---- Pass 4: JFA hole fill ---- */
+    /* ---- Pass 4: JFA hole fill (operates on out_w × out_h) ---- */
     GLuint display_tex = tex_output;
     if (use_hole_fill) {
         /* Init seed image from depth SSBO */
         glUseProgram(prog_jfa_init);
-        glUniform2i(uloc_jfai_size, proc_w, proc_h);
+        glUniform2i(uloc_jfai_size, out_w, out_h);
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_depth);
         glBindImageTexture(0, tex_jfa_a, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32I);
-        glDispatchCompute(groups_x, groups_y, 1);
+        glDispatchCompute(out_groups_x, out_groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
         /* JFA passes — step halves each iteration */
         GLuint cur  = tex_jfa_a;
         GLuint next = tex_jfa_b;
-        int max_dim = std::max(proc_w, proc_h);
+        int max_dim = std::max(out_w, out_h);
         int step = 1;
         while (step < max_dim) step <<= 1;
         step >>= 1;
@@ -1057,10 +1150,10 @@ void SynthWindow::paintGL()
         while (step >= 1) {
             glUseProgram(prog_jfa);
             glUniform1i(uloc_jfa_step, step);
-            glUniform2i(uloc_jfa_size, proc_w, proc_h);
+            glUniform2i(uloc_jfa_size, out_w, out_h);
             glBindImageTexture(0, cur,  0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32I);
             glBindImageTexture(1, next, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_R32I);
-            glDispatchCompute(groups_x, groups_y, 1);
+            glDispatchCompute(out_groups_x, out_groups_y, 1);
             glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
             std::swap(cur, next);
             step >>= 1;
@@ -1068,26 +1161,44 @@ void SynthWindow::paintGL()
 
         /* Gather: copy nearest-seed colour into tex_filled */
         glUseProgram(prog_jfa_gather);
-        glUniform2i(uloc_jfag_size, proc_w, proc_h);
+        glUniform2i(uloc_jfag_size, out_w, out_h);
         glBindImageTexture(0, cur,        0, GL_FALSE, 0, GL_READ_ONLY,  GL_R32I);
         glBindImageTexture(1, tex_output, 0, GL_FALSE, 0, GL_READ_ONLY,  GL_RGBA8);
         glBindImageTexture(2, tex_filled, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
-        glDispatchCompute(groups_x, groups_y, 1);
+        glDispatchCompute(out_groups_x, out_groups_y, 1);
         glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 
         display_tex = tex_filled;
     }
 
-    /* ---- Render fullscreen quad ---- */
-    glViewport(0, 0, width(), height());
-    glClear(GL_COLOR_BUFFER_BIT);
-    glUseProgram(prog_display);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, display_tex);
-    glUniform1i(uloc_disp_texture, 0);
-    glBindVertexArray(quad_vao);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glBindVertexArray(0);
+    /* ---- Render output texture letterboxed in the Qt window.
+     * Output is out_w × out_h (e.g. 480×1080, A-pillar strip aspect).
+     * Scale the unit quad so it fills the correct fraction of the window
+     * without stretching — pillarbox or letterbox as needed. ---- */
+    {
+        float tex_aspect = (float)out_w / (float)out_h;
+        float win_aspect = (float)width() / (float)height();
+        float sx, sy;
+        if (tex_aspect < win_aspect) {
+            /* Pillarbox: texture narrower than window — fill height, pad sides */
+            sx = tex_aspect / win_aspect;
+            sy = 1.0f;
+        } else {
+            /* Letterbox: texture wider than window — fill width, pad top/bottom */
+            sx = 1.0f;
+            sy = win_aspect / tex_aspect;
+        }
+        glViewport(0, 0, width(), height());
+        glClear(GL_COLOR_BUFFER_BIT);
+        glUseProgram(prog_display);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, display_tex);
+        glUniform1i(uloc_disp_texture, 0);
+        glUniform2f(uloc_disp_scale, sx, sy);
+        glBindVertexArray(quad_vao);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        glBindVertexArray(0);
+    }
 
     /* ---- FPS overlay ---- */
     auto now = std::chrono::steady_clock::now();
@@ -1143,7 +1254,7 @@ int main(int argc, char *argv[])
 
     QApplication app(argc, argv);
     SynthWindow win;
-    win.resize(960, 540);
+    win.resize(1920, 1080);
     win.show();
     return app.exec();
 }

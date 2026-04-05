@@ -13,6 +13,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
+#include <opencv2/core.hpp>
 
 /* ========================================================================
  * TensorRT helpers
@@ -102,12 +103,9 @@ static nvinfer1::ICudaEngine *load_or_build_engine(const std::string &onnx_path)
  * Public API
  * ======================================================================== */
 
-bool FaceTracker::start(int camera_index,
-                        const std::string &cascade_path,
-                        const std::string &facemesh_onnx)
+bool FaceTracker::start(int camera_index, const std::string &facemesh_onnx)
 {
     camera_index_  = camera_index;
-    cascade_path_  = cascade_path;
     facemesh_onnx_ = facemesh_onnx;
     running_       = true;
     worker_        = std::thread(&FaceTracker::threadLoop, this);
@@ -146,14 +144,6 @@ bool FaceTracker::isActive() const { return active_.load(); }
 
 void FaceTracker::threadLoop()
 {
-    /* ---- Load Haar cascade ---- */
-    if (!cascade_.load(cascade_path_)) {
-        fprintf(stderr, "[FaceTracker] Failed to load cascade: %s\n",
-                cascade_path_.c_str());
-        running_ = false;
-        return;
-    }
-
     /* ---- Open webcam via GStreamer ---- */
     const char *pipeline_fmt =
         "v4l2src device=/dev/video%d"
@@ -281,56 +271,28 @@ void FaceTracker::threadLoop()
 
     /* ---- Main loop ---- */
     cv::Mat frame, face_crop_rgb;
-    cv::Rect last_bbox;
-    bool bbox_valid  = false;
+    cv::Rect crop_rect;
+    bool crop_valid  = false;
     int  frame_count = 0;
 
     while (running_.load()) {
         cap >> frame;
         if (frame.empty()) continue;
 
-        const bool do_detect = (!bbox_valid) || (frame_count % FT_DETECT_EVERY == 0);
-
-        /* --- Face detection --- */
-        if (do_detect) {
-            cv::Mat gray;
-            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-            cv::Mat small;
-            cv::resize(gray, small, cv::Size(320, 240), 0, 0, cv::INTER_NEAREST);
-
-            std::vector<cv::Rect> faces;
-            cascade_.detectMultiScale(small, faces, 1.1, 3, 0, cv::Size(30, 30));
-
-            if (!faces.empty()) {
-                /* Largest face in 320×240 space → scale to full-res */
-                auto &best = *std::max_element(faces.begin(), faces.end(),
-                    [](const cv::Rect &a, const cv::Rect &b){ return a.area()<b.area(); });
-                float sx = (float)fw / 320.f;
-                float sy = (float)fh / 240.f;
-                last_bbox = cv::Rect(
-                    (int)(best.x * sx), (int)(best.y * sy),
-                    (int)(best.width * sx), (int)(best.height * sy))
-                    & cv::Rect(0, 0, fw, fh);
-                bbox_valid = true;
-            } else {
-                bbox_valid = false;
-            }
+        /* --- Determine crop for this frame ---
+         * On the first frame, or after losing the face, run FaceMesh on the
+         * full frame (as a square centre crop).  After each successful iris
+         * detection the crop is updated from the iris position so subsequent
+         * frames use a tighter, face-centred input. */
+        if (!crop_valid) {
+            int size = std::min(fw, fh);
+            crop_rect = cv::Rect((fw - size) / 2, (fh - size) / 2, size, size);
         }
 
-        if (!bbox_valid) { ++frame_count; continue; }
-
-        /* --- Build square crop with 30% padding --- */
-        int size = std::max(last_bbox.width, last_bbox.height);
-        int pad  = size / 3;
-        size += 2 * pad;
-        int cx = last_bbox.x + last_bbox.width  / 2;
-        int cy = last_bbox.y + last_bbox.height / 2;
-        cv::Rect crop_rect(cx - size/2, cy - size/2, size, size);
-        crop_rect &= cv::Rect(0, 0, fw, fh);
         if (crop_rect.width < 32 || crop_rect.height < 32) { ++frame_count; continue; }
 
         /* --- Preprocess to 192×192 RGB float [0,1] --- */
-        cv::Mat crop = frame(crop_rect);
+        cv::Mat crop = frame(crop_rect &= cv::Rect(0, 0, fw, fh));
         cv::resize(crop, face_crop_rgb, cv::Size(192, 192), 0, 0, cv::INTER_LINEAR);
         cv::cvtColor(face_crop_rgb, face_crop_rgb, cv::COLOR_BGR2RGB);
         face_crop_rgb.convertTo(face_crop_rgb, CV_32FC3, 1.0 / 255.0);
@@ -386,7 +348,7 @@ void FaceTracker::threadLoop()
         /* (Not strictly required — proceed regardless for now.) */
 
         /* --- Iris depth estimation --- */
-        if (n_landmarks < 478 && left_iris_idx < 0) { ++frame_count; continue; }
+        if (n_landmarks < 478 && left_iris_idx < 0) { crop_valid = false; ++frame_count; continue; }
 
         /* Separate iris outputs: 5 pts × 2 coords (x,y, stride=2) in crop-pixel space.
            Packed fallback (478 lm): stride=3, left starts at 468, right at 473.
@@ -402,7 +364,7 @@ void FaceTracker::threadLoop()
         float dh = std::hypot(lix(2,0)-lix(4,0), lix(2,1)-lix(4,1));
         float dv = std::hypot(lix(1,0)-lix(3,0), lix(1,1)-lix(3,1));
         float diam_crop = (dh + dv) * 0.5f;
-        if (diam_crop < 1.0f) { ++frame_count; continue; }   /* degenerate */
+        if (diam_crop < 1.0f) { crop_valid = false; ++frame_count; continue; }   /* degenerate — retry from full frame */
 
         /* Scale to original image pixels */
         float crop_to_img  = (float)crop_rect.width / 192.0f;
@@ -411,6 +373,14 @@ void FaceTracker::threadLoop()
         /* Average of left and right iris centres */
         float iris_cx = ((lix(0,0) + rix(0,0)) * 0.5f) * crop_to_img + crop_rect.x;
         float iris_cy = ((lix(0,1) + rix(0,1)) * 0.5f) * crop_to_img + crop_rect.y;
+
+        /* Update crop for next frame — centred on the iris, sized ~6× iris diameter */
+        {
+            int crop_size = std::max((int)(iris_diam_px * 6.0f), 64);
+            int ix = (int)iris_cx, iy = (int)iris_cy;
+            crop_rect  = cv::Rect(ix - crop_size/2, iy - crop_size/2, crop_size, crop_size);
+            crop_valid = true;
+        }
 
         /* Depth from iris diameter */
         const float IRIS_DIAM_M = 0.01170f;
