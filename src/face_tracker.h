@@ -56,6 +56,7 @@ public:
     // True once the TRT engine is loaded and the first detection has fired.
     bool isActive() const;
 
+
 private:
     void threadLoop();
 

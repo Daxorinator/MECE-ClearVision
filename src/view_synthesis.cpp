@@ -1038,7 +1038,7 @@ void SynthWindow::paintGL()
         if (hp.valid) {
             head_x = -hp.x;
             head_y =  hp.y;
-            head_z =  0.0f;  /* z offset from display plane deferred to Phase 6 */
+            head_z =  hp.z;
         }
     }
 
@@ -1216,12 +1216,13 @@ void SynthWindow::paintGL()
     painter.setFont(font);
     char info[320];
     snprintf(info, sizeof(info),
-             "FPS: %.1f | Hole=%s | %dx%d | Track:%s hx=%.1fcm",
+             "FPS: %.1f | Hole=%s | %dx%d | Track:%s hx=%.1fcm hZ=%.2fm",
              current_fps,
              use_hole_fill ? "JFA" : "OFF",
              proc_w, proc_h,
              (face_tracking_enabled && face_tracker && face_tracker->isActive()) ? "ON" : "OFF",
-             head_x * 100.0f);
+             head_x * 100.0f,
+             head_z);
     painter.setPen(Qt::black); painter.drawText(12, 32, info);
     painter.setPen(Qt::white); painter.drawText(10, 30, info);
     painter.end();
