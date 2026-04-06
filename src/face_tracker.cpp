@@ -310,19 +310,36 @@ void FaceTracker::threadLoop()
         if (frame.empty()) continue;
 
         /* --- Determine crop for this frame ---
-         * On the first frame, or after losing the face, run FaceMesh on the
-         * full frame (as a square centre crop).  After each successful iris
-         * detection the crop is updated from the iris position so subsequent
-         * frames use a tighter, face-centred input. */
+         * Re-detection: use a square that spans the FULL frame width so a face
+         * anywhere in the image is found — not just the centre.
+         * Tracking: use the tight crop from last iris position. */
         if (!crop_valid) {
-            int size = std::min(fw, fh);
+            int size = std::max(fw, fh);
             crop_rect = cv::Rect((fw - size) / 2, (fh - size) / 2, size, size);
         }
 
         if (crop_rect.width < 32 || crop_rect.height < 32) { ++frame_count; continue; }
 
+        /* --- Extract crop with black padding for out-of-bounds regions.
+         * Do NOT use &= to clip crop_rect — that would corrupt crop_to_img and
+         * the iris coordinate mapping when the face is near a frame edge. --- */
+        cv::Mat crop;
+        {
+            int pad_top    = std::max(0, -crop_rect.y);
+            int pad_bottom = std::max(0, crop_rect.y + crop_rect.height - fh);
+            int pad_left   = std::max(0, -crop_rect.x);
+            int pad_right  = std::max(0, crop_rect.x + crop_rect.width  - fw);
+            cv::Rect actual = crop_rect & cv::Rect(0, 0, fw, fh);
+            cv::Mat  raw    = frame(actual);
+            if (pad_top || pad_bottom || pad_left || pad_right)
+                cv::copyMakeBorder(raw, crop, pad_top, pad_bottom,
+                                   pad_left, pad_right,
+                                   cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            else
+                crop = raw;
+        }
+
         /* --- Preprocess to 192×192 RGB float [0,1] --- */
-        cv::Mat crop = frame(crop_rect &= cv::Rect(0, 0, fw, fh));
         cv::resize(crop, face_crop_rgb, cv::Size(192, 192), 0, 0, cv::INTER_LINEAR);
         cv::cvtColor(face_crop_rgb, face_crop_rgb, cv::COLOR_BGR2RGB);
         face_crop_rgb.convertTo(face_crop_rgb, CV_32FC3, 1.0 / 255.0);
