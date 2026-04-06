@@ -165,9 +165,15 @@ void FaceTracker::threadLoop()
     const float focal_px = fw / (2.0f * std::tan(35.0f * M_PI / 180.0f));
     const float cam_cx   = fw * 0.5f;
     const float cam_cy   = fh * 0.5f;
-    /* Scale from 192×192 model space back to full-frame pixels */
-    const float scale_x  = (float)fw / 192.0f;
-    const float scale_y  = (float)fh / 192.0f;
+
+    /* Letterbox: pad the shorter dimension so we feed a square to FaceMesh.
+     * This preserves aspect ratio — no squishing.
+     * pad_x / pad_y are the black border widths (in original frame pixels)
+     * added on each side.  The square side length is sq. */
+    const int   sq     = std::max(fw, fh);
+    const int   pad_x  = (sq - fw) / 2;   // left/right black border in frame px
+    const int   pad_y  = (sq - fh) / 2;   // top/bottom black border in frame px
+    const float scale  = (float)sq / 192.0f;   // 192-space → frame pixels (uniform)
 
     /* ---- Load / build TRT engine ---- */
     auto *engine = load_or_build_engine(facemesh_onnx_);
@@ -230,16 +236,20 @@ void FaceTracker::threadLoop()
     std::vector<float> h_output(output_bytes / sizeof(float));
     std::vector<float> h_left_iris(10, 0.f), h_right_iris(10, 0.f);
 
-    /* ---- Main loop: resize full frame → 192×192 → infer ---- */
-    cv::Mat frame, resized;
+    /* ---- Main loop: letterbox → 192×192 → infer ---- */
+    cv::Mat frame, squared, resized;
     int frame_count = 0;
 
     while (running_.load()) {
         cap >> frame;
         if (frame.empty()) continue;
 
-        /* Resize the full frame to 192×192 and normalise */
-        cv::resize(frame, resized, cv::Size(192, 192));
+        /* Letterbox to sq×sq (pad shorter axis with black), then resize to
+         * 192×192.  This keeps the face's aspect ratio intact. */
+        cv::copyMakeBorder(frame, squared,
+                           pad_y, pad_y, pad_x, pad_x,
+                           cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+        cv::resize(squared, resized, cv::Size(192, 192));
         cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
         resized.convertTo(resized, CV_32FC3, 1.0 / 255.0);
 
@@ -293,18 +303,18 @@ void FaceTracker::threadLoop()
         auto lix = [&](int pt, int c){ return l_iris[pt*stride+c] * lm_scale; };
         auto rix = [&](int pt, int c){ return r_iris[pt*stride+c] * lm_scale; };
 
-        /* Iris diameter in 192-space, then scale back to real frame pixels.
-         * Use per-axis scale to correct for the non-square resize. */
+        /* Iris diameter in 192-space → real frame pixels.
+         * The resize was square (sq×sq → 192×192) so scale is uniform. */
         float dh_192 = std::hypot(lix(2,0)-lix(4,0), lix(2,1)-lix(4,1));
         float dv_192 = std::hypot(lix(1,0)-lix(3,0), lix(1,1)-lix(3,1));
         float diam_192 = (dh_192 + dv_192) * 0.5f;
         if (diam_192 < 1.0f) { ++frame_count; continue; }
 
-        float iris_diam_px = (dh_192 * scale_x + dv_192 * scale_y) * 0.5f;
+        float iris_diam_px = diam_192 * scale;
 
-        /* Iris centre averaged across both eyes */
-        float iris_cx = ((lix(0,0) + rix(0,0)) * 0.5f) * scale_x;
-        float iris_cy = ((lix(0,1) + rix(0,1)) * 0.5f) * scale_y;
+        /* Iris centre: 192-space → sq-space → frame pixels (subtract padding) */
+        float iris_cx = ((lix(0,0) + rix(0,0)) * 0.5f) * scale - pad_x;
+        float iris_cy = ((lix(0,1) + rix(0,1)) * 0.5f) * scale - pad_y;
 
         const float IRIS_DIAM_M = 0.01170f;
         float Z     = IRIS_DIAM_M * focal_px / iris_diam_px;
