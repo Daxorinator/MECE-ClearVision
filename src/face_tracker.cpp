@@ -15,6 +15,7 @@
 #include <opencv2/videoio.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/objdetect.hpp>
+#include <opencv2/imgcodecs.hpp>
 
 /* ========================================================================
  * TensorRT helpers
@@ -93,12 +94,10 @@ static nvinfer1::ICudaEngine *load_or_build_engine(const std::string &onnx_path)
  * Public API
  * ======================================================================== */
 
-bool FaceTracker::start(int camera_index, const std::string &facemesh_onnx,
-                        const std::string &yunet_onnx)
+bool FaceTracker::start(int camera_index, const std::string &facemesh_onnx)
 {
     camera_index_  = camera_index;
     facemesh_onnx_ = facemesh_onnx;
-    yunet_onnx_    = yunet_onnx;
     running_       = true;
     worker_        = std::thread(&FaceTracker::threadLoop, this);
     return true;
@@ -230,28 +229,57 @@ void FaceTracker::threadLoop()
     std::vector<float> h_output(output_bytes / sizeof(float));
     std::vector<float> h_left_iris(10, 0.f), h_right_iris(10, 0.f);
 
-    /* ---- YuNet face detector ---- */
-    auto detector = cv::FaceDetectorYN::create(yunet_onnx_, "", cv::Size(fw, fh),
-                                               0.6f, 0.3f, 5000);
-    printf("[FaceTracker] YuNet detector ready  input=%dx%d\n", fw, fh);
+    /* ---- Haar cascade face detector ---- */
+    cv::CascadeClassifier cascade;
+    const char *cascade_candidates[] = {
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+        "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",
+        "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+        "/usr/local/share/OpenCV/haarcascades/haarcascade_frontalface_default.xml",
+    };
+    for (const char *p : cascade_candidates) {
+        if (cascade.load(p)) {
+            printf("[FaceTracker] Haar cascade loaded: %s\n", p);
+            break;
+        }
+    }
+    if (cascade.empty()) {
+        fprintf(stderr, "[FaceTracker] Could not load Haar cascade — face tracking disabled\n");
+        running_ = false;
+        for (int i = 0; i < n_bindings; i++) if (d_buffers[i]) cudaFree(d_buffers[i]);
+        delete context; delete engine; cap.release(); return;
+    }
+
+    /* Detection runs on a half-res grey frame for speed */
+    const float det_scale = 0.5f;
+    const int   det_w = (int)(fw * det_scale);
+    const int   det_h = (int)(fh * det_scale);
 
     /* ---- Main loop: detect face → crop → FaceMesh → iris depth ---- */
-    cv::Mat frame, crop, resized, faces;
+    cv::Mat frame, det_frame, det_grey, crop, resized;
+    std::vector<cv::Rect> det_faces;
     int frame_count = 0;
 
     while (running_.load()) {
         cap >> frame;
         if (frame.empty()) continue;
 
-        /* Detect faces in the full frame */
-        detector->detect(frame, faces);
-        if (faces.rows == 0) { ++frame_count; continue; }
+        /* Detect on half-res grey */
+        cv::resize(frame, det_frame, cv::Size(det_w, det_h));
+        cv::cvtColor(det_frame, det_grey, cv::COLOR_BGR2GRAY);
+        cv::equalizeHist(det_grey, det_grey);
+        det_faces.clear();
+        cascade.detectMultiScale(det_grey, det_faces, 1.1, 4,
+                                 cv::CASCADE_SCALE_IMAGE, cv::Size(60, 60));
+        if (det_faces.empty()) { ++frame_count; continue; }
 
-        /* Take the highest-confidence face (row 0 after NMS) */
-        float bx = faces.at<float>(0, 0);
-        float by = faces.at<float>(0, 1);
-        float bw = faces.at<float>(0, 2);
-        float bh = faces.at<float>(0, 3);
+        /* Pick largest detection, scale bbox back to full frame */
+        cv::Rect best = *std::max_element(det_faces.begin(), det_faces.end(),
+            [](const cv::Rect &a, const cv::Rect &b){ return a.area() < b.area(); });
+        float bx = best.x / det_scale;
+        float by = best.y / det_scale;
+        float bw = best.width  / det_scale;
+        float bh = best.height / det_scale;
 
         /* Expand bbox by 40% and make it square so FaceMesh gets context */
         float cx = bx + bw * 0.5f;
@@ -345,7 +373,7 @@ void FaceTracker::threadLoop()
         float img_Y = (iris_cy - cam_cy) * Z / focal_px;
 
         if (frame_count % 30 == 0)
-            printf("[FaceTracker] bbox=(%.0f,%.0f,%.0f,%.0f) iris=%.1fpx  Z=%.2fm  pos=(%.1f, %.1f)cm\n",
+            printf("[FaceTracker] face=(%.0f,%.0f %.0fx%.0f) iris=%.1fpx  Z=%.2fm  pos=(%.1f,%.1f)cm\n",
                    bx, by, bw, bh, iris_diam_px, Z, img_X * 100.f, img_Y * 100.f);
 
         {

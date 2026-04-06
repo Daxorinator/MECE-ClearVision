@@ -25,13 +25,10 @@ struct HeadPos {
 };
 
 /*
- * FaceTracker — background thread that opens a USB webcam and runs a MediaPipe
- * FaceMesh ONNX model (478 landmarks, iris indices 468–477) via TensorRT to
- * estimate the viewer's 3-D head position from iris diameter.
- *
- * On the first frame (or after losing the face) FaceMesh is run on the full
- * frame.  After each successful inference the crop is updated from the iris
- * position so subsequent frames use a tighter, face-centred input.
+ * FaceTracker — background thread that opens a USB webcam, uses a Haar cascade
+ * to locate the face each frame, crops and resizes to 192×192, then runs a
+ * MediaPipe FaceMesh ONNX model (478 landmarks, iris indices 468–477) via
+ * TensorRT to estimate the viewer's 3-D head position from iris diameter.
  *
  * Iris depth formula:  Z = IRIS_DIAM_M * focal_px / iris_diam_px
  * where IRIS_DIAM_M = 11.7 mm (average human iris).
@@ -48,9 +45,7 @@ public:
     ~FaceTracker() { stop(); }
 
     // facemesh_onnx : path to face_landmark_with_attention.onnx (478 landmarks)
-    // yunet_onnx    : path to face_detection_yunet_2021sep.onnx (face detector)
-    bool start(int camera_index, const std::string &facemesh_onnx,
-               const std::string &yunet_onnx);
+    bool start(int camera_index, const std::string &facemesh_onnx);
     void stop();
 
     // Store current iris position as the "looking straight ahead" reference.
@@ -65,7 +60,6 @@ private:
     void threadLoop();
 
     std::string facemesh_onnx_;
-    std::string yunet_onnx_;
 
     std::thread        worker_;
     std::atomic<bool>  running_{false};

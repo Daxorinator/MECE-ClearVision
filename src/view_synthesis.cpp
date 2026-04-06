@@ -639,32 +639,23 @@ SynthWindow::SynthWindow(QWidget *parent) : QOpenGLWidget(parent)
     printf("  C     - Recalibrate face tracker (look straight ahead first)\n");
     printf("============================================================\n\n");
 
-    /* Face tracker — search for FaceMesh and YuNet ONNX models */
+    /* Face tracker — search for FaceMesh ONNX model */
     const char *facemesh_candidates[] = {
         "face_landmark_with_attention.onnx",
         "../src/models/face_landmark_with_attention.onnx",
         "src/models/face_landmark_with_attention.onnx",
     };
-    const char *yunet_candidates[] = {
-        "face_detection_yunet_2021sep.onnx",
-        "../src/models/face_detection_yunet_2021sep.onnx",
-        "src/models/face_detection_yunet_2021sep.onnx",
-    };
-    std::string facemesh_path, yunet_path;
+    std::string facemesh_path;
     for (const char *c : facemesh_candidates) {
         if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); facemesh_path = c; break; }
     }
-    for (const char *c : yunet_candidates) {
-        if (FILE *f = std::fopen(c, "rb")) { std::fclose(f); yunet_path = c; break; }
-    }
 
-    if (facemesh_path.empty() || yunet_path.empty()) {
-        printf("[FaceTracker] Models not found — face tracking disabled.\n");
-        printf("  Need: face_landmark_with_attention.onnx + face_detection_yunet_2021sep.onnx\n");
-        printf("  Place both in src/models/\n");
+    if (facemesh_path.empty()) {
+        printf("[FaceTracker] FaceMesh ONNX model not found — face tracking disabled.\n");
+        printf("  Place face_landmark_with_attention.onnx in src/models/\n");
     } else {
         face_tracker = new FaceTracker();
-        if (face_tracker->start(FACE_CAM_INDEX, facemesh_path, yunet_path)) {
+        if (face_tracker->start(FACE_CAM_INDEX, facemesh_path)) {
             face_tracking_enabled = true;
             printf("[FaceTracker] Started on camera %d  model: %s\n",
                    FACE_CAM_INDEX, facemesh_path.c_str());
