@@ -494,12 +494,11 @@ private:
 
     /* Physical display geometry — bench-test defaults.
      * pos/normal/right/up in OAK-D world space (metres).
-     * OAK-D is at origin facing +Z. Viewer is at z = −hp.z (behind the camera).
-     * Display is co-mounted with OAK-D at z≈0; set pos[2] to the actual
-     * OAK-D→display offset along Z if they are not co-located.
+     * OAK-D is at origin facing +Z. Display is 400 mm behind OAK-D (z=−0.4).
+     * Viewer sits a further ~650 mm behind the display (z≈−1.05).
      * normal points from display toward viewer (−Z in OAK-D frame). */
     struct DisplayConfig {
-        float pos[3]     = {0.f, 0.f, 0.f};
+        float pos[3]     = {0.f, 0.f,-0.4f};  /* 400 mm behind OAK-D toward viewer */
         float normal[3]  = {0.f, 0.f,-1.f};   /* toward viewer */
         float right_v[3] = {1.f, 0.f, 0.f};
         float up_v[3]    = {0.f, 1.f, 0.f};   /* +Y (cam-space down) so dst_y=0 = screen top */
@@ -1035,7 +1034,7 @@ void SynthWindow::paintGL()
      * Face tracker reports hp.z as positive distance from its camera to the viewer's
      * face, so we negate it to place the viewer at negative Z in OAK-D space.
      * Negate x too: face-tracker x=right (cam faces viewer) → OAK-D x=left. */
-    float head_x = 0.0f, head_y = 0.0f, head_z = -0.6f;  /* default: 600 mm behind cam */
+    float head_x = 0.0f, head_y = 0.0f, head_z = -1.05f;  /* default: display(0.4) + viewer(0.65) */
     if (face_tracking_enabled && face_tracker && face_tracker->isActive()) {
         HeadPos hp = face_tracker->headPos();
         if (hp.valid) {
