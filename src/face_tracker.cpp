@@ -154,11 +154,22 @@ void FaceTracker::threadLoop()
 
     cv::VideoCapture cap;
     int fw = 0, fh = 0;
-    for (auto [w, h] : std::initializer_list<std::pair<int,int>>{{320,240},{640,480}}) {
+    /* Try highest resolution first — larger iris diameter = more reliable detection */
+    for (auto [w, h] : std::initializer_list<std::pair<int,int>>{{640,480},{320,240}}) {
         char buf[512];
         std::snprintf(buf, sizeof(buf), pipeline_fmt, camera_index_, w, h);
         cap.open(buf, cv::CAP_GSTREAMER);
         if (cap.isOpened()) { fw = w; fh = h; break; }
+    }
+    /* GStreamer fallback: try plain V4L2 (no MJPEG requirement) */
+    if (!cap.isOpened()) {
+        cap.open(camera_index_);
+        if (cap.isOpened()) {
+            cap.set(cv::CAP_PROP_FRAME_WIDTH,  640);
+            cap.set(cv::CAP_PROP_FRAME_HEIGHT, 480);
+            fw = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+            fh = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+        }
     }
     if (!cap.isOpened()) {
         fprintf(stderr, "[FaceTracker] Failed to open camera %d\n", camera_index_);
@@ -217,23 +228,32 @@ void FaceTracker::threadLoop()
         }
     }
 
-    /* Look for separate left/right iris outputs: 5 pts × 2 coords (x,y) = vol 10 each */
+    /* Look for separate left/right iris outputs (vol==10) and face flag (vol==1) */
     int left_iris_idx  = -1;
     int right_iris_idx = -1;
+    int face_flag_idx  = -1;
     for (int i = 0; i < n_bindings; i++) {
         if (engine->bindingIsInput(i) || i == output_idx) continue;
         auto dims = engine->getBindingDimensions(i);
         size_t vol = 1;
         for (int d = 0; d < dims.nbDims; d++) vol *= (size_t)dims.d[d];
+        std::string name = engine->getBindingName(i);
         if (vol == 10) {
-            std::string name = engine->getBindingName(i);
             if (name.find("left")  != std::string::npos) left_iris_idx  = i;
             if (name.find("right") != std::string::npos) right_iris_idx = i;
         }
+        /* Face flag: scalar output that signals face presence */
+        if (vol == 1 && face_flag_idx < 0)
+            face_flag_idx = i;
     }
     if (left_iris_idx >= 0 && right_iris_idx >= 0)
-        printf("[FaceTracker] Found iris outputs: left=binding%d right=binding%d\n",
+        printf("[FaceTracker] Iris outputs: left=binding%d right=binding%d\n",
                left_iris_idx, right_iris_idx);
+    if (face_flag_idx >= 0)
+        printf("[FaceTracker] Face flag: binding%d\n", face_flag_idx);
+    else
+        printf("[FaceTracker] WARNING: no face flag output found — "
+               "all frames will be accepted\n");
 
     if (input_idx < 0 || output_idx < 0 || n_landmarks < 1) {
         fprintf(stderr, "[FaceTracker] Unexpected model bindings — aborting\n");
@@ -265,6 +285,7 @@ void FaceTracker::threadLoop()
     std::vector<float> h_output   (output_bytes / sizeof(float));
     std::vector<float> h_left_iris (10, 0.f);
     std::vector<float> h_right_iris(10, 0.f);
+    float h_face_flag = 0.f;
 
     /* Diagnostic: print first few landmarks on first successful inference */
     bool first_infer = true;
@@ -321,16 +342,26 @@ void FaceTracker::threadLoop()
         if (right_iris_idx >= 0)
             cudaMemcpy(h_right_iris.data(), d_buffers[right_iris_idx], 10*sizeof(float),
                        cudaMemcpyDeviceToHost);
+        if (face_flag_idx >= 0)
+            cudaMemcpy(&h_face_flag, d_buffers[face_flag_idx], sizeof(float),
+                       cudaMemcpyDeviceToHost);
 
         const float *lm = h_output.data();
 
         /* Diagnostic on first inference */
         if (first_infer) {
             printf("[FaceTracker] First inference: lm[0..5] = "
-                   "%.3f %.3f %.3f  %.3f %.3f %.3f\n",
-                   lm[0], lm[1], lm[2], lm[3], lm[4], lm[5]);
+                   "%.3f %.3f %.3f  %.3f %.3f %.3f  face_flag=%.3f\n",
+                   lm[0], lm[1], lm[2], lm[3], lm[4], lm[5], h_face_flag);
             first_infer = false;
             active_ = true;
+        }
+
+        /* Reject frame if face is not present */
+        if (face_flag_idx >= 0 && h_face_flag < 0.5f) {
+            crop_valid = false;   /* force full-frame re-detection next frame */
+            ++frame_count;
+            continue;
         }
 
         /* Determine coordinate scale: if max x/y < 2, landmarks are normalised [0,1] */
@@ -374,9 +405,10 @@ void FaceTracker::threadLoop()
         float iris_cx = ((lix(0,0) + rix(0,0)) * 0.5f) * crop_to_img + crop_rect.x;
         float iris_cy = ((lix(0,1) + rix(0,1)) * 0.5f) * crop_to_img + crop_rect.y;
 
-        /* Update crop for next frame — centred on the iris, sized ~6× iris diameter */
+        /* Update crop for next frame — centred on the iris, sized ~15× iris diameter.
+         * 15× captures the full face; 6× was too tight and caused FaceMesh to lose lock. */
         {
-            int crop_size = std::max((int)(iris_diam_px * 6.0f), 64);
+            int crop_size = std::max((int)(iris_diam_px * 15.0f), 96);
             int ix = (int)iris_cx, iy = (int)iris_cy;
             crop_rect  = cv::Rect(ix - crop_size/2, iy - crop_size/2, crop_size, crop_size);
             crop_valid = true;
@@ -385,6 +417,10 @@ void FaceTracker::threadLoop()
         /* Depth from iris diameter */
         const float IRIS_DIAM_M = 0.01170f;
         float Z = IRIS_DIAM_M * focal_px / iris_diam_px;
+
+        if (frame_count % 60 == 0)
+            printf("[FaceTracker] iris_diam=%.1fpx  Z=%.2fm  crop=%dx%d  flag=%.2f\n",
+                   iris_diam_px, Z, crop_rect.width, crop_rect.height, h_face_flag);
 
         /* Lateral/vertical position relative to camera centre */
         float img_X = (iris_cx - cam_cx) * Z / focal_px;

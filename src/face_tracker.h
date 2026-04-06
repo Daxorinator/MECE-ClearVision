@@ -7,7 +7,7 @@
 
 #include <opencv2/core.hpp>
 
-#define FT_SMOOTH  0.12f   // EMA alpha for head position smoothing
+#define FT_SMOOTH  0.25f   // EMA alpha for head position smoothing
 
 /*
  * Head position in the face-tracker camera's coordinate frame (metres).
