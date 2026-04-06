@@ -48,7 +48,9 @@ public:
     ~FaceTracker() { stop(); }
 
     // facemesh_onnx : path to face_landmark_with_attention.onnx (478 landmarks)
-    bool start(int camera_index, const std::string &facemesh_onnx);
+    // yunet_onnx    : path to face_detection_yunet_2021sep.onnx (face detector)
+    bool start(int camera_index, const std::string &facemesh_onnx,
+               const std::string &yunet_onnx);
     void stop();
 
     // Store current iris position as the "looking straight ahead" reference.
@@ -63,6 +65,7 @@ private:
     void threadLoop();
 
     std::string facemesh_onnx_;
+    std::string yunet_onnx_;
 
     std::thread        worker_;
     std::atomic<bool>  running_{false};

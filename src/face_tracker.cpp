@@ -14,6 +14,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 #include <opencv2/core.hpp>
+#include <opencv2/objdetect.hpp>
 
 /* ========================================================================
  * TensorRT helpers
@@ -92,10 +93,12 @@ static nvinfer1::ICudaEngine *load_or_build_engine(const std::string &onnx_path)
  * Public API
  * ======================================================================== */
 
-bool FaceTracker::start(int camera_index, const std::string &facemesh_onnx)
+bool FaceTracker::start(int camera_index, const std::string &facemesh_onnx,
+                        const std::string &yunet_onnx)
 {
     camera_index_  = camera_index;
     facemesh_onnx_ = facemesh_onnx;
+    yunet_onnx_    = yunet_onnx;
     running_       = true;
     worker_        = std::thread(&FaceTracker::threadLoop, this);
     return true;
@@ -166,15 +169,6 @@ void FaceTracker::threadLoop()
     const float cam_cx   = fw * 0.5f;
     const float cam_cy   = fh * 0.5f;
 
-    /* Letterbox: pad the shorter dimension so we feed a square to FaceMesh.
-     * This preserves aspect ratio — no squishing.
-     * pad_x / pad_y are the black border widths (in original frame pixels)
-     * added on each side.  The square side length is sq. */
-    const int   sq     = std::max(fw, fh);
-    const int   pad_x  = (sq - fw) / 2;   // left/right black border in frame px
-    const int   pad_y  = (sq - fh) / 2;   // top/bottom black border in frame px
-    const float scale  = (float)sq / 192.0f;   // 192-space → frame pixels (uniform)
-
     /* ---- Load / build TRT engine ---- */
     auto *engine = load_or_build_engine(facemesh_onnx_);
     if (!engine) { running_ = false; return; }
@@ -236,30 +230,58 @@ void FaceTracker::threadLoop()
     std::vector<float> h_output(output_bytes / sizeof(float));
     std::vector<float> h_left_iris(10, 0.f), h_right_iris(10, 0.f);
 
-    /* ---- Main loop: letterbox → 192×192 → infer ---- */
-    cv::Mat frame, squared, resized;
+    /* ---- YuNet face detector ---- */
+    auto detector = cv::FaceDetectorYN::create(yunet_onnx_, "", cv::Size(fw, fh),
+                                               0.6f, 0.3f, 5000);
+    printf("[FaceTracker] YuNet detector ready  input=%dx%d\n", fw, fh);
+
+    /* ---- Main loop: detect face → crop → FaceMesh → iris depth ---- */
+    cv::Mat frame, crop, resized, faces;
     int frame_count = 0;
 
     while (running_.load()) {
         cap >> frame;
         if (frame.empty()) continue;
 
-        /* Letterbox to sq×sq (pad shorter axis with black), then resize to
-         * 192×192.  This keeps the face's aspect ratio intact. */
-        cv::copyMakeBorder(frame, squared,
-                           pad_y, pad_y, pad_x, pad_x,
-                           cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
-        cv::resize(squared, resized, cv::Size(192, 192));
+        /* Detect faces in the full frame */
+        detector->detect(frame, faces);
+        if (faces.rows == 0) { ++frame_count; continue; }
+
+        /* Take the highest-confidence face (row 0 after NMS) */
+        float bx = faces.at<float>(0, 0);
+        float by = faces.at<float>(0, 1);
+        float bw = faces.at<float>(0, 2);
+        float bh = faces.at<float>(0, 3);
+
+        /* Expand bbox by 40% and make it square so FaceMesh gets context */
+        float cx = bx + bw * 0.5f;
+        float cy = by + bh * 0.5f;
+        float side = std::max(bw, bh) * 1.4f;
+        int x0 = std::max(0, (int)(cx - side * 0.5f));
+        int y0 = std::max(0, (int)(cy - side * 0.5f));
+        int x1 = std::min(fw, (int)(cx + side * 0.5f));
+        int y1 = std::min(fh, (int)(cy + side * 0.5f));
+        int cw = x1 - x0;
+        int ch = y1 - y0;
+        if (cw < 32 || ch < 32) { ++frame_count; continue; }
+
+        /* Crop and resize to 192×192 for FaceMesh */
+        crop = frame(cv::Rect(x0, y0, cw, ch));
+        cv::resize(crop, resized, cv::Size(192, 192));
         cv::cvtColor(resized, resized, cv::COLOR_BGR2RGB);
         resized.convertTo(resized, CV_32FC3, 1.0 / 255.0);
+
+        /* Scale factors: 192-space → full frame pixels */
+        const float sx = (float)cw / 192.0f;
+        const float sy = (float)ch / 192.0f;
 
         if (nhwc_input) {
             std::memcpy(h_input.data(), resized.data, input_bytes);
         } else {
-            std::vector<cv::Mat> ch(3);
-            cv::split(resized, ch);
+            std::vector<cv::Mat> ch3(3);
+            cv::split(resized, ch3);
             for (int c = 0; c < 3; c++)
-                std::memcpy(h_input.data() + c * 192 * 192, ch[c].data,
+                std::memcpy(h_input.data() + c * 192 * 192, ch3[c].data,
                             192 * 192 * sizeof(float));
         }
 
@@ -300,21 +322,22 @@ void FaceTracker::threadLoop()
         const float *r_iris = (right_iris_idx >= 0) ? h_right_iris.data() : (lm + 473*3);
         const int stride    = (left_iris_idx  >= 0) ? 2 : 3;
 
-        auto lix = [&](int pt, int c){ return l_iris[pt*stride+c] * lm_scale; };
-        auto rix = [&](int pt, int c){ return r_iris[pt*stride+c] * lm_scale; };
+        /* Landmark coords in 192-space → full frame pixels via crop offset */
+        auto lx = [&](const float *iris, int pt, int c){
+            return iris[pt*stride+c] * lm_scale * (c==0 ? sx : sy) + (c==0 ? x0 : y0);
+        };
 
-        /* Iris diameter in 192-space → real frame pixels.
-         * The resize was square (sq×sq → 192×192) so scale is uniform. */
-        float dh_192 = std::hypot(lix(2,0)-lix(4,0), lix(2,1)-lix(4,1));
-        float dv_192 = std::hypot(lix(1,0)-lix(3,0), lix(1,1)-lix(3,1));
-        float diam_192 = (dh_192 + dv_192) * 0.5f;
-        if (diam_192 < 1.0f) { ++frame_count; continue; }
+        /* Iris diameter: horizontal (pts 2↔4) and vertical (pts 1↔3) spans */
+        float dh_px = std::hypot((lx(l_iris,2,0)-lx(l_iris,4,0)),
+                                 (lx(l_iris,2,1)-lx(l_iris,4,1)));
+        float dv_px = std::hypot((lx(l_iris,1,0)-lx(l_iris,3,0)),
+                                 (lx(l_iris,1,1)-lx(l_iris,3,1)));
+        float iris_diam_px = (dh_px + dv_px) * 0.5f;
+        if (iris_diam_px < 2.0f) { ++frame_count; continue; }
 
-        float iris_diam_px = diam_192 * scale;
-
-        /* Iris centre: 192-space → sq-space → frame pixels (subtract padding) */
-        float iris_cx = ((lix(0,0) + rix(0,0)) * 0.5f) * scale - pad_x;
-        float iris_cy = ((lix(0,1) + rix(0,1)) * 0.5f) * scale - pad_y;
+        /* Iris centre in full-frame pixels, averaged across both eyes */
+        float iris_cx = (lx(l_iris,0,0) + lx(r_iris,0,0)) * 0.5f;
+        float iris_cy = (lx(l_iris,0,1) + lx(r_iris,0,1)) * 0.5f;
 
         const float IRIS_DIAM_M = 0.01170f;
         float Z     = IRIS_DIAM_M * focal_px / iris_diam_px;
@@ -322,8 +345,8 @@ void FaceTracker::threadLoop()
         float img_Y = (iris_cy - cam_cy) * Z / focal_px;
 
         if (frame_count % 30 == 0)
-            printf("[FaceTracker] iris=%.1fpx  Z=%.2fm  pos=(%.1f, %.1f)cm\n",
-                   iris_diam_px, Z, img_X * 100.f, img_Y * 100.f);
+            printf("[FaceTracker] bbox=(%.0f,%.0f,%.0f,%.0f) iris=%.1fpx  Z=%.2fm  pos=(%.1f, %.1f)cm\n",
+                   bx, by, bw, bh, iris_diam_px, Z, img_X * 100.f, img_Y * 100.f);
 
         {
             std::lock_guard<std::mutex> lock(mtx_);
