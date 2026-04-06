@@ -383,14 +383,9 @@ void FaceTracker::threadLoop()
             active_ = true;
         }
 
-        /* Reject frame if face is not present.
-         * Threshold is 0.0: works for raw logits (>0 = present) and probabilities
-         * (sigmoid(0)=0.5, so >0 → >50% confidence). */
-        if (face_flag_idx >= 0 && h_face_flag <= 0.0f) {
-            crop_valid = false;
-            ++frame_count;
-            continue;
-        }
+        /* Face flag check intentionally omitted: the binding identified as face_flag
+         * (vol==1) is not a reliable presence score in this ONNX export.
+         * Bad detections are handled by diam_crop < 1.0 below. */
 
         /* Determine coordinate scale: if max x/y < 2, landmarks are normalised [0,1] */
         float lm_scale = 1.0f;
