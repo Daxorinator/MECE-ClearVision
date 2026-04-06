@@ -243,17 +243,26 @@ void FaceTracker::threadLoop()
             if (name.find("right") != std::string::npos) right_iris_idx = i;
         }
         /* Face flag: scalar output that signals face presence */
-        if (vol == 1 && face_flag_idx < 0)
-            face_flag_idx = i;
+        /* Face flag: prefer a binding whose name contains "score"/"flag"/"face";
+         * fall back to first scalar output.  Vol==1 covers both (1,) and (1,1,1,1). */
+        if (vol == 1) {
+            bool named = (name.find("score") != std::string::npos ||
+                          name.find("flag")  != std::string::npos ||
+                          name.find("face")  != std::string::npos);
+            if (named || face_flag_idx < 0)
+                face_flag_idx = i;
+        }
     }
     if (left_iris_idx >= 0 && right_iris_idx >= 0)
         printf("[FaceTracker] Iris outputs: left=binding%d right=binding%d\n",
                left_iris_idx, right_iris_idx);
-    if (face_flag_idx >= 0)
-        printf("[FaceTracker] Face flag: binding%d\n", face_flag_idx);
-    else
+    if (face_flag_idx >= 0) {
+        printf("[FaceTracker] Face flag: binding%d ('%s')\n",
+               face_flag_idx, engine->getBindingName(face_flag_idx));
+    } else {
         printf("[FaceTracker] WARNING: no face flag output found — "
                "all frames will be accepted\n");
+    }
 
     if (input_idx < 0 || output_idx < 0 || n_landmarks < 1) {
         fprintf(stderr, "[FaceTracker] Unexpected model bindings — aborting\n");
@@ -357,9 +366,11 @@ void FaceTracker::threadLoop()
             active_ = true;
         }
 
-        /* Reject frame if face is not present */
-        if (face_flag_idx >= 0 && h_face_flag < 0.5f) {
-            crop_valid = false;   /* force full-frame re-detection next frame */
+        /* Reject frame if face is not present.
+         * Threshold is 0.0: works for raw logits (>0 = present) and probabilities
+         * (sigmoid(0)=0.5, so >0 → >50% confidence). */
+        if (face_flag_idx >= 0 && h_face_flag <= 0.0f) {
+            crop_valid = false;
             ++frame_count;
             continue;
         }

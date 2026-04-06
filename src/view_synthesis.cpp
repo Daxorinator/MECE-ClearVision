@@ -500,7 +500,7 @@ private:
         float pos[3]     = {0.f, 0.f, 0.4f};
         float normal[3]  = {0.f, 0.f,-1.f};   /* toward viewer */
         float right_v[3] = {1.f, 0.f, 0.f};
-        float up_v[3]    = {0.f,-1.f, 0.f};   /* −Y = up in image coords */
+        float up_v[3]    = {0.f, 1.f, 0.f};   /* +Y (cam-space down) so dst_y=0 = screen top */
         float width_m    = 0.133f;             /* 480/1920 × 532 mm */
         float height_m   = 0.300f;
     } display_config;
