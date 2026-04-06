@@ -497,7 +497,7 @@ private:
      * display is 0.8 m in front of OAK-D; viewer (head) is at z≈0 (OAK-D position).
      * normal points from display toward viewer (−Z in OAK-D frame). */
     struct DisplayConfig {
-        float pos[3]     = {0.f, 0.f, 0.8f};
+        float pos[3]     = {0.f, 0.f, 0.4f};
         float normal[3]  = {0.f, 0.f,-1.f};   /* toward viewer */
         float right_v[3] = {1.f, 0.f, 0.f};
         float up_v[3]    = {0.f,-1.f, 0.f};   /* −Y = up in image coords */
