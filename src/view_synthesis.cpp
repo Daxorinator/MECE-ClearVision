@@ -494,10 +494,12 @@ private:
 
     /* Physical display geometry — bench-test defaults.
      * pos/normal/right/up in OAK-D world space (metres).
-     * display is 0.8 m in front of OAK-D; viewer (head) is at z≈0 (OAK-D position).
+     * OAK-D is at origin facing +Z. Viewer is at z = −hp.z (behind the camera).
+     * Display is co-mounted with OAK-D at z≈0; set pos[2] to the actual
+     * OAK-D→display offset along Z if they are not co-located.
      * normal points from display toward viewer (−Z in OAK-D frame). */
     struct DisplayConfig {
-        float pos[3]     = {0.f, 0.f, 0.4f};
+        float pos[3]     = {0.f, 0.f, 0.f};
         float normal[3]  = {0.f, 0.f,-1.f};   /* toward viewer */
         float right_v[3] = {1.f, 0.f, 0.f};
         float up_v[3]    = {0.f, 1.f, 0.f};   /* +Y (cam-space down) so dst_y=0 = screen top */
@@ -1028,17 +1030,18 @@ void SynthWindow::paintGL()
     float vcx = oak_receiver.cx * scale_x;
     float vcy = oak_receiver.cy * scale_y;
 
-    /* Head position from iris-depth face tracker.
-     * x/y are relative to calibration reference; z is absolute depth in metres.
-     * Negate x: face-tracker camera faces viewer (x=right from cam = viewer's left),
-     * OAK-D faces scene (x=right from cam = viewer's right). */
-    float head_x = 0.0f, head_y = 0.0f, head_z = 0.0f;
+    /* Head position in OAK-D world space (metres).
+     * OAK-D is at origin facing +Z (into scene). Viewer is behind the camera at −Z.
+     * Face tracker reports hp.z as positive distance from its camera to the viewer's
+     * face, so we negate it to place the viewer at negative Z in OAK-D space.
+     * Negate x too: face-tracker x=right (cam faces viewer) → OAK-D x=left. */
+    float head_x = 0.0f, head_y = 0.0f, head_z = -0.6f;  /* default: 600 mm behind cam */
     if (face_tracking_enabled && face_tracker && face_tracker->isActive()) {
         HeadPos hp = face_tracker->headPos();
         if (hp.valid) {
             head_x = -hp.x;
             head_y =  hp.y;
-            head_z =  hp.z;
+            head_z = -hp.z;   /* viewer is at negative Z in OAK-D space */
         }
     }
 
