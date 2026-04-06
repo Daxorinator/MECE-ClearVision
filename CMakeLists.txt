@@ -56,19 +56,8 @@ find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d highgui ximgproc ob
 find_package(Qt5 REQUIRED COMPONENTS Widgets OpenGL)
 find_package(Threads REQUIRED)
 
-# ---- TensorRT (required for FaceMesh iris-depth face tracker) ----
-find_path(TRT_INCLUDE_DIR NvInfer.h
-    HINTS /usr/include /usr/include/aarch64-linux-gnu)
-find_library(NVINFER_LIB   nvinfer
-    HINTS /usr/lib/aarch64-linux-gnu /usr/lib)
-find_library(NVONNX_LIB    nvonnxparser
-    HINTS /usr/lib/aarch64-linux-gnu /usr/lib)
+# ---- CUDA (for OpenCV CUDA modules used in view_synthesis) ----
 find_package(CUDA REQUIRED)
-
-if(NOT TRT_INCLUDE_DIR OR NOT NVINFER_LIB OR NOT NVONNX_LIB)
-    message(FATAL_ERROR "TensorRT not found (need NvInfer.h, libnvinfer, libnvonnxparser)")
-endif()
-message(STATUS "TensorRT: ${TRT_INCLUDE_DIR}  nvinfer=${NVINFER_LIB}  nvonnxparser=${NVONNX_LIB}")
 
 # ---- depthai-core 2.x (OAK-D Lite) ----
 # Built from source as a git submodule, pinned to v2.26.0 (matches pip package).
@@ -97,7 +86,7 @@ add_executable(view_synthesis
     src/face_tracker.cpp
     src/oak_receiver.cpp
 )
-target_include_directories(view_synthesis PRIVATE ${TRT_INCLUDE_DIR} ${CUDA_INCLUDE_DIRS})
+target_include_directories(view_synthesis PRIVATE ${CUDA_INCLUDE_DIRS})
 target_link_libraries(view_synthesis
     ${OpenCV_LIBS}
     depthai::core
@@ -106,13 +95,12 @@ target_link_libraries(view_synthesis
     GLESv2
     EGL
     Threads::Threads
-    ${NVINFER_LIB}
-    ${NVONNX_LIB}
     ${CUDA_LIBRARIES}
 )
 target_precompile_headers(view_synthesis PRIVATE
     <opencv2/core.hpp>
     <opencv2/imgproc.hpp>
+    <opencv2/dnn.hpp>
     <opencv2/cudaarithm.hpp>
     <opencv2/cudaimgproc.hpp>
     <opencv2/cudawarping.hpp>
