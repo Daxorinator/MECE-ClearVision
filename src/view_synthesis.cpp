@@ -494,11 +494,12 @@ private:
 
     /* Physical display geometry — bench-test defaults.
      * pos/normal/right/up in OAK-D world space (metres).
-     * OAK-D is at origin facing +Z. Display is 400 mm behind OAK-D (z=−0.4).
-     * Viewer sits a further ~650 mm behind the display (z≈−1.05).
+     * OAK-D at origin facing +Z. Display is physically 400 mm behind OAK-D but
+     * modelled at z=0: this uses viewer-to-OAK-D (~1.05 m) as the projection
+     * distance, giving correctly-sized scene objects vs the shorter 0.65 m gap.
      * normal points from display toward viewer (−Z in OAK-D frame). */
     struct DisplayConfig {
-        float pos[3]     = {0.f, 0.f,-0.4f};  /* 400 mm behind OAK-D toward viewer */
+        float pos[3]     = {0.f, 0.f, 0.f};
         float normal[3]  = {0.f, 0.f,-1.f};   /* toward viewer */
         float right_v[3] = {1.f, 0.f, 0.f};
         float up_v[3]    = {0.f, 1.f, 0.f};   /* +Y (cam-space down) so dst_y=0 = screen top */
