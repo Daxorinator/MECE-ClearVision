@@ -1,0 +1,1218 @@
+% ClearVision: Real-Time DIBR for A-Pillar Blind Spot Elimination
+% Seán Kelly — 21421506 — University of Galway — 1MECE1
+
+\documentclass[12pt, a4paper]{report}
+
+% -----------------------------------------------------------------------
+%  Packages
+% -----------------------------------------------------------------------
+\usepackage[a4paper, top=2.5cm, bottom=2.5cm, left=2.8cm, right=2.8cm]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{parskip}
+\usepackage{setspace}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage[backend=biber, style=ieee]{biblatex}
+\addbibresource{references.bib}
+
+% -----------------------------------------------------------------------
+%  Listings style (GLSL / C++ / Python snippets)
+% -----------------------------------------------------------------------
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    captionpos=b,
+    commentstyle=\color{gray},
+    keywordstyle=\color{blue!70!black},
+    stringstyle=\color{red!60!black},
+    showstringspaces=false,
+    tabsize=4,
+    numbers=left,
+    numberstyle=\tiny\color{gray},
+    numbersep=5pt,
+}
+
+% -----------------------------------------------------------------------
+%  Header / Footer
+% -----------------------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small ClearVision — MECE Final Year Project}
+\fancyhead[R]{\small Seán Kelly, 21421506}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+% -----------------------------------------------------------------------
+%  Title formatting
+% -----------------------------------------------------------------------
+\titleformat{\chapter}[block]
+  {\normalfont\Large\bfseries}{\thechapter.}{0.8em}{}
+\titlespacing*{\chapter}{0pt}{20pt}{10pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+% -----------------------------------------------------------------------
+%  Document
+% -----------------------------------------------------------------------
+\begin{document}
+
+% =====================================================================
+%  COVER PAGE
+% =====================================================================
+\begin{titlepage}
+    \centering
+    \vspace*{1.5cm}
+
+    {\Large \textsc{University of Galway}}\\[0.4em]
+    {\large College of Science and Engineering}\\[0.3em]
+    {\large School of Engineering}\\[2.8cm]
+
+    \rule{\linewidth}{1pt}\\[0.5em]
+    {\LARGE \bfseries ClearVision: A Real-Time Depth-Image Based Rendering\\[0.3em]
+    System for Automotive A-Pillar Blind Spot Elimination}\\[0.5em]
+    \rule{\linewidth}{1pt}\\[2cm]
+
+    {\large \textbf{Author:} Seán Kelly}\\[0.4em]
+    {\large \textbf{Student ID:} 21421506}\\[0.4em]
+    {\large \textbf{Programme:} BE Mechatronics Engineering (1MECE1)}\\[0.4em]
+    {\large \textbf{Module:} MECE Final Year Project}\\[0.4em]
+    {\large \textbf{Date:} May 2026}\\[2.5cm]
+
+    \begin{minipage}{0.85\linewidth}
+    \begin{abstract}
+    \noindent
+    This report describes the design, implementation, and evaluation of ClearVision,
+    a real-time stereoscopic Depth-Image Based Rendering (DIBR) system targeting the
+    automotive A-pillar blind spot problem.
+    A Luxonis OAK-D Lite stereo camera, mounted externally, provides
+    hardware-accelerated subpixel disparity; the host (NVIDIA Jetson Nano,
+    OpenGL ES~3.1) runs a multi-pass compute shader pipeline that reprojects
+    the scene point cloud to match the driver's instantaneous viewpoint.
+    A TensorRT-accelerated MediaPipe FaceMesh tracker estimates head position
+    in real time from iris diameter, enabling the displayed image to behave
+    as a transparent window with physically-correct motion parallax.
+    The project evolved through three architectures across three development
+    branches, culminating in a system that achieves 25--30~FPS at 640$\times$480,
+    compared to approximately 5~FPS with the original CPU stereo approach.
+    Key contributions include a geometrically-correct virtual window projection
+    model, a Jump Flood Algorithm (JFA) hole-fill pass, and resolution of
+    seven non-trivial engineering problems specific to the combination of
+    DepthAI, TensorRT, and OpenGL ES~3.1 on Jetson Nano hardware.
+    \end{abstract}
+    \end{minipage}
+\end{titlepage}
+
+% =====================================================================
+%  TABLE OF CONTENTS
+% =====================================================================
+\tableofcontents
+\newpage
+
+% =====================================================================
+%  CHAPTER 1 — INTRODUCTION AND BACKGROUND
+% =====================================================================
+\chapter{Introduction and Background}
+
+\section{Motivation}
+
+A-pillar blind spots are a well-documented road safety hazard.
+The structural pillars at the front corners of a vehicle obstruct
+approximately 4--8$^\circ$ of the driver's forward field of
+view~\cite{nhtsa_visibility}.
+At a pedestrian crossing 20~m ahead, this translates to roughly 1.4~m of
+hidden lateral space --- sufficient to conceal a cyclist or child.
+Existing mitigation strategies, such as convex mirrors and fixed-viewpoint
+camera displays, do not preserve the spatial relationship between the
+displayed scene and the driver's viewpoint.
+Objects shown on a fixed camera feed do not move as the driver moves,
+which degrades depth perception and object localisation.
+
+ClearVision takes a different approach.
+Rather than displaying a static camera feed, it synthesises a novel
+viewpoint that tracks the driver's head position, so that the panel
+behaves as if it were transparent.
+The driver receives the same motion parallax cues as through a real window,
+making depth judgements natural and intuitive.
+
+\section{Depth-Image Based Rendering}
+
+Depth-Image Based Rendering (DIBR) synthesises novel camera viewpoints from
+a reference image and its associated depth map, without requiring a full 3D
+model of the scene~\cite{fehn2004depth}.
+Each pixel of the reference image is warped to the position it would occupy
+in the target view, using depth to determine how far each pixel shifts.
+
+A stereo camera pair provides the depth map.
+The two cameras are separated by a known \textbf{baseline} $B$ (metres).
+For a point at depth $Z$, the horizontal pixel offset between the two images
+--- the \textbf{disparity} $d$ --- satisfies:
+
+\begin{equation}
+    d = \frac{f \cdot B}{Z}
+    \label{eq:disparity}
+\end{equation}
+
+where $f$ is the focal length in pixels.
+Inverting, given $d$:
+
+\begin{equation}
+    Z = \frac{f \cdot B}{d}
+    \label{eq:depth_from_disparity}
+\end{equation}
+
+Given $Z$ and camera intrinsics $(f_x, f_y, c_x, c_y)$, a pixel $(u, v)$
+is unprojected to metric 3D coordinates:
+
+\begin{equation}
+    X = \frac{(u - c_x) \cdot Z}{f_x}, \quad
+    Y = \frac{(v - c_y) \cdot Z}{f_y}
+    \label{eq:unproject}
+\end{equation}
+
+These world-space points form a point cloud from which any viewpoint
+can be rendered.
+
+\section{The Virtual Window Model}
+
+A naive DIBR implementation treats view synthesis as a horizontal pixel
+shift: $u' = u - \alpha \cdot d$, where $\alpha$ blends between the two
+stereo camera positions.
+This has two fundamental problems for the A-pillar application.
+First, the viewer is \emph{inside} the car and the stereo cameras are
+\emph{outside}; the viewer is not interpolating between the stereo pair, so
+no value of $\alpha$ corresponds to a physically-meaningful viewpoint.
+Second, the shift has no connection to physical viewer displacement ---
+the scale constant must be hand-tuned empirically.
+
+The virtual window model replaces this with a geometrically-correct ray
+projection.
+For each output pixel on the display:
+
+\begin{enumerate}[noitemsep]
+    \item Connect world point $W$ to head position $H$ by a ray:
+          $\mathbf{r} = \mathrm{normalize}(W - H)$.
+    \item Intersect the ray with the display plane to find $Q$.
+    \item Express $Q$ in display-local UV coordinates to determine the
+          output pixel.
+\end{enumerate}
+
+The ray-plane intersection is:
+
+\begin{equation}
+    t = \frac{(P - H) \cdot \hat{n}}{r \cdot \hat{n}}, \quad Q = H + t \cdot r
+    \label{eq:ray_plane}
+\end{equation}
+
+where $P$ is any point on the plane and $\hat{n}$ its outward normal.
+
+This yields physically-correct parallax by construction.
+For a head displacement $\Delta x$ and an object at depth $Z$:
+
+\begin{equation}
+    \delta u = \frac{f_x \cdot \Delta x}{Z}
+    \label{eq:parallax_shift}
+\end{equation}
+
+No scaling constants are required.
+Horizontal and vertical parallax both emerge naturally.
+
+\section{Off-Axis Projection}
+
+The virtual window model is related to off-axis (asymmetric frustum)
+projection~\cite{kooima2009generalized}, demonstrated interactively by
+Lee~\cite{lee2008head}: the OpenGL viewing frustum is defined to match the
+viewer's actual position relative to the screen, so the rendered scene
+exhibits correct parallax as the viewer moves.
+
+ClearVision incorporates this in two forms.
+Early proof-of-concept Python demonstrations used an orthographic asymmetric
+frustum directly in OpenGL.
+The final C\texttt{++} pipeline generalises this to full 3D using real depth
+data, implementing the ray-projection formulation above in compute shaders.
+
+\section{Stereo Vision and Disparity Estimation}
+
+Reliable disparity estimation requires \textbf{stereo rectification} ---
+re-projecting both camera images onto a common plane so that corresponding
+scene points lie on the same image row.
+After rectification, \textbf{Semi-Global Block Matching}
+(SGBM)~\cite{hirschmuller2005sgbm} finds the best-matching horizontal
+offset for each pixel.
+
+The OAK-D Lite performs rectification and SGBM in dedicated hardware on
+its Myriad X VPU.
+This offloads what would otherwise be the dominant compute bottleneck --- CPU
+SGBM at 640$\times$480 requires 20--30~ms on the Jetson Nano --- to
+specialised silicon at zero host CPU cost.
+
+\section{Face Tracking and Iris-Based Depth}
+
+To position the virtual camera, the system must estimate the driver's 3D
+head position in real time.
+A viewer-facing USB webcam feeds a face detection and landmark pipeline
+that outputs $(X, Y, Z)$ in the OAK-D camera's coordinate frame.
+
+Depth is recovered from the apparent iris diameter.
+The human iris has a near-constant physical diameter of approximately
+11.7~mm (population variance $\pm 0.5$~mm --- substantially tighter than
+inter-ocular distance or face width).
+Its projected size in pixels depends on focal length $f_t$ and distance $Z$:
+
+\begin{equation}
+    Z = \frac{D_{\mathrm{iris}} \cdot f_t}{d_{\mathrm{iris,px}}}
+    \label{eq:iris_depth}
+\end{equation}
+
+Lateral and vertical head position follow from the pinhole model once
+$Z$ is known.
+
+\section{Project Scope and Objectives}
+
+The project proceeded in three development branches, each addressing a
+distinct set of objectives:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{\texttt{feature/dibr-quality-optimisations}.}
+          Establish the core DIBR pipeline using dual CSI cameras on the
+          Jetson Nano.
+          Explore stereo matching quality improvements and GPU acceleration.
+    \item \textbf{\texttt{feature/head-tracking}.}
+          Investigate and implement a reliable real-time head tracking
+          architecture that does not consume the limited remaining CPU budget.
+    \item \textbf{\texttt{feature/oakd-lite}.}
+          Replace the homebrew dual-CSI rig with an OAK-D Lite to offload
+          stereo to the Myriad X VPU, and migrate to the virtual window
+          projection model.
+\end{enumerate}
+
+Python proof-of-concept demonstrations preceded the C\texttt{++} pipeline
+to validate the core viewing geometry.
+
+% =====================================================================
+%  CHAPTER 2 — SYSTEM ARCHITECTURE
+% =====================================================================
+\chapter{System Architecture}
+
+\section{Hardware}
+
+Three hardware components comprise the system.
+
+\textbf{OAK-D Lite (Luxonis)}~\cite{luxonis_oakd} is the external stereo camera.
+It contains two OmniVision OV7251 global-shutter monochrome sensors
+(640$\times$480, 73$^\circ$ HFOV) on a 75~mm fixed baseline, a Sony
+IMX214 colour camera, and an Intel Myriad X VPU.
+The global shutter is important for this application: a rolling shutter
+introduces lateral skew artefacts when the scene or camera moves
+between rows, distorting the disparity map and breaking the parallax
+illusion.
+The OAK-D Lite connects via a single USB-C cable and is bus-powered.
+
+\textbf{NVIDIA Jetson Nano (B01)} is the host compute platform.
+It provides a Maxwell GPU (128 CUDA cores, OpenGL ES~3.1) and runs
+NVIDIA JetPack~4.x (L4T~R32).
+The Maxwell GPU is sufficient for the DIBR compute shader pipeline
+once the SGBM bottleneck is removed by the OAK-D VPU.
+
+\textbf{USB webcam} (interior, viewer-facing) feeds the head tracking
+pipeline.
+No stereo hardware is required for head tracking; a single camera with
+the iris depth estimator suffices.
+
+The physical camera rig was mounted with the OAK-D Lite inverted
+(rotated 180$^\circ$) for installation reasons.
+Compensation is applied in the capture pipeline via a GStreamer
+\texttt{videoflip} element (\texttt{flip-method=rotate-180}) and
+additionally in software for the OAK-D's DepthAI frame output.
+
+\section{Architecture Evolution Across Branches}
+
+Table~\ref{tab:arch_evolution} summarises the key changes across the
+three development branches.
+
+\begin{table}[h]
+\centering
+\caption{Architecture evolution across development branches}
+\label{tab:arch_evolution}
+\begin{tabular}{@{}p{3.5cm}p{3.5cm}p{3.5cm}@{}}
+\toprule
+\textbf{dibr-quality-opt.} & \textbf{head-tracking} & \textbf{oakd-lite (final)} \\
+\midrule
+Dual CSI cameras & Dual CSI cameras & OAK-D Lite USB-C \\
+CPU SGBM / CUDA BM & CPU SGBM / CUDA BM & Hardware SGBM on Myriad X \\
+Manual stereo calibration & Manual stereo calibration & EEPROM intrinsics \\
+Disparity shift model & Disparity shift model & Virtual window ray model \\
+Lucas-Kanade / OpenCV DNN & MOSSE + Haar Cascade & TRT FaceMesh + iris depth \\
+Horizontal hole fill & Horizontal hole fill & JFA 2D hole fill \\
+$\sim$5 FPS & $\sim$10 FPS & 25--30 FPS \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Software Architecture}
+
+The system is implemented in C\texttt{++} using Qt for the OpenGL window
+and event loop.
+Three concurrent threads handle the three data sources:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{OAK receiver thread} (\texttt{oak\_receiver.cpp}):
+          polls the DepthAI device for disparity (RAW16 subpixel), rectified
+          mono frames (left and right), and colour frame; writes to shared
+          \texttt{cv::Mat} objects protected by a mutex.
+    \item \textbf{Face tracker thread} (\texttt{face\_tracker.cpp}):
+          runs Haar cascade detection and TensorRT FaceMesh inference on the
+          webcam feed; outputs a smoothed 3D head position vector.
+    \item \textbf{Qt render thread}: calls \texttt{paintGL()} at the
+          OAK-D frame rate, consuming the latest data from both background
+          threads and dispatching the compute shader pipeline.
+\end{itemize}
+
+\section{Compute Shader Pipeline}
+
+Each frame, the following GPU passes execute in sequence:
+
+\begin{table}[h]
+\centering
+\caption{Compute shader passes per frame}
+\label{tab:shader_passes}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Pass & Shader & Function \\
+\midrule
+0 & \texttt{CLEAR\_CS}          & Zero the depth SSBO (GPU-side) \\
+1 & \texttt{UNPROJECT\_CS}      & Disparity $\to$ world-space XYZ texture \\
+2 & \texttt{VWINDOW\_DEPTH\_CS}  & World points $\to$ virtual window depth buffer \\
+3 & \texttt{VWINDOW\_COLOR\_CS}  & Depth-tested colour splat from left camera \\
+4 & \texttt{VWINDOW\_RIGHT\_CS}  & Right-camera disocclusion fill \\
+5 & \texttt{JFA\_INIT\_CS}      & Seed JFA with filled pixel coordinates \\
+6--N & \texttt{JFA\_CS} $\times \lceil\log_2(\max(W,H))\rceil$ & Voronoi propagation \\
+N+1 & \texttt{JFA\_GATHER\_CS}  & Copy nearest-seed colour into holes \\
+Display & \texttt{DISPLAY\_VS/FS} & Fullscreen quad, letterboxed \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All image-space compute shaders use a 16$\times$16 workgroup layout.
+\texttt{CLEAR\_CS} uses \texttt{local\_size\_x = 64}.
+
+\section{Stereo Baseline Selection}
+
+The OAK-D Lite's fixed 75~mm baseline is well-matched to the application.
+The A-pillar on a typical passenger vehicle occludes approximately 80--120~mm
+of lateral space at the driver's eye position.
+For the virtual window parallax to correctly reveal the hidden scene, the
+synthesisable viewpoint shift must span this same distance.
+
+At the target depth range of 3--5~m, the OAK-D Lite stereo pair
+($f \approx 381$~px at 480P, 73$^\circ$ HFOV) produces:
+
+\begin{equation}
+    d_{3\mathrm{m}} = \frac{381 \times 0.075}{3} \approx 9.5~\mathrm{px}, \quad
+    d_{5\mathrm{m}} = \frac{381 \times 0.075}{5} \approx 5.7~\mathrm{px}
+\end{equation}
+
+Both values are above the noise floor for the hardware SGBM matcher.
+Benchmarks from~\cite{arxiv2501} report $<$2\% depth error at 4~m for
+OAK-D hardware under controlled conditions.
+
+% =====================================================================
+%  CHAPTER 3 — PROOF-OF-CONCEPT DEMONSTRATIONS
+% =====================================================================
+\chapter{Proof-of-Concept Demonstrations}
+
+\section{Head Pose Vector Demo}
+
+The first demonstration, implemented in Python using MediaPipe
+FaceLandmarker~\cite{mediapipe_face}, validated the face tracking
+foundation.
+The goal was to render the 3D head orientation vector overlaid on a live
+camera feed, without hardcoded constants.
+
+The face normal is computed from a small set of facial landmarks --- nose
+tip, chin, and inner eye corners --- using a cross product:
+
+\begin{enumerate}[noitemsep]
+    \item Eye line vector: $\mathbf{e} = P_{\mathrm{right}} - P_{\mathrm{left}}$
+    \item Vertical face axis: $\mathbf{v} = P_{\mathrm{nose}} - P_{\mathrm{chin}}$
+    \item Face normal: $\hat{n} = \mathrm{normalize}(\mathbf{v} \times \mathbf{e})$
+\end{enumerate}
+
+MediaPipe's LIVE\_STREAM mode was used throughout.
+The callback architecture established here --- callback stores result into a
+locked global, main thread reads and renders --- became the template for all
+subsequent pipelines.
+
+\section{Off-Axis Projection Demo}
+
+The second demonstration (\texttt{head\_coupled\_offaxis.py}) coupled
+the viewer's nose-tip position from MediaPipe to an OpenGL rendered scene.
+A calibration phase records the reference nose position at the viewer's
+normal viewing distance.
+During the demo, the delta from this reference drives the OpenGL projection:
+
+\begin{equation}
+    \Delta x_{\mathrm{mm}} = -(x_{\mathrm{nose}} - x_{\mathrm{ref}}) \cdot W_{\mathrm{screen,mm}}
+    \label{eq:delta_x}
+\end{equation}
+
+A negative sign is required because the webcam image is mirrored: the
+viewer moving right appears as a leftward nose shift in the camera frame.
+An orthographic frustum shifted by the head offset produces the parallax
+effect:
+
+\begin{lstlisting}[language=Python, caption=Orthographic frustum with head-coupled offset]
+zoom = 2.0          # field of view factor
+scale = 2.0         # movement amplification
+
+glOrtho(-W/2 * zoom - dx * scale,
+         W/2 * zoom - dx * scale,
+        -H/2 * zoom - dy * scale,
+         H/2 * zoom - dy * scale,
+        -1000, 1000)
+\end{lstlisting}
+
+The orthographic formulation was adopted after the perspective frustum
+failed to produce a visible effect: the combination of a 1~mm near plane
+and millimetre-scale scene geometry placed all scene content behind the
+near clipping plane.
+The orthographic version correctly demonstrates the head-coupled parallax
+effect and served its purpose as a proof of concept.
+
+\subsection{Development Challenges}
+
+Several non-trivial issues were encountered during development.
+
+\textbf{Texture upload failure on Windows.}
+The demo was developed on Windows and verified on a Raspberry Pi.
+On Windows, \texttt{glTexImage2D} failed silently when passed a JPEG-loaded
+NumPy array; switching the source image to PNG resolved the issue.
+The Raspberry Pi's OpenGL driver was unaffected.
+
+\textbf{Axis inversions.}
+MediaPipe returns nose coordinates in a mirrored camera frame where $+Y$ is
+downward.
+After calibration, the head offset required sign inversion on both axes.
+In the final demo: $\Delta x \to -\Delta x$ (camera $+X$ is viewer's left),
+$\Delta y \to +\Delta y$ (prior incorrect negation removed).
+
+\textbf{LIVE\_STREAM threading.}
+MediaPipe's LIVE\_STREAM mode is mandatory for low-latency camera
+processing.
+IMAGE mode processes one frame at a time and was 5--10$\times$ slower.
+The callback must not perform display operations; OpenGL contexts are
+not thread-safe.
+All rendering runs on the main thread.
+
+% =====================================================================
+%  CHAPTER 4 — THE DIBR PIPELINE: STEREO DEPTH
+% =====================================================================
+\chapter{The DIBR Pipeline: Stereo Depth}
+
+\section{OAK-D Lite Integration}
+
+\subsection{Replacing the Homebrew Stereo Rig}
+
+The original stereo pipeline used two IMX219 CSI cameras connected directly
+to the Jetson Nano.
+This configuration required a manual stereo calibration procedure
+(\texttt{calibration.cpp}) and performed stereo rectification and matching
+entirely on the Jetson CPU and CUDA-capable Maxwell GPU.
+CPU SGBM dominated the frame budget at 20--30~ms per frame; even with CUDA
+StereoBM this fell to 10--15~ms, but consumed GPU resources that were
+needed by the DIBR render pipeline.
+
+The OAK-D Lite replaces the dual-CSI rig with a single USB-C connection.
+The Myriad X VPU performs rectification and SGBM entirely in hardware,
+returning already-rectified frames and subpixel disparity to the Jetson
+host at zero host CPU cost.
+
+\subsection{DepthAI Pipeline Configuration}
+
+The pipeline graph is configured at startup.
+Four DepthAI nodes are used: left and right MonoCamera (480P), a
+StereoDepth node, and a ColorCamera (ISP output).
+The stereo node is configured with:
+
+\begin{itemize}[noitemsep]
+    \item Left-right consistency check enabled: discards pixels where
+          the left-to-right and right-to-left disparity estimates disagree
+          beyond a threshold.
+    \item Subpixel mode enabled: disparity encoded as 16-bit values with
+          5 fractional bits (divide by 32 on host to recover pixel disparity).
+    \item 7$\times$7 median filter for speckle suppression.
+    \item Runtime-configurable confidence threshold via an \texttt{XLinkIn}
+          stream, adjustable without restarting the pipeline.
+\end{itemize}
+
+Camera intrinsics and baseline are read from the device EEPROM via
+\texttt{device->readCalibration()}, eliminating the manual calibration step.
+The baseline is returned in centimetres and converted to metres on the host.
+
+\subsection{Queue Discipline}
+
+Three output queues carry data from device to host.
+The disparity queue is blocking (size~1): every new disparity frame must
+be consumed before the next is accepted, driving the render rate.
+Colour and rectified mono queues use \texttt{tryGet} (non-blocking) so
+the host always has the latest frame without stalling.
+
+\subsection{Disparity Pre-Processing}
+
+Before uploading disparity to the GPU, the host applies three steps:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Speckle filter:} \texttt{cv::filterSpeckles} with max
+          blob size 150~px and max disparity jump 16.
+          Removes isolated incorrect matches from rain or specular surfaces.
+    \item \textbf{Subpixel conversion:} \texttt{convertTo(CV\_32F, 1.0/32.0)}
+          recovers true pixel disparity from the RAW16 subpixel encoding.
+    \item \textbf{IIR temporal filter:}
+          $d_{\mathrm{out}} = 0.3 \cdot d_{\mathrm{new}} + 0.7 \cdot d_{\mathrm{prev}}$,
+          with $d_{\mathrm{prev}}$ preserved unchanged where
+          $d_{\mathrm{new}} = 0$.
+          The zero-value guard is critical: without it, zero disparity
+          from invalid pixels bleeds into adjacent valid estimates over time,
+          growing the hole on every frame.
+\end{enumerate}
+
+\section{Right-Disparity Construction}
+
+\texttt{VWINDOW\_RIGHT\_CS} requires a disparity value for right-camera
+pixels.
+This is constructed on the CPU per scanline before the GPU pass:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Forward pass}: for each left pixel $(x_l, y)$ with
+          disparity $d$, write $d$ at right pixel $x_r = \mathrm{round}(x_l - d)$,
+          keeping the maximum when multiple left pixels map to the same
+          right pixel (nearest surface wins).
+    \item \textbf{Backward fill}: scan right-to-left; fill zero (disoccluded)
+          pixels with the last nonzero value to the right.
+          Background depth propagates leftward into holes.
+\end{enumerate}
+
+% =====================================================================
+%  CHAPTER 5 — THE DIBR PIPELINE: HEAD TRACKING
+% =====================================================================
+\chapter{The DIBR Pipeline: Head Tracking}
+
+\section{Architecture Evolution}
+
+The face tracker went through four complete architectures before reaching
+the final design.
+Table~\ref{tab:tracker_history} summarises the sequence and failure mode
+of each.
+
+\begin{table}[h]
+\centering
+\caption{Face tracker architecture evolution}
+\label{tab:tracker_history}
+\begin{tabular}{@{}p{4cm}p{7.5cm}@{}}
+\toprule
+Architecture & Failure mode \\
+\midrule
+Lucas-Kanade optical flow & Drifted without periodic re-detection; anchor lost in low-texture frames. \\
+OpenCV DNN (face + landmark) & Inference too slow on the Cortex-A57 CPU; consumed most of available compute budget. \\
+MOSSE + Haar Cascade & MOSSE correlation filter tracked between Haar-detected bounding boxes. Achieved low CPU load. Abandoned in favour of TRT pipeline on \texttt{feature/oakd-lite} for metric depth. \\
+\textbf{Haar + TRT FaceMesh} & \textbf{Final architecture.} Haar cascade for bootstrapping; TRT FaceMesh on iris-centred crop for subsequent frames. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{MOSSE + Haar Cascade (feature/head-tracking)}
+
+This architecture, developed on the \texttt{feature/head-tracking} branch,
+was the first to achieve acceptable CPU load on the Jetson Nano.
+A Haar cascade face detector ran every $N$ frames to anchor the tracker;
+a Minimum Output Sum of Squared Error (MOSSE) correlation
+filter~\cite{bolme2010mosse} maintained the bounding box between
+detections.
+A heavy IIR low-pass filter on the bounding box coordinates eliminated jitter.
+The face normal was computed from the bounding box aspect ratio and a
+calibrated homography.
+
+This approach was replaced on \texttt{feature/oakd-lite} because it does
+not provide metric depth --- the MOSSE bounding box gives 2D screen
+position only.
+Metric depth is required to correctly scale the parallax in the virtual
+window model.
+
+\section{Final Architecture: Haar + TRT FaceMesh}
+
+\subsection{Detection and Tracking}
+
+The face tracker runs on a dedicated thread consuming frames from the
+viewer-facing USB webcam via a GStreamer pipeline
+(\texttt{v4l2src $\to$ JPEG $\to$ jpegdec $\to$ BGR $\to$ appsink},
+\texttt{drop=true}, \texttt{max-buffers=1}).
+
+The pipeline is:
+
+\begin{enumerate}[noitemsep]
+    \item \textbf{Haar cascade} on a 50\%-scale greyscale,
+          histogram-equalised frame: scale factor 1.1, minimum 4 neighbours,
+          minimum face size 60$\times$60.
+          The largest detection is selected.
+    \item \textbf{Bounding box expansion and squaring}: 40\% margin added
+          on each side, cropped to a square, resized to 192$\times$192
+          RGB float [0,~1].
+    \item \textbf{Bootstrap frame}: full-frame FaceMesh inference (first
+          frame with a new detection) provides 478 landmarks.
+          Subsequent frames crop around the iris centre for speed, reducing
+          the input area and inference latency.
+    \item \textbf{TensorRT FaceMesh engine}~\cite{tensorrt} (ONNX, FP16, 256~MB workspace):
+          built from ONNX on first run, serialised to a \texttt{.trt} cache
+          file, reloaded on subsequent runs.
+    \item \textbf{Iris landmarks} (tensor output indices 468--477) provide
+          the iris bounding circle for depth estimation via
+          Equation~\ref{eq:iris_depth}.
+    \item \textbf{IIR smoothing} (constant \texttt{FT\_SMOOTH}) on
+          $(X, Y, Z)$.
+\end{enumerate}
+
+\subsection{Coordinate Mapping}
+
+The face tracker camera faces the viewer ($+Z$ toward camera), while the
+OAK-D faces the scene ($+Z$ away from camera).
+The tracker's $+X$ is the viewer's right, which is the scene's left
+(OAK-D $-X$).
+Two sign inversions are applied:
+
+\begin{equation}
+    h_x^{\mathrm{OAK}} = -h_x^{\mathrm{tracker}}, \quad
+    h_z^{\mathrm{OAK}} = -h_z^{\mathrm{tracker}}
+    \label{eq:coord_flip}
+\end{equation}
+
+Without these, the parallax direction is inverted --- moving the head
+right makes the scene shift right instead of left.
+
+\subsection{Calibration}
+
+The tracker supports interactive recalibration (key \texttt{C}).
+The current raw $(X, Y)$ position is stored as a reference offset;
+subsequent output is the delta from this offset.
+The driver's neutral forward-facing position therefore maps to
+$(0, 0)$ in the virtual window frame regardless of webcam mounting position.
+
+% =====================================================================
+%  CHAPTER 6 — THE DIBR PIPELINE: COMPUTE SHADERS
+% =====================================================================
+\chapter{The DIBR Pipeline: Compute Shaders}
+
+\section{UNPROJECT\_CS}
+
+This pass converts the uploaded disparity texture to a world-space
+XYZ texture (RGBA32F).
+For each pixel $(u, v)$ with disparity $d$:
+
+\begin{equation}
+    Z = \frac{f_x \cdot B}{d}, \quad
+    X = \frac{(u - c_x) \cdot Z}{f_x}, \quad
+    Y = \frac{(v - c_y) \cdot Z}{f_y}
+    \label{eq:unproject_shader}
+\end{equation}
+
+Pixels with $d < 0.5$ (invalid disparity) write $w = 0$ and are skipped
+in all subsequent passes.
+
+\section{CLEAR\_CS}
+
+The depth SSBO (one unsigned integer per output pixel) must be zeroed
+each frame.
+\texttt{glClearBufferSubData} is absent from the L4T~R32 \texttt{gl32.h}
+headers, so a dedicated compute shader (\texttt{local\_size\_x = 64})
+performs the clear on the GPU, avoiding the overhead of uploading a
+$\sim$1.2~MB zero buffer from the host each frame.
+
+\section{VWINDOW\_DEPTH\_CS and VWINDOW\_COLOR\_CS}
+
+For each valid world point $W$, a ray is cast from head position $H$
+and intersected with the display plane using
+Equation~\ref{eq:ray_plane}.
+The intersection $Q$ is projected into display UV coordinates using
+the display's right and up vectors.
+
+The DEPTH pass writes:
+\begin{equation}
+    \texttt{atomicMax}(\texttt{depth}[\text{dst}],\;
+    \texttt{floatBitsToUint}(1/Z_W))
+    \label{eq:atomic_depth}
+\end{equation}
+
+Storing $1/Z$ as float bits exploits the fact that IEEE~754 positive
+floats compare correctly as unsigned integers, enabling
+\texttt{atomicMax} without floating-point atomic support (unavailable in
+OpenGL ES~3.1).
+This resolves the many-to-one mapping when multiple world points project
+to the same output pixel.
+
+The COLOR pass reads each output pixel's depth, computes the
+corresponding source pixel in the left camera image via backprojection,
+and writes the bilinear-sampled colour to the output texture.
+
+\section{VWINDOW\_RIGHT\_CS}
+
+When the virtual viewpoint shifts, regions occluded in the left camera
+become visible.
+The right rectified image provides colour data for these disocclusion
+regions.
+For each right-camera pixel with disparity $d_R$, the disocclusion filter
+checks:
+
+\begin{equation}
+    d_R < d_L \cdot 0.7
+    \label{eq:disocclusion_filter}
+\end{equation}
+
+where $d_L$ is the co-located left-camera disparity.
+If satisfied, the pixel is a true disocclusion.
+The right pixel is only written where \texttt{depth[dst] == 0}:
+pixels already filled by the left-camera pass are not overwritten.
+
+\section{Jump Flood Algorithm Hole Fill}
+
+Remaining holes are filled using the Jump Flood
+Algorithm~\cite{rong2006jfa}, which computes an approximate
+nearest-seed Voronoi diagram in $\mathcal{O}(\log N)$ passes by
+propagating seed coordinates outward at a step distance that halves
+each iteration.
+
+An initialisation pass (\texttt{JFA\_INIT\_CS}) marks each filled pixel
+as a seed, storing its coordinate packed as \texttt{x | (y << 16)} in an
+R32I image.
+Each JFA pass checks the 9 neighbours at the current step distance and
+adopts the nearest seed.
+After $\lceil \log_2(\max(W, H)) \rceil$ passes, a gather pass copies
+the nearest seed's colour into each hole pixel.
+
+This replaces the earlier horizontal scan hole-fill, which only
+propagated colour rightward, producing directional streaks at depth
+discontinuities.
+
+The packed R32I coordinate format was necessary because Maxwell under
+OpenGL ES~3.1 does not support \texttt{rg32i} as an image format in
+compute shaders.
+The two-component format compiled without error but produced garbage
+output at runtime; the single-integer packed format resolved the issue.
+
+\section{Display Pass}
+
+The final fragment shader samples the hole-filled texture via a
+fullscreen quad.
+A \texttt{u\_scale} uniform applies NDC scaling to letterbox or
+pillarbox the output to the correct aspect ratio.
+
+% =====================================================================
+%  CHAPTER 7 — KEY ENGINEERING CHALLENGES
+% =====================================================================
+\chapter{Key Engineering Challenges}
+
+\section{Build System and DepthAI Dependencies}
+
+Building the depthai-core library on L4T~R32 required the following
+non-obvious steps:
+
+\begin{itemize}[noitemsep]
+    \item A Hunter package manager gate must precede the
+          \texttt{project()} call --- non-standard for CMake.
+    \item CMake minimum version required: 3.20, above the default L4T
+          apt package.
+    \item \texttt{PresetType::HIGH\_DENSITY} was removed from the API
+          in the version available; replaced with a string-based preset.
+    \item Frame data initially retrieved via \texttt{getCvFrame()}, which
+          requires the \texttt{DEPTHAI\_OPENCV\_SUPPORT} compile flag;
+          replaced with \texttt{getData()} and manual
+          \texttt{cv::Mat} construction from the raw byte pointer.
+\end{itemize}
+
+\section{Camera Rig Orientation}
+
+The OAK-D Lite was mounted with the rig rotated 180$^\circ$ for
+installation reasons.
+This inverted both the left and right mono streams and the colour stream.
+Compensation was applied in two places:
+
+\begin{enumerate}[noitemsep]
+    \item The GStreamer capture pipeline for the USB webcam head tracker
+          was given a \texttt{videoflip flip-method=rotate-180} element.
+    \item DepthAI OAK-D frames were flipped in the host pre-processing
+          step using \texttt{cv::rotate(frame, frame, cv::ROTATE\_180)}.
+\end{enumerate}
+
+Additionally, the default stereo matching parameters were revised:
+Block Matching was set as the default (lowest available block size) to
+prioritise frame rate while the rig orientation was being validated.
+
+\section{Coordinate System Consistency}
+
+Three separate sign errors were introduced and corrected across development.
+
+\textbf{Parallax inversion.}
+The face tracker camera faces the viewer, so its $+X$ is the viewer's
+right --- opposite to the OAK-D scene frame.
+The missing negation of $h_x$ (Equation~\ref{eq:coord_flip}) caused
+parallax to invert: moving the head left made the scene shift left
+instead of right.
+
+\textbf{Viewer depth sign.}
+The OAK-D faces into the scene along $+Z$, placing the viewer at negative
+$Z$.
+The tracker returns a positive viewer distance, requiring negation before
+use as $h_z$.
+
+\textbf{Display plane placement.}
+The display was initially placed at $Z = 0$ (the OAK-D optical origin).
+Scene points at 2--5~m projected onto this plane from a viewer at
+$Z = -1$~m, producing a very narrow field of view --- the output appeared
+heavily zoomed in.
+Moving the display to $Z = -0.4$~m corrected the scale.
+The final model places the display at $Z = 0$ with the OAK-D slightly
+behind it, matching the physical geometry.
+
+\section{Disocclusion Fill Correctness}
+
+Achieving correct disocclusion fill required three iterations.
+
+\textbf{Attempt 1: Pixel splatting.}
+A 2$\times$2 splat on forward-warped pixels was intended to close
+sub-pixel cracks.
+It inadvertently filled holes with adjacent incorrect colours, producing
+coloured fringing at depth edges.
+
+\textbf{Attempt 2: Unconstrained right-camera write.}
+\texttt{VWINDOW\_RIGHT\_CS} wrote right-camera colour into any output
+pixel not yet filled.
+This caused ghosting: right-camera pixels landed on top of
+already-correct left-camera pixels due to the small baseline offset
+between the two views.
+Fix: only write where \texttt{depth[dst] == 0}.
+
+\textbf{Attempt 3: Missing disocclusion filter.}
+Ghosting persisted at depth discontinuities.
+The right camera sees the same surface at a slightly different disparity,
+so right pixels near edges were incorrectly treated as new content.
+The disocclusion filter (Equation~\ref{eq:disocclusion_filter}) resolved
+this: if both cameras see approximately the same depth, the right pixel
+is from the same surface and is discarded.
+
+\section{StereoDepthConfig State Reset}
+
+Runtime stereo parameter updates are sent via an \texttt{XLinkIn} stream
+as a \texttt{StereoDepthConfig} object.
+Constructing a fresh config object to update one parameter silently resets
+all other parameters to defaults.
+Subpixel mode and left-right consistency check were both reset to off
+on every keypress.
+Disparity quality degraded progressively after any runtime adjustment.
+The fix is to re-assert all desired settings in every configuration update:
+
+\begin{lstlisting}[language=C++, caption=StereoDepthConfig update with explicit re-assertion]
+StereoDepthConfig cfg;
+cfg.setMedianFilter(enable_median ? KERNEL_7x7 : MEDIAN_OFF);
+cfg.setLeftRightCheck(true);     // must re-assert every update
+cfg.setSubpixel(true);           // must re-assert every update
+configIn->send(cfg);
+\end{lstlisting}
+
+\section{Maxwell GPU Format Restrictions}
+
+The JFA seed texture was initially declared as \texttt{rg32i} (two
+32-bit integers per pixel, one per coordinate component).
+Maxwell under OpenGL ES~3.1 does not support \texttt{rg32i} as an image
+format in compute shaders.
+The shader compiled and linked without error but produced garbage output
+at runtime.
+Switching to \texttt{r32i} with coordinates packed as
+\texttt{x | (y << 16)} resolved the issue.
+
+Separately, \texttt{glClearBufferSubData} is absent from the
+L4T~R32 \texttt{gl32.h} headers entirely.
+The depth SSBO is cleared each frame by a dedicated \texttt{CLEAR\_CS}
+compute shader rather than a host-side zero buffer upload.
+
+\section{IIR Temporal Filter Invalid-Sample Decay}
+
+The IIR filter applied to the disparity map:
+
+\begin{equation}
+    d_{\mathrm{out}} = \alpha \cdot d_{\mathrm{new}} + (1 - \alpha) \cdot d_{\mathrm{prev}}
+\end{equation}
+
+was initially applied unconditionally.
+Where the OAK-D returns zero disparity (no valid stereo match), zero was
+blended in as if it were a real depth reading.
+Over successive frames, valid depth estimates near persistent holes decayed
+toward zero, growing the hole on every frame.
+Fix: detect where $d_{\mathrm{new}} = 0$ and carry $d_{\mathrm{prev}}$
+forward unchanged, preserving the last valid estimate.
+
+% =====================================================================
+%  CHAPTER 8 — RESULTS AND ANALYSIS
+% =====================================================================
+\chapter{Results and Analysis}
+
+\section{Frame Rate}
+
+Table~\ref{tab:fps_comparison} summarises pipeline frame rate at each
+development stage.
+
+\begin{table}[h]
+\centering
+\caption{Pipeline frame rate across development stages}
+\label{tab:fps_comparison}
+\begin{tabular}{@{}p{5cm}lc@{}}
+\toprule
+Configuration & Stereo method & FPS (640$\times$480) \\
+\midrule
+\texttt{dibr-quality-opt.}: CSI + CPU SGBM & CPU, 20--30 ms & $\approx$5 \\
+\texttt{dibr-quality-opt.}: CSI + CUDA BM & Maxwell GPU, 10--15 ms & $\approx$15 \\
+\texttt{oakd-lite}: OAK-D Lite & Myriad X hardware, 0 ms host & 25--30 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At 0.5$\times$ processing scale (320$\times$240), frame rate exceeds
+60~FPS with negligible visual quality loss for the A-pillar application,
+which operates at coarser spatial frequencies than the full resolution.
+
+\section{Depth Quality}
+
+The OAK-D Lite's 5-bit subpixel disparity reduces depth quantisation by
+a factor of 32 relative to integer-pixel matching.
+At 4~m depth, integer-pixel disparity changes in $\Delta Z \approx 0.4$~m
+steps; subpixel reduces this to approximately 12~mm.
+Global shutter on the OV7251 sensors eliminates rolling-shutter skew,
+which was a visible artefact with the CSI camera rig during fast lateral
+head movements.
+
+\section{Parallax Effect}
+
+The virtual window effect is most apparent at $\pm$50--100~mm of lateral
+head displacement from the calibrated reference position.
+At this range, objects at 3~m shift approximately 9--19~px in the output
+image --- clearly perceptible.
+Objects at 5~m shift approximately 6--11~px.
+Near objects at 1~m shift substantially more, providing strong depth cues.
+
+\section{Remaining Artefacts}
+
+\textbf{Large disocclusions.}
+When the head moves more than approximately 60~mm, background regions
+become visible with no colour data in either camera.
+JFA fills these with the nearest valid colour, which is plausible for
+small holes but visibly incorrect at high-contrast boundaries.
+
+\textbf{Textureless regions.}
+Passive stereo fails on uniform surfaces.
+The OAK-D confidence map is used to mask low-confidence disparity before
+upload; textureless areas remain as holes filled by JFA.
+
+\textbf{Iris depth variation.}
+The fixed iris diameter constant introduces approximately $\pm$10\% depth
+error across the adult population.
+This manifests as slight over- or under-scaling of parallax magnitude.
+
+\section{Display Calibration}
+
+Direct calibration between the OAK-D (external, facing outward) and the
+display (internal, facing the driver) is geometrically impossible --- the
+two devices face opposite directions and are separated by the car body.
+A \texttt{solvePnP}-based indirect approach, chaining transforms through an
+intermediate reference marker, was investigated but found to accumulate
+excessive error (angular error of 1--2$^\circ$ produces centimetre-scale
+positional error at display distance).
+
+A manual tuning procedure was adopted: the display-to-camera transform is
+initialised from physical measurements (tape measure for translation,
+nominal angles for rotation) and refined by observing whether parallel
+lines in the scene remain parallel in the output.
+The dominant uncertainty sources (iris depth $\pm 5$--10\%, tracker noise
+$\pm 5$~mm) exceed the calibration error, making a more rigorous procedure
+unnecessary at this stage.
+
+% =====================================================================
+%  CHAPTER 9 — CONCLUSIONS AND REFLECTIONS
+% =====================================================================
+\chapter{Conclusions and Reflections}
+
+\section{Summary}
+
+ClearVision demonstrates that a real-time stereoscopic DIBR system for
+an automotive A-pillar application is achievable on embedded GPU hardware
+at a cost accessible to a student project.
+The system combines hardware-accelerated stereo depth from an OAK-D Lite,
+a multi-pass OpenGL ES~3.1 compute shader DIBR pipeline, and a
+TensorRT-accelerated face tracker to synthesise a physically-correct novel
+viewpoint at 25--30~FPS.
+The virtual window projection model is geometrically correct and requires
+no empirical scaling constants.
+
+The project also produced two working Python proof-of-concept
+demonstrations --- head pose vector visualisation and head-coupled
+off-axis projection --- which validated the viewing geometry before the
+full C\texttt{++} pipeline was built.
+
+\section{Key Technical Contributions}
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Virtual window projection model}: replaces the
+          ad-hoc fractional interpolation approach with geometrically-correct
+          ray-plane intersection.
+          Parallax scale is physically derived, with no tuning constants.
+    \item \textbf{JFA hole fill}: $\mathcal{O}(\log N)$ 2D nearest-seed
+          fill replaces $\mathcal{O}(N)$ horizontal scan, eliminating
+          directional streaking.
+    \item \textbf{GPU-side depth buffer clear}: avoids a 1.2~MB host
+          upload per frame via a dedicated compute shader.
+    \item \textbf{\texttt{floatBitsToUint} depth ordering}: enables
+          \texttt{atomicMax} depth testing in OpenGL ES~3.1 without
+          floating-point atomic support.
+    \item \textbf{IIR invalid-sample guard}: prevents valid depth from
+          decaying into adjacent zero-disparity holes over time.
+    \item \textbf{Iris-based metric depth}: uses the known iris diameter
+          (11.7~mm) as a depth cue, providing more accurate and stable
+          depth estimates than face-width-based methods.
+\end{itemize}
+
+\section{Limitations}
+
+\textbf{Large disocclusions.}
+JFA nearest-neighbour fill is plausible only for small holes
+($\lesssim$30~px).
+For larger disocclusions, background inpainting or temporal reprojection
+is needed.
+This is a fundamental constraint of single-viewpoint DIBR regardless of
+depth quality.
+
+\textbf{Textureless regions.}
+Passive stereo fails on uniform surfaces.
+Active stereo (structured light) or a time-of-flight sensor would provide
+reliable depth in such scenes, at substantially higher hardware cost.
+
+\textbf{Single viewer.}
+The system is calibrated to one driver's head position.
+Multi-viewer support would require time-multiplexed rendering or a
+lenticular display.
+
+\textbf{Display calibration.}
+The manual calibration procedure is sufficient for development but would
+require a repeatable mechanical fixture for production deployment.
+
+\section{Future Work}
+
+Near-term improvements within the existing architecture:
+
+\begin{itemize}[noitemsep]
+    \item \textbf{Temporal reprojection}: warp the previous frame's output
+          into the current frame using the inter-frame head displacement,
+          seeding holes before JFA.
+          Reduces visible artefacts for large disocclusions.
+    \item \textbf{Joint bilateral depth upsampling}: upsample the 480P
+          depth map to match the IMX214 colour resolution (up to 1080P),
+          guided by colour edges, before the UNPROJECT pass.
+    \item \textbf{IMU-assisted display pose}: use the OAK-D Lite's onboard
+          Bosch BMI270 and a complementary display-mounted IMU to automate
+          the rotation component of the display-to-camera calibration.
+\end{itemize}
+
+\section{Reflections}
+
+The project demonstrated that hardware-accelerated stereo depth is now
+accessible at consumer price points.
+The OAK-D Lite in particular substantially lowered the barrier to entry:
+hardware SGBM, subpixel disparity, global shutter, EEPROM-stored
+intrinsics, and a single USB-C cable replaced what previously required a
+CUDA-capable GPU, a manual calibration rig, and careful CSI ribbon routing.
+
+The majority of development time was spent not on the core DIBR rendering
+but on peripheral problems: build system compatibility, tracker reliability,
+and coordinate system consistency.
+These are typical of projects that integrate multiple independently-developed
+components (DepthAI, TensorRT, OpenGL ES, Qt) on a constrained embedded
+platform.
+Documenting the specific failure modes --- the StereoDepthConfig state
+reset, the Maxwell \texttt{rg32i} format gap, the IIR decay bug, the
+GStreamer flip compensation --- provides a concrete reference for similar
+work on the same hardware.
+
+The virtual window model, once correctly implemented, required no further
+calibration.
+Physically-correct parallax including correct vertical parallax,
+depth-dependent magnitude, and natural near-object motion made the
+A-pillar elimination effect substantially more convincing than the earlier
+$u\_\mathrm{shift}$ model.
+
+% =====================================================================
+%  BIBLIOGRAPHY
+% =====================================================================
+\printbibliography
+
+% =====================================================================
+%  APPENDIX
+% =====================================================================
+\appendix
+
+\chapter{Stereo Baseline Selection}
+\label{app:baseline}
+
+The stereo baseline determines both the achievable depth accuracy and
+the maximum synthesisable viewpoint shift.
+For the A-pillar application, both constraints converge on the same range.
+
+The A-pillar obstruction subtends approximately 80--120~mm of lateral space
+at the driver's eye position (measured on a typical passenger vehicle,
+driver seated 600--700~mm from the pillar).
+The synthesised viewpoint shift must span this width.
+A narrower baseline would not produce sufficient shift; a wider baseline
+would shift near-pillar objects beyond the obstruction width, breaking the
+window illusion.
+
+The OAK-D Lite's 75~mm fixed baseline lies comfortably within this range.
+
+A further constraint: extending the baseline too far increases disocclusion
+region size, worsening visible artefacts from the JFA fill.
+For DIBR specifically, the recommended stereo baseline is approximately
+5--10\% of the target scene depth --- for 3--5~m scenes, this gives
+150--500~mm.
+The A-pillar geometry constraint at 80--120~mm is therefore the binding
+constraint, not depth accuracy.
+
+\chapter{Key Source File Reference}
+\label{app:source}
+
+\begin{table}[h]
+\centering
+\caption{Principal source files}
+\begin{tabular}{@{}ll@{}}
+\toprule
+File & Role \\
+\midrule
+\texttt{src/view\_synthesis.cpp} & Qt OpenGL widget; compute shader dispatch; main render loop \\
+\texttt{src/oak\_receiver.cpp}   & DepthAI pipeline; OAK-D polling thread \\
+\texttt{src/oak\_receiver.h}     & \texttt{OAKFrame} struct; queue management interface \\
+\texttt{src/face\_tracker.cpp}   & Haar + TRT FaceMesh pipeline; iris depth estimation \\
+\texttt{src/face\_tracker.h}     & Tuning constants (\texttt{FT\_SMOOTH}, iris diameter) \\
+\texttt{src/calibration.cpp}     & Legacy manual stereo calibration --- retained for reference \\
+\texttt{src/depth\_pipeline.cpp} & CUDA preprocessing reference implementation \\
+\texttt{demos/head\_coupled\_offaxis.py} & Python proof-of-concept \\
+\texttt{demos/face\_landmarker\_demo.py} & Head pose vector demo \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\end{document}
