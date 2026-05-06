@@ -1,7 +1,7 @@
 % ClearVision: Real-Time DIBR for A-Pillar Blind Spot Elimination
 % Seán Kelly — 21421506 — University of Galway — 1MECE1
 
-\documentclass[12pt, a4paper]{report}
+\documentclass[11pt, a4paper]{report}
 
 % -----------------------------------------------------------------------
 %  Packages
@@ -50,8 +50,8 @@
 % -----------------------------------------------------------------------
 \pagestyle{fancy}
 \fancyhf{}
-\fancyhead[L]{\small ClearVision — MECE Final Year Project}
-\fancyhead[R]{\small Seán Kelly, 21421506}
+\fancyhead[L]{\small ClearVision — Project Report}
+\fancyhead[R]{\small Seán Kelly, 21421506, 1MECE1}
 \fancyfoot[C]{\thepage}
 \renewcommand{\headrulewidth}{0.4pt}
 
@@ -78,19 +78,21 @@
     \vspace*{1.5cm}
 
     {\Large \textsc{University of Galway}}\\[0.4em]
-    {\large College of Science and Engineering}\\[0.3em]
-    {\large School of Engineering}\\[2.8cm]
+    {\large School of Engineering}\\[0.3em]
+    {\large Department of Electronic and Electrical Engineering}\\[2.8cm]
 
     \rule{\linewidth}{1pt}\\[0.5em]
-    {\LARGE \bfseries ClearVision: A Real-Time Depth-Image Based Rendering\\[0.3em]
-    System for Automotive A-Pillar Blind Spot Elimination}\\[0.5em]
+    {\LARGE \bfseries ClearVision: A Real-Time Vision\\[0.3em]
+    System for the A-Pillar Blind Spot}\\[0.5em]
     \rule{\linewidth}{1pt}\\[2cm]
 
     {\large \textbf{Author:} Seán Kelly}\\[0.4em]
     {\large \textbf{Student ID:} 21421506}\\[0.4em]
-    {\large \textbf{Programme:} BE Mechatronics Engineering (1MECE1)}\\[0.4em]
-    {\large \textbf{Module:} MECE Final Year Project}\\[0.4em]
-    {\large \textbf{Date:} May 2026}\\[2.5cm]
+    {\large \textbf{Date:} 11 May 2026}\\[0.4em]
+    {\large \textbf{Supervisor:} Prof. Martin Glavin}\\[0.4em]
+    {\large \textbf{Co-Assessor:} Dr. Brian Deegan}\\[0.4em]
+
+	\newpage
 
     \begin{minipage}{0.85\linewidth}
     \begin{abstract}
@@ -120,6 +122,8 @@
 %  TABLE OF CONTENTS
 % =====================================================================
 \tableofcontents
+\listoftables
+\listoffigures
 \newpage
 
 % =====================================================================
@@ -147,6 +151,16 @@ viewpoint that tracks the driver's head position, so that the panel
 behaves as if it were transparent.
 The driver receives the same motion parallax cues as through a real window,
 making depth judgements natural and intuitive.
+
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.85\linewidth]{figures/apillar_concept.png}
+% \caption{The A-pillar blind spot problem. Left: typical driver field of view with
+%          the A-pillar obstruction highlighted. Right: ClearVision concept --- the
+%          display panel renders a synthesised viewpoint tracking the driver's head,
+%          making the pillar appear transparent.}
+% \label{fig:apillar_concept}
+% \end{figure}
 
 \section{Depth-Image Based Rendering}
 
@@ -338,6 +352,16 @@ Compensation is applied in the capture pipeline via a GStreamer
 \texttt{videoflip} element (\texttt{flip-method=rotate-180}) and
 additionally in software for the OAK-D's DepthAI frame output.
 
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.85\linewidth]{figures/hardware_rig.jpg}
+% \caption{The ClearVision hardware assembly. The OAK-D Lite stereo camera is
+%          mounted externally (inverted), connected via USB-C to the Jetson Nano
+%          host board. The viewer-facing USB webcam for head tracking is visible
+%          at the interior mounting position.}
+% \label{fig:hardware_rig}
+% \end{figure}
+
 \section{Architecture Evolution Across Branches}
 
 Table~\ref{tab:arch_evolution} summarises the key changes across the
@@ -380,6 +404,17 @@ Three concurrent threads handle the three data sources:
           OAK-D frame rate, consuming the latest data from both background
           threads and dispatching the compute shader pipeline.
 \end{itemize}
+
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.92\linewidth]{figures/software_architecture.png}
+% \caption{ClearVision software architecture. Three concurrent threads supply
+%          data to the Qt render thread: the OAK receiver thread (disparity,
+%          rectified frames, colour), the face tracker thread (3D head position),
+%          and the Qt render thread (compute shader pipeline dispatch). Shared
+%          data is protected by mutexes.}
+% \label{fig:software_architecture}
+% \end{figure}
 
 \section{Compute Shader Pipeline}
 
@@ -456,6 +491,15 @@ The callback architecture established here --- callback stores result into a
 locked global, main thread reads and renders --- became the template for all
 subsequent pipelines.
 
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.75\linewidth]{figures/demo_head_pose.png}
+% \caption{Head pose vector demonstration. The 3D face normal vector is overlaid
+%          on the live camera feed. The vector is computed from nose tip, chin,
+%          and inner eye corner landmarks without any hardcoded scaling constants.}
+% \label{fig:demo_head_pose}
+% \end{figure}
+
 \section{Off-Axis Projection Demo}
 
 The second demonstration (\texttt{head\_coupled\_offaxis.py}) coupled
@@ -491,6 +535,16 @@ and millimetre-scale scene geometry placed all scene content behind the
 near clipping plane.
 The orthographic version correctly demonstrates the head-coupled parallax
 effect and served its purpose as a proof of concept.
+
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.85\linewidth]{figures/demo_offaxis.png}
+% \caption{Off-axis projection proof-of-concept. Left: viewer centred --- scene
+%          rendered straight ahead. Right: viewer shifted laterally --- the
+%          orthographic frustum shifts to expose the scene region behind the
+%          viewer's new sightline, producing visible motion parallax.}
+% \label{fig:demo_offaxis}
+% \end{figure}
 
 \subsection{Development Challenges}
 
@@ -589,6 +643,17 @@ Before uploading disparity to the GPU, the host applies three steps:
           growing the hole on every frame.
 \end{enumerate}
 
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.92\linewidth]{figures/disparity_map.png}
+% \caption{OAK-D Lite disparity output at 640$\times$480. Left: raw subpixel
+%          disparity (RAW16, scaled for display). Right: after speckle filter
+%          and IIR temporal smoothing. Nearer objects appear brighter; invalid
+%          stereo regions appear as black holes subsequently filled by the JFA
+%          pass.}
+% \label{fig:disparity_map}
+% \end{figure}
+
 \section{Right-Disparity Construction}
 
 \texttt{VWINDOW\_RIGHT\_CS} requires a disparity value for right-camera
@@ -683,6 +748,16 @@ The pipeline is:
     \item \textbf{IIR smoothing} (constant \texttt{FT\_SMOOTH}) on
           $(X, Y, Z)$.
 \end{enumerate}
+
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.75\linewidth]{figures/face_tracker.png}
+% \caption{Haar + TRT FaceMesh face tracker running on the viewer-facing webcam.
+%          The 478-landmark mesh is overlaid on the face crop; the iris bounding
+%          circle (landmarks 468--477) is highlighted. The estimated 3D head
+%          position $(X, Y, Z)$ is displayed in the overlay.}
+% \label{fig:face_tracker}
+% \end{figure}
 
 \subsection{Coordinate Mapping}
 
@@ -809,6 +884,17 @@ OpenGL ES~3.1 does not support \texttt{rg32i} as an image format in
 compute shaders.
 The two-component format compiled without error but produced garbage
 output at runtime; the single-integer packed format resolved the issue.
+
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.92\linewidth]{figures/jfa_holefill.png}
+% \caption{Jump Flood Algorithm hole fill. Left: output after left-camera colour
+%          splat and right-camera disocclusion fill --- unfilled holes appear
+%          black. Right: after JFA gather pass --- holes are filled with the
+%          nearest valid seed colour, eliminating the directional streaking
+%          produced by the earlier horizontal scan fill.}
+% \label{fig:jfa_holefill}
+% \end{figure}
 
 \section{Display Pass}
 
@@ -990,6 +1076,16 @@ At 0.5$\times$ processing scale (320$\times$240), frame rate exceeds
 60~FPS with negligible visual quality loss for the A-pillar application,
 which operates at coarser spatial frequencies than the full resolution.
 
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.7\linewidth]{figures/fps_comparison.png}
+% \caption{Pipeline frame rate across development stages at 640$\times$480.
+%          The transition from CPU SGBM (CSI rig) to hardware SGBM on the
+%          OAK-D Myriad X VPU produces the dominant performance gain, with a
+%          further improvement achievable at 0.5$\times$ scale.}
+% \label{fig:fps_comparison}
+% \end{figure}
+
 \section{Depth Quality}
 
 The OAK-D Lite's 5-bit subpixel disparity reduces depth quantisation by
@@ -1008,6 +1104,17 @@ At this range, objects at 3~m shift approximately 9--19~px in the output
 image --- clearly perceptible.
 Objects at 5~m shift approximately 6--11~px.
 Near objects at 1~m shift substantially more, providing strong depth cues.
+
+% \begin{figure}[h]
+% \centering
+% \includegraphics[width=0.92\linewidth]{figures/virtual_window_output.png}
+% \caption{ClearVision live output. Left: head centred at calibration position.
+%          Right: head shifted approximately 60~mm laterally --- objects at
+%          depth shift in the opposite direction, reproducing the motion parallax
+%          of a transparent window. The JFA hole fill is visible at the right
+%          edge where the virtual viewpoint exposes a disocclusion region.}
+% \label{fig:virtual_window_output}
+% \end{figure}
 
 \section{Remaining Artefacts}
 
